@@ -1406,6 +1406,11 @@ DEFAULT_CONFIG = {
         # only visible when show_reasoning is enabled.
         "show_commentary": True,
         "tool_progress_command": False,  # Enable /verbose command in messaging gateway
+        # Per-tool progress mode overrides: {"skill_manage": "all", "terminal": "off"}.
+        # Overrides the global tool_progress mode for specific tools. When
+        # global mode is "off" but the filter has non-off entries, the progress
+        # queue stays active so whitelisted tools still emit messages.
+        "tool_progress_filter": {},
         # NOTE: display.tool_progress_overrides is deprecated and no longer
         # seeded here — use display.platforms. A user-set value is still
         # honored at runtime (gateway display_config back-compat read) and

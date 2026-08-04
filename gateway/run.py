@@ -4399,12 +4399,23 @@ class TurnRunner:
             return
 
         # If tool_progress is off, only _thinking passes through (above).
-        # Regular tool calls are suppressed.
+        # Regular tool calls are suppressed — UNLESS the per-tool filter
+        # explicitly whitelists this tool (e.g. {"skill_view": "all"} with a
+        # global mode of "off").
         if not ctx.tool_progress_enabled:
             return
 
         # Only act on tool.started events (ignore tool.completed, reasoning.available, etc.)
         if event_type not in {"tool.started",}:
+            return
+
+        # Per-tool filter: resolve effective mode for this tool.
+        # Filter entries override the global progress_mode per tool name.
+        # (e.g. {"skill_view": "all", "terminal": "off"} with global "all" →
+        # terminal suppressed, skill_view shown.)
+        _filter = ctx.tool_progress_filter or {}
+        _effective_mode = _filter.get(tool_name, ctx.progress_mode) if _filter else ctx.progress_mode
+        if _effective_mode == "off":
             return
 
         # Never render a progress bubble for the clarify tool.  The
@@ -4435,7 +4446,7 @@ class TurnRunner:
             pass
 
         # "new" mode: only report when tool changes
-        if ctx.progress_mode == "new" and tool_name == ctx.last_tool[0]:
+        if _effective_mode == "new" and tool_name == ctx.last_tool[0]:
             return
         ctx.last_tool[0] = tool_name
 
@@ -4491,7 +4502,7 @@ class TurnRunner:
             _code_block_short = f"{_block_header}```\n{_cmd_short}\n```"
 
         # Verbose mode: show detailed arguments, respects tool_preview_length
-        if ctx.progress_mode == "verbose":
+        if _effective_mode == "verbose":
             if _code_block_full is not None:
                 ctx.last_was_terminal_block[0] = True
                 ctx.progress_queue.put(_code_block_full)
@@ -28198,6 +28209,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # so each progress line would be sent as a separate message.
         from gateway.config import Platform
         tool_progress_enabled = progress_mode not in {"off", "log"} and source.platform != Platform.WEBHOOK
+
+        # Per-tool progress filter: allows overriding the global mode for
+        # specific tools (e.g., show skill_manage even when global is "off").
+        # Check platform-level first, fall back to global display config.
+        _tool_progress_filter = (
+            _platform_cfg.get("tool_progress_filter")
+            if isinstance(_platform_cfg, dict)
+            else None
+        ) or _display_cfg.get("tool_progress_filter") or {}
+        # If global is "off" but filter has entries that aren't "off", we still
+        # need the progress queue active so filtered tools can emit messages.
+        if not tool_progress_enabled and _tool_progress_filter and source.platform != Platform.WEBHOOK:
+            if any(v != "off" for v in _tool_progress_filter.values()):
+                tool_progress_enabled = True
         # Live working-state status for text-rendering typing indicators
         # (Slack's assistant status line). Independent of tool_progress —
         # Slack defaults tool_progress off (permanent lines spam channels)
@@ -28332,6 +28357,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             progress_mode=progress_mode,
             progress_grouping=progress_grouping,
             tool_progress_enabled=tool_progress_enabled,
+            tool_progress_filter=_tool_progress_filter,
             progress_queue=progress_queue,
             log_queue=log_queue,
             last_progress_msg=last_progress_msg,
