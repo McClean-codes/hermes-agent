@@ -8850,11 +8850,24 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
 
 
 def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
-    """Reclaim ``running`` tasks whose worker PID is no longer alive.
+    """Reclaim tasks whose worker PID is no longer alive.
 
     Appends a ``crashed`` event and restores the task's source phase.
     Different from ``release_stale_claims``: this checks liveness
     immediately rather than waiting for the claim TTL.
+
+    Covers ``running`` tasks plus the dispatchable non-running phases
+    (``ready`` / ``review``) that can still carry a stale claim: a worker
+    that dies mid-API-call can leave the card flipped back to ``ready``
+    while ``claim_lock`` / ``worker_pid`` and the open run row remain.
+    Every other reclaim path requires ``status='running'`` and the ready /
+    review queries require ``claim_lock IS NULL``, so such a card is
+    invisible to the dispatcher forever (the dead zone). Reclaiming it
+    here closes the leaked run with ``outcome='crashed'``, clears the
+    claim, and returns the card to its source phase — the same tick's
+    ready query then re-dispatches it. A card with a still-LIVE pid is
+    never touched: the worker may legitimately be mid-flight and will
+    resolve via its own terminal kanban call.
 
     Only considers tasks claimed by *this host* — PIDs from other hosts
     are meaningless here. The host-local check is enough because
@@ -8892,9 +8905,9 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     exited_hook_payloads: list[dict] = []
     with write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at, assignee "
-            "FROM tasks "
-            "WHERE status = 'running' AND worker_pid IS NOT NULL"
+            "SELECT id, worker_pid, claim_lock, started_at, assignee FROM tasks "
+            "WHERE status IN ('running', 'ready', 'review') "
+            "  AND worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
         for row in rows:
@@ -8982,7 +8995,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
-                "WHERE id = ? AND status = 'running' "
+                "WHERE id = ? AND status IN ('running', 'ready', 'review') "
                 "  AND worker_pid = ? AND claim_lock IS ?",
                 (retry_status, row["id"], pid, row["claim_lock"]),
             )
