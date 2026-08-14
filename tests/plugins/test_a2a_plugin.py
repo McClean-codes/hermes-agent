@@ -1312,6 +1312,17 @@ class TestMultiAgentRouting:
     def test_path_routed_agent_card_uses_prefix_and_canonical_path(self, monkeypatch):
         from plugins.platforms.a2a.adapter import A2AAdapter
         from gateway.config import PlatformConfig
+        from tools.registry import registry
+
+        # Pin the shared tool registry so the dynamic card skills are
+        # deterministic: the card advertises registered ∩ configured
+        # toolsets, and must not depend on ambient registrations left by
+        # other tests importing tools.* modules (e.g. tools.web_tools
+        # registers the 'web' toolset at import time).
+        monkeypatch.setattr(registry, "get_registered_toolset_names",
+                            lambda: ["web", "research"])
+        monkeypatch.setattr(registry, "get_tool_names_for_toolset",
+                            lambda ts: {"web": ["web_search"], "research": ["research_synthesize"]}[ts])
 
         adapter = A2AAdapter(PlatformConfig(enabled=True, extra={
             "agents": {
