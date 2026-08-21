@@ -124,6 +124,9 @@ def test_kanban_notifier_replays_telegram_dm_topic_delivery_metadata(tmp_path, m
         "telegram_dm_topic_reply_fallback": True,
         "telegram_reply_to_message_id": "462",
         "thread_id": "20197",
+        # Terminal notifier sends carry a final-reply marker so push-capable
+        # adapters (A2A) deliver instead of dropping them.
+        "notify": True,
     }
     assert len(adapter.handled) == 1
     assert adapter.handled[0].source.chat_type == "dm"
