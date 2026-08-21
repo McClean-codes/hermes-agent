@@ -1,0 +1,5 @@
+name: workflow
+version: 1.0.0
+description: "DAG-based multi-agent pipeline runner with LOOP convention and LLM-backed auxiliary analysis for escalation, status summarisation, and failure diagnosis."
+author: Hopper (fleet tuner)
+kind: standalone
