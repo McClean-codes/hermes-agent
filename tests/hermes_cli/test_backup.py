@@ -1280,6 +1280,69 @@ class TestQuickSnapshot:
         assert "skipping state.db" in out.lower() or "skipping snapshot prune" in out.lower()
 
 
+    def test_backup_parser_keep_flag(self):
+        """``hermes backup --quick --keep N`` parses; default stays None
+        (create_quick_snapshot then applies the 20-snapshot default)."""
+        import argparse
+
+        from hermes_cli.subcommands.backup import build_backup_parser
+
+        parser = argparse.ArgumentParser()
+        subparsers = parser.add_subparsers(dest="command")
+        build_backup_parser(subparsers, cmd_backup=lambda args: None)
+
+        ns = parser.parse_args(["backup", "--quick", "--keep", "2"])
+        assert ns.keep == 2
+        assert ns.quick is True
+
+        ns_default = parser.parse_args(["backup", "--quick"])
+        assert ns_default.keep is None
+
+    def test_run_quick_backup_keep_prunes_beyond_newest_two(
+        self, hermes_home, monkeypatch
+    ):
+        """hermes backup --quick --keep 2 must retain only the newest 2
+        complete snapshots — the fleet nightly local-retention policy.
+
+        Local-only: the quick-backup Python path has no OCI calls; remote
+        retention (RETAIN=7) lives exclusively in backup-nightly.sh.
+        """
+        from argparse import Namespace
+
+        from hermes_cli import backup as backup_mod
+
+        # Seed three older complete snapshots at distinct timestamps.
+        for label in ("a", "b", "c"):
+            snap_id = backup_mod.create_quick_snapshot(
+                label=label, hermes_home=hermes_home
+            )
+            assert snap_id is not None
+            _advance_backup_clock()
+
+        monkeypatch.setattr(backup_mod, "get_hermes_home", lambda: hermes_home)
+        backup_mod.run_quick_backup(Namespace(quick=True, label=None, keep=2))
+
+        snaps = backup_mod.list_quick_snapshots(limit=100, hermes_home=hermes_home)
+        ids = [s["id"] for s in snaps]
+        assert len(ids) == 2, f"expected exactly 2 snapshots after keep=2, got {ids}"
+        # The two newest survive (previous newest label='c' + the just-created
+        # unlabeled snapshot); the two oldest (label='a'/'b') are pruned.
+        assert any(sid.endswith("-c") for sid in ids)
+        assert all(not sid.endswith(("-a", "-b")) for sid in ids)
+
+    def test_run_quick_backup_rejects_keep_below_one(self, hermes_home, monkeypatch):
+        """--keep 0 would prune every snapshot including the fresh one; reject."""
+        from argparse import Namespace
+
+        import pytest
+
+        from hermes_cli import backup as backup_mod
+
+        monkeypatch.setattr(backup_mod, "get_hermes_home", lambda: hermes_home)
+        with pytest.raises(SystemExit):
+            backup_mod.run_quick_backup(Namespace(quick=True, label=None, keep=0))
+
+
 class TestQuickSnapshotProjectsKanban:
     """Regression for #52889: projects.db / kanban.db must survive an upgrade.
 

@@ -1813,7 +1813,10 @@ def prune_quick_snapshots(
 def run_quick_backup(args) -> None:
     """CLI entry point for hermes backup --quick."""
     label = getattr(args, "label", None)
-    snap_id = create_quick_snapshot(label=label)
+    keep = getattr(args, "keep", None)
+    if keep is not None and keep < 1:
+        raise SystemExit("error: --keep must be a positive integer")
+    snap_id = create_quick_snapshot(label=label, keep=keep)
     if snap_id:
         print(f"State snapshot created: {snap_id}")
         snaps = list_quick_snapshots()

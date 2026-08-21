@@ -35,4 +35,12 @@ def build_backup_parser(subparsers, *, cmd_backup: Callable) -> None:
     backup_parser.add_argument(
         "-l", "--label", help="Label for the snapshot (only used with --quick)"
     )
+    backup_parser.add_argument(
+        "--keep",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Retain only the newest N local quick snapshots (only used with "
+        "--quick; default: 20)",
+    )
     backup_parser.set_defaults(func=cmd_backup)
