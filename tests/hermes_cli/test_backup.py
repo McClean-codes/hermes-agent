@@ -1342,6 +1342,53 @@ class TestQuickSnapshot:
         with pytest.raises(SystemExit):
             backup_mod.run_quick_backup(Namespace(quick=True, label=None, keep=0))
 
+    def test_prune_counts_only_generated_snapshot_ids(self, tmp_path):
+        """Regression: keep=N must apply only to generated quick-snapshot
+        directories, never to named archives or staging entries.
+
+        The named safety archive auth-json-pre-bws-cleanup-20260630-233827
+        previously consumed a keep slot: over 3 snapshots + the archive,
+        keep=2 pruned a real snapshot (or the archive itself). Classification
+        is the anchored generated-ID contract ^\\d{8}-\\d{6}(?:-|$) —
+        timestamped names with label/collision suffixes are snapshots; every
+        other directory (archive included, manifest presence notwithstanding)
+        is preserved. Hidden and .partial staging dirs stay excluded.
+        """
+        from hermes_cli.backup import _prune_quick_snapshots
+
+        root = tmp_path / "state-snapshots"
+        root.mkdir()
+
+        def _mk_dir(name: str, with_manifest: bool = True) -> None:
+            d = root / name
+            d.mkdir()
+            if with_manifest:
+                (d / "manifest.json").write_text("{}")
+
+        # Three generated snapshot IDs: plain, collision-suffix, label-suffix.
+        # The oldest is gutted (no manifest) — name alone must classify it.
+        _mk_dir("20260101-000000", with_manifest=False)
+        _mk_dir("20260101-000001-2")  # collision suffix
+        _mk_dir("20260101-000002-pre-bws")  # labelled, newest
+
+        # Named safety archive (stale manifest present — must still be kept)
+        # plus hidden/.partial staging entries (never snapshots).
+        _mk_dir("auth-json-pre-bws-cleanup-20260630-233827")
+        _mk_dir(".hidden-dir")
+        _mk_dir(".20260101-000002.12345.partial")
+
+        deleted = _prune_quick_snapshots(root, keep=2)
+
+        assert deleted == 1, f"expected exactly the oldest snapshot pruned, got {deleted}"
+        remaining = sorted(d.name for d in root.iterdir())
+        assert remaining == [
+            ".20260101-000002.12345.partial",
+            ".hidden-dir",
+            "20260101-000001-2",
+            "20260101-000002-pre-bws",
+            "auth-json-pre-bws-cleanup-20260630-233827",
+        ]
+
 
 class TestQuickSnapshotProjectsKanban:
     """Regression for #52889: projects.db / kanban.db must survive an upgrade.

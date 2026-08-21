@@ -11,6 +11,7 @@ HERMES_HOME root.
 import json
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import stat
@@ -1311,6 +1312,12 @@ _QUICK_STATE_FILES = (
 
 _QUICK_SNAPSHOTS_DIR = "state-snapshots"
 _QUICK_DEFAULT_KEEP = 20
+# Anchored contract for generated quick-snapshot IDs (%Y%m%d-%H%M%S plus an
+# optional ``-<label>``/``-<N>`` collision suffix). Snapshot classification
+# is name-based on purpose: manifest presence is not a reliable marker (stale
+# manifests can survive in gutted directories), while named directories such
+# as the auth-json-pre-bws-cleanup-* safety archive must never be pruned.
+_SNAPSHOT_ID_RE = re.compile(r"^\d{8}-\d{6}(?:-|$)")
 
 
 def _quick_snapshot_root(hermes_home: Optional[Path] = None) -> Path:
@@ -1777,7 +1784,14 @@ def restore_cron_jobs_if_emptied(
 
 
 def _prune_quick_snapshots(root: Path, keep: int = _QUICK_DEFAULT_KEEP) -> int:
-    """Remove oldest quick snapshots beyond the keep limit. Returns count deleted."""
+    """Remove oldest quick snapshots beyond the keep limit. Returns count deleted.
+
+    Only directories whose names match the generated quick-snapshot ID
+    contract (``^\\d{8}-\\d{6}(?:-|$)``) count against *keep*; hidden and
+    ``.partial`` staging directories are excluded. Named non-snapshot
+    directories (e.g. the auth-json-pre-bws-cleanup-* safety archive) are
+    always preserved, even when they contain a stale ``manifest.json``.
+    """
     if not root.exists():
         return 0
 
@@ -1785,7 +1799,10 @@ def _prune_quick_snapshots(root: Path, keep: int = _QUICK_DEFAULT_KEEP) -> int:
         (
             d
             for d in root.iterdir()
-            if d.is_dir() and not d.name.startswith(".") and not d.name.endswith(".partial")
+            if d.is_dir()
+            and not d.name.startswith(".")
+            and not d.name.endswith(".partial")
+            and _SNAPSHOT_ID_RE.match(d.name) is not None
         ),
         key=lambda d: d.name,
         reverse=True,
