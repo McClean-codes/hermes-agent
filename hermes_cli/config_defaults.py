@@ -1255,6 +1255,14 @@ DEFAULT_CONFIG = {
         },
     },
     
+    # Agent identity emoji shown on message acknowledgment and completion.
+    # Platforms that support reactions display this emoji while processing.
+    # Can be overridden per-platform under discord.persona_emoji, etc.
+    "persona_emoji": "",
+    # Swap the active reaction emoji to reflect the current tool call.
+    # Can be overridden per-platform under discord.dynamic_reactions, etc.
+    "dynamic_reactions": True,
+
     "display": {
         "compact": False,
         "personality": "",

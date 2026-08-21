@@ -4332,6 +4332,20 @@ class TurnRunner:
                     ctx._live_status_adapter.set_status_text(ctx.source.chat_id, None)
             except Exception as _ls_err:
                 logger.debug("live status update failed: %s", _ls_err)
+        # Fire on_tool_call_start hook for dynamic reaction swapping.
+        # Runs before the progress_queue guard so reactions work even when
+        # tool progress messages are off.
+        if event_type == "tool.started" and tool_name and getattr(ctx, "_status_adapter", None) and ctx._run_still_current():
+            try:
+                import asyncio as _asyncio
+                _asyncio.run_coroutine_threadsafe(
+                    ctx._status_adapter._run_processing_hook(
+                        "on_tool_call_start", ctx.source, tool_name
+                    ),
+                    ctx._loop_for_step,
+                )
+            except Exception:
+                pass
         # "log" mode: append tool.started lines to the log queue and stay
         # silent in chat. Handled before the progress_queue guard because
         # log mode runs without a chat progress queue.
@@ -5809,15 +5823,7 @@ class TurnRunner:
         # who set thinking_progress:true but kept tool_progress:off got a
         # None callback — so _thinking scratch bubbles never relayed even
         # though the progress queue was created for them.
-        agent.tool_progress_callback = (
-            ctx.progress_callback
-            if (
-                ctx.needs_progress_queue
-                or ctx.log_mode_enabled
-                or ctx._live_status_adapter is not None
-            )
-            else None
-        )
+        agent.tool_progress_callback = ctx.progress_callback  # always register — hook fires before progress_queue guard
         # Compose ID-bearing lifecycle consumers: Discord's one-time voice
         # ack and Slack's native task cards both ride the authoritative
         # start callback, so neither has to infer identity from tool names.
