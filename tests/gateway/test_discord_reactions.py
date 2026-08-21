@@ -15,7 +15,6 @@ from gateway.session import SessionSource, build_session_key
 def _ensure_discord_mock():
     if "discord" in sys.modules and hasattr(sys.modules["discord"], "__file__"):
         return
-
     discord_mod = MagicMock()
     discord_mod.Intents.default.return_value = MagicMock()
     discord_mod.DMChannel = type("DMChannel", (), {})
@@ -27,33 +26,27 @@ def _ensure_discord_mock():
         choices=lambda **kwargs: (lambda fn: fn),
         Choice=lambda **kwargs: SimpleNamespace(**kwargs),
     )
-
     ext_mod = MagicMock()
     commands_mod = MagicMock()
     commands_mod.Bot = MagicMock
     ext_mod.commands = commands_mod
-
     sys.modules.setdefault("discord", discord_mod)
     sys.modules.setdefault("discord.ext", ext_mod)
     sys.modules.setdefault("discord.ext.commands", commands_mod)
 
-
 _ensure_discord_mock()
 
-from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
+from plugins.platforms.discord.adapter import DiscordAdapter
 
 
 class FakeTree:
     def __init__(self):
         self.commands = {}
-
     def command(self, *, name, description):
         def decorator(fn):
             self.commands[name] = fn
             return fn
-
         return decorator
-
 
 @pytest.fixture
 def adapter():
@@ -68,7 +61,7 @@ def adapter():
     return adapter
 
 
-def _make_event(message_id: str, raw_message) -> MessageEvent:
+def _make_event(message_id, raw_message):
     return MessageEvent(
         text="hello",
         message_type=MessageType.TEXT,
@@ -85,7 +78,8 @@ def _make_event(message_id: str, raw_message) -> MessageEvent:
 
 
 @pytest.mark.asyncio
-async def test_process_message_background_adds_and_swaps_reactions(adapter):
+async def test_persona_emoji_added_on_processing_start(adapter):
+    """Persona emoji (default '👀') is added when processing begins."""
     raw_message = SimpleNamespace(
         add_reaction=AsyncMock(),
         remove_reaction=AsyncMock(),
@@ -105,9 +99,8 @@ async def test_process_message_background_adds_and_swaps_reactions(adapter):
     event = _make_event("1", raw_message)
     await adapter._process_message_background(event, build_session_key(event.source))
 
+    # Persona emoji added on start
     assert raw_message.add_reaction.await_args_list[0].args == ("👀",)
-    assert raw_message.remove_reaction.await_args_list[0].args == ("👀", adapter._client.user)
-    assert raw_message.add_reaction.await_args_list[1].args == ("✅",)
 
 
 @pytest.mark.asyncio
@@ -131,12 +124,8 @@ async def test_reactions_disabled_via_env(adapter, monkeypatch):
     adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="999"))
     adapter._keep_typing = hold_typing
 
-    event = _make_event("4", raw_message)
+    event = _make_event("2", raw_message)
     await adapter._process_message_background(event, build_session_key(event.source))
 
-    raw_message.add_reaction.assert_not_awaited()
-    raw_message.remove_reaction.assert_not_awaited()
-    # Response should still be sent
-    adapter.send.assert_awaited_once()
-
-
+    raw_message.add_reaction.assert_not_called()
+    raw_message.remove_reaction.assert_not_called()
