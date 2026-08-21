@@ -1,0 +1,74 @@
+name: A2A plugin integration tests
+
+# A2A integration-marked tests are deselected by the default pytest
+# addopts (`-m 'not integration'` in pyproject.toml) and are NOT run by
+# the main CI workflow (which only triggers on PRs and push-to-main).
+# That silently deselects the flagship delivery-loss regression
+# (`test_lost_push_regression_two_adapters` in
+# tests/plugins/test_a2a_delivery_loss_fixes.py) on the fleet's
+# `main` line. This job runs the hermetic A2A suites (all 204
+# tests in the three A2A plugin files, in-process adapters, ~30s) on
+# every push and on PRs targeting main.
+#
+# Scope is the explicit file list, not the `integration` marker: the
+# full marked set also contains tests that need external services
+# (Modal, Docker, live HA clusters, live model APIs), which live in
+# OTHER files and are intentionally not collected here. The
+# `-o addopts=""` override neutralizes the project-wide
+# `-m 'not integration'` default, which would otherwise re-deselect the
+# integration-marked tests (including the flagship regression).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: integration-a2a-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  a2a-integration:
+    name: A2A integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          # Pin the uv version (see tests.yml for the incident history
+          # behind this pin).
+          version: "0.9.28"
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: Install dependencies
+        uses: ./.github/actions/retry
+        with:
+          command: uv sync --locked --python 3.11 --extra all --extra dev
+
+      - name: Run A2A integration tests
+        run: |
+          source .venv/bin/activate
+          python -m pytest -o addopts="" \
+            tests/plugins/test_a2a_delivery_loss_fixes.py \
+            tests/plugins/test_a2a_plugin.py \
+            tests/plugins/test_a2a_phase23.py \
+            -v --tb=short
+        env:
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
