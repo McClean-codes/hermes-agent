@@ -1259,6 +1259,7 @@ def init_agent(
             _gr_label = " + Guardrails" if agent._bedrock_guardrail_config else ""
             print(f"🤖 AI Agent initialized with model: {agent.model} (AWS Bedrock, {agent._bedrock_region}{_gr_label})")
     else:
+        client_kwargs = {}
         if api_key and base_url:
             # Explicit credentials from CLI/gateway — construct directly.
             # The runtime provider resolver already handled auth for us.
@@ -1317,7 +1318,9 @@ def init_agent(
                 client_kwargs["default_headers"] = _ra()._qwen_portal_headers()
             elif base_url_host_matches(effective_base, "chatgpt.com"):
                 from agent.auxiliary_client import _codex_cloudflare_headers
-                client_kwargs["default_headers"] = _codex_cloudflare_headers(api_key)
+                client_kwargs["default_headers"] = _codex_cloudflare_headers(
+                    api_key, base_url=effective_base,
+                )
             elif base_url_host_matches(effective_base, "x.ai"):
                 from tools.xai_http import hermes_xai_default_headers
 
@@ -1430,6 +1433,19 @@ def init_agent(
                         "select a provider, or run `hermes setup` for first-time "
                         "configuration."
                     )
+        # Bedrock GPT-5.5/5.6 use Bedrock Mantle's OpenAI Responses endpoint.
+        # Runtime resolution uses api_key="aws-sdk" as the IAM-auth sentinel;
+        # attach an httpx client that SigV4-signs every OpenAI SDK request.
+        # No-op for non-Mantle base URLs.
+        try:
+            from agent.bedrock_adapter import configure_bedrock_openai_client_kwargs
+            configure_bedrock_openai_client_kwargs(
+                client_kwargs,
+                timeout=_provider_timeout,
+            )
+        except Exception:
+            if agent.provider == "bedrock" and "bedrock-mantle." in str(client_kwargs.get("base_url", "")):
+                raise
         
         agent._client_kwargs = client_kwargs  # stored for rebuilding after interrupt
 
