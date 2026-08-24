@@ -60,7 +60,6 @@ def adapter():
     )
     return adapter
 
-
 def _make_event(message_id, raw_message):
     return MessageEvent(
         text="hello",
@@ -129,3 +128,182 @@ async def test_reactions_disabled_via_env(adapter, monkeypatch):
 
     raw_message.add_reaction.assert_not_called()
     raw_message.remove_reaction.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Regression tests: tool transitions, final cleanup, and edge cases
+# ---------------------------------------------------------------------------
+
+
+def _make_tool_source():
+    """SessionSource matching the adapter fixture's chat_id."""
+    return SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="123",
+        chat_type="dm",
+        user_id="42",
+        user_name="Jezza",
+    )
+
+
+@pytest.mark.asyncio
+async def test_tool_transition_add_before_remove(adapter):
+    """Tool calls store state under the same message-ID key as start/complete.
+    Before the fix, tool calls stored under a session key, causing the final
+    cleanup to miss the tool state entirely."""
+    adapter._rxn_dynamic = True
+    adapter._rxn_cooldown = 0
+
+    raw = SimpleNamespace(
+        id="msg1",
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+    )
+    event = _make_event("msg1", raw)
+
+    # processing start — must go through adapter.on_processing_start
+    # (populates _session_raw_messages for on_tool_call_start to find)
+    await adapter.on_processing_start(event)
+    persona_emoji = adapter._rxn_persona_emoji
+    assert raw.add_reaction.await_args_list[0].args == (persona_emoji,)
+
+    # tool call via adapter.on_tool_call_start (SessionSource, not event)
+    source = _make_tool_source()
+    await adapter.on_tool_call_start(source, "tool_a")
+
+    # tool emoji added before persona removed
+    tool_add = raw.add_reaction.await_args_list[-1]
+    persona_removes = [
+        c for c in raw.remove_reaction.await_args_list if c.args[0] == persona_emoji
+    ]
+    assert len(persona_removes) == 1
+    assert tool_add.called_before(persona_removes[0])
+
+    # State is tracked under the message-ID key (not session key)
+    assert "msg1" in adapter._rxn_active, (
+        "tool state must be under message-ID key, not session key"
+    )
+
+    # Now complete — persona add should come before tool remove
+    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+    persona_adds = [
+        c for c in raw.add_reaction.await_args_list if c.args[0] == persona_emoji
+    ]
+    tool_removes = [
+        c for c in raw.remove_reaction.await_args_list
+        if c.args[0] == tool_add.args[0]
+    ]
+    assert len(tool_removes) == 1, "tool emoji should be removed on completion"
+    assert persona_adds[-1].called_before(tool_removes[0])
+    assert adapter._rxn_active == {}
+
+
+@pytest.mark.asyncio
+async def test_completion_after_tool_removes_tool_emoji(adapter):
+    """Successful completion after a tool call produces add(persona) before
+    remove(last_tool) and leaves only the persona emoji effective."""
+    adapter._rxn_dynamic = True
+    adapter._rxn_cooldown = 0
+
+    raw = SimpleNamespace(
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+    )
+    event = _make_event("msg2", raw)
+
+    # processing start
+    await adapter._rxn_on_processing_start(event)
+
+    # tool call
+    source = _make_tool_source()
+    await adapter.on_tool_call_start(source, "read_file")
+
+    # get the tool emoji that was added
+    tool_emoji = raw.add_reaction.await_args_list[-1].args[0]
+
+    # successful completion
+    await adapter._rxn_on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+    # find persona add and tool remove
+    persona_adds = [
+        c for c in raw.add_reaction.await_args_list if c.args[0] == "👀"
+    ]
+    tool_removes = [
+        c for c in raw.remove_reaction.await_args_list if c.args[0] == tool_emoji
+    ]
+    assert len(persona_adds) >= 2  # start + completion
+    assert len(tool_removes) == 1
+    # last persona add must come before tool remove
+    assert persona_adds[-1].called_before(tool_removes[0])
+
+    # effective final state: only persona emoji
+    assert adapter._rxn_active == {}
+
+
+@pytest.mark.asyncio
+async def test_completion_no_tool_call_no_duplicate(adapter):
+    """Completion without any tool call succeeds cleanly — no leftover state.
+    The persona emoji is already active so no redundant add/remove happens."""
+    raw = SimpleNamespace(
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+    )
+    event = _make_event("msg3", raw)
+
+    await adapter._rxn_on_processing_start(event)
+    await adapter._rxn_on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+    # Only persona was added once at start — completion sees it already active
+    # and correctly skips a redundant add/remove (the "!= current" guard).
+    persona_adds = [
+        c for c in raw.add_reaction.await_args_list if c.args[0] == "👀"
+    ]
+    assert len(persona_adds) == 1
+    # No removals (no tool emoji existed)
+    raw.remove_reaction.assert_not_called()
+    # Active state is cleaned up
+    assert adapter._rxn_active == {}
+
+
+@pytest.mark.asyncio
+async def test_tool_progress_disabled_still_fires_hook(adapter):
+    """on_tool_call_start fires even when progress messages are off,
+    because the reaction hook runs before the progress_queue guard."""
+    adapter._rxn_dynamic = True
+    adapter._rxn_cooldown = 0
+
+    raw = SimpleNamespace(
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+    )
+    event = _make_event("msg4", raw)
+
+    await adapter._rxn_on_processing_start(event)
+    # The hook should succeed regardless of progress queue state
+    source = _make_tool_source()
+    await adapter.on_tool_call_start(source, "terminal")
+
+    tool_adds = [
+        c for c in raw.add_reaction.await_args_list if c.args[0] != "👀"
+    ]
+    assert len(tool_adds) == 1, "tool emoji was added despite no progress queue"
+
+
+@pytest.mark.asyncio
+async def test_disabled_reactions_no_changes(adapter, monkeypatch):
+    """Reactions disabled via env: no add or remove at any lifecycle stage."""
+    monkeypatch.setenv("DISCORD_REACTIONS", "false")
+
+    raw = SimpleNamespace(
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+    )
+    event = _make_event("msg5", raw)
+
+    await adapter._rxn_on_processing_start(event)
+    source = _make_tool_source()
+    await adapter._rxn_on_tool_call_start(source, "terminal")
+    await adapter._rxn_on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+    raw.add_reaction.assert_not_called()
+    raw.remove_reaction.assert_not_called()

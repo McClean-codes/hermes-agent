@@ -139,6 +139,7 @@ except ImportError:
     commands = None
 
 import sys
+from types import SimpleNamespace
 from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
 
@@ -3404,7 +3405,22 @@ class DiscordAdapter(DynamicReactionMixin, BasePlatformAdapter):
         )
 
     async def on_tool_call_start(self, event, tool_name: str) -> None:
-        """Swap the active reaction to the tool-specific emoji."""
+        """Swap the active reaction to the tool-specific emoji.
+
+        ``event`` is the ``SessionSource`` from ``ctx.source`` (set by
+        ``TurnRunner.progress_callback``).  The reaction mixin's
+        ``_reaction_msg_key`` would derive a session-level key from it,
+        but ``on_processing_start`` / ``on_processing_complete`` store
+        state under the Discord message ID.  Look up the cached raw
+        message so the same message-ID key is used across the entire
+        lifecycle — without this, the final tool-emoji removal would
+        never fire because it looks up a key that was never written.
+        """
+        source = getattr(event, "source", event)
+        key = self._session_key_from_source(source)
+        raw = self._session_raw_messages.get(key)
+        if raw is not None:
+            event = SimpleNamespace(raw_message=raw, source=source)
         await self._rxn_on_tool_call_start(event, tool_name)
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
