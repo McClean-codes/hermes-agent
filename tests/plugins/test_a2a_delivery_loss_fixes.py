@@ -204,7 +204,7 @@ def test_push_round_trip_surfaces_peer_reply(monkeypatch, tmp_path):
         )
         pushed: list[dict] = []
 
-        def fake_post(url, body, headers, timeout):
+        def fake_post(url, body, headers, timeout, **kw):
             pushed.append(body)
             return protocol.jsonrpc_result(
                 body["id"],
@@ -441,7 +441,7 @@ def test_send_task_stamps_sender_with_timeout_no_live_adapter(monkeypatch, tmp_p
     monkeypatch.setattr(tools, "_fetch_card", lambda *a, **k: None)
     posted: dict = {}
 
-    def fake_post(url, body, headers, timeout):
+    def fake_post(url, body, headers, timeout, **kw):
         posted["body"] = body
         return protocol.jsonrpc_result(
             body["id"],
