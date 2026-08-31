@@ -447,24 +447,45 @@ def _handle_send(args):
 
     used_home_channel = False
     if not chat_id:
-        home = config.get_home_channel(platform)
-        if not home and platform_name == "weixin":
-            wx_home = os.getenv("WEIXIN_HOME_CHANNEL", "").strip()
-            if wx_home:
-                from gateway.config import HomeChannel
-                home = HomeChannel(platform=platform, chat_id=wx_home, name="Weixin Home")
-        if home:
-            chat_id = home.chat_id
-            used_home_channel = True
+        # A2A origin rule: a confirmation emitted
+        # from an A2A session for a context that was born in a real gateway
+        # session (e.g. a Discord thread) must return to that origin's
+        # chat/thread — the session that initiated the A2A exchange. The
+        # home channel is only the fallback when no origin exists; without
+        # this, A2A confirmations post to the platform-wide default channel
+        # instead of the originating thread.
+        try:
+            from plugins.platforms.a2a.tools import _current_a2a_origin_target
+            origin_target = _current_a2a_origin_target(platform_name)
+        except Exception:
+            origin_target = {}
+        if origin_target:
+            chat_id = origin_target["chat_id"]
+            thread_id = origin_target.get("thread_id") or thread_id
+            logger.info(
+                "send_message: A2A session confirmation routed to origin %s chat %s (thread %s) "
+                "instead of the home channel",
+                platform_name, chat_id, thread_id,
+            )
         else:
-            home_env = _HOME_CHANNEL_ENV_OVERRIDES.get(
-                platform_name, f"{platform_name.upper()}_HOME_CHANNEL"
-            )
-            return tool_error(
-                f"No home channel set for {platform_name} to determine where to send the message. "
-                f"Either specify a channel directly with '{platform_name}:CHANNEL_NAME', "
-                f"or set a home channel via: hermes config set {home_env} <channel_id>"
-            )
+            home = config.get_home_channel(platform)
+            if not home and platform_name == "weixin":
+                wx_home = os.getenv("WEIXIN_HOME_CHANNEL", "").strip()
+                if wx_home:
+                    from gateway.config import HomeChannel
+                    home = HomeChannel(platform=platform, chat_id=wx_home, name="Weixin Home")
+            if home:
+                chat_id = home.chat_id
+                used_home_channel = True
+            else:
+                home_env = _HOME_CHANNEL_ENV_OVERRIDES.get(
+                    platform_name, f"{platform_name.upper()}_HOME_CHANNEL"
+                )
+                return tool_error(
+                    f"No home channel set for {platform_name} to determine where to send the message. "
+                    f"Either specify a channel directly with '{platform_name}:CHANNEL_NAME', "
+                    f"or set a home channel via: hermes config set {home_env} <channel_id>"
+                )
 
     duplicate_skip = _maybe_skip_cron_duplicate_send(platform_name, chat_id, thread_id)
     if duplicate_skip:
@@ -608,14 +629,6 @@ def _parse_target_ref(platform_name: str, target_ref: str):
         if group_id:
             return f"group:{group_id}", None, True
         return None, None, False
-    # WeCom: group IDs start with "wr" or "wc", user IDs start with "wo" or
-    # are bare alphanumeric strings. Treat any non-empty WeCom target_ref as
-    # an explicit chat_id — the adapter resolves whether to use APP_CMD_RESPONSE
-    # (groups) or APP_CMD_SEND (DMs) internally.
-    if platform_name == "wecom":
-        stripped = target_ref.strip()
-        if stripped:
-            return stripped, None, True
     if platform_name in _PHONE_PLATFORMS:
         match = _E164_TARGET_RE.fullmatch(target_ref)
         if match:
@@ -1155,18 +1168,6 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         Platform.TELEGRAM: TelegramAdapter.MAX_MESSAGE_LENGTH if _telegram_available else 4096,
     }
 
-    # Signal's standalone path (_send_signal) speaks raw JSON-RPC and does not
-    # go through SignalAdapter.send(), so it never benefits from the adapter's
-    # native chunking. Register the platform limit here so the shared
-    # truncate_message() pass below splits long sends instead of signal-cli
-    # rejecting them. Sourced from the adapter module so the two paths can't
-    # drift (credit: @5L-hermes01 in #67279, @lkz-de in #57929).
-    try:
-        from gateway.platforms.signal import MAX_MESSAGE_LENGTH as _SIGNAL_MAX
-        _MAX_LENGTHS[Platform.SIGNAL] = _SIGNAL_MAX
-    except ImportError:
-        _MAX_LENGTHS[Platform.SIGNAL] = 8000
-
     # Check plugin registry for max_message_length
     if platform not in _MAX_LENGTHS:
         try:
@@ -1439,25 +1440,6 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 chunk,
                 thread_id=thread_id,
                 media_files=media_files if is_last else [],
-                force_document=force_document,
-            )
-            if isinstance(result, dict) and result.get("error"):
-                return result
-            last_result = result
-        return last_result
-
-    # --- WeCom: native media attachment support via live gateway adapter ---
-    if platform == Platform.WECOM and media_files:
-        last_result = None
-        for i, chunk in enumerate(chunks):
-            is_last = (i == len(chunks) - 1)
-            result = await _send_via_adapter(
-                platform,
-                pconfig,
-                chat_id,
-                chunk,
-                thread_id=thread_id,
-                media_files=media_files if is_last else None,
                 force_document=force_document,
             )
             if isinstance(result, dict) and result.get("error"):

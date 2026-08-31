@@ -258,15 +258,43 @@ def data_part(data: Any, media_type: str = "application/json") -> dict:
     return {"data": data, "mediaType": media_type}
 
 
-def text_message(role: str, text: str, context_id: str = "") -> dict:
-    """Build an A2A v1.0 Message with a single text Part."""
+def text_message(role: str, text: str, context_id: str = "",
+                  sender: Optional[dict] = None,
+                  metadata: Optional[dict] = None) -> dict:
+    """Build an A2A v1.0 Message with a single text Part.
+
+    ``sender`` is the v1.0 AgentName identity of the sending agent
+    (``agentId`` / ``name`` / optional ``url``).  Peers use it to learn this
+    gateway's real endpoint so out-of-band completion pushes can be routed
+    back with the port included — the gap that left port-less ``ip:``
+    identities unresolvable as push targets.
+
+    Sender identity is carried inside the standard A2A ``metadata`` field
+    under the namespaced key ``a2a.sender`` — **not** as a non-standard
+    top-level field.  A strict A2A parser rejects unknown top-level keys;
+    carrying sender inside metadata avoids that rejection while preserving
+    the identity exchange that makes out-of-band pushes work.
+    """
     msg: dict[str, Any] = {
         "role": role,  # ROLE_USER | ROLE_AGENT
         "parts": [text_part(text)],
         "messageId": uuid.uuid4().hex,
     }
+    if isinstance(sender, dict) and sender:
+        # Strip bearer tokens and other sensitive fields before putting
+        # sender in metadata — tokens must never enter the wire message
+        # or evidence logs.
+        _SENSITIVE_SENDER_KEYS = frozenset({"token", "auth", "secret", "password"})
+        meta = dict(metadata or {})
+        meta["a2a.sender"] = {
+            k: v for k, v in sender.items()
+            if v is not None and k.lower() not in _SENSITIVE_SENDER_KEYS
+        }
+        metadata = meta
     if context_id:
         msg["contextId"] = context_id
+    if metadata:
+        msg["metadata"] = dict(metadata)
     return msg
 
 
@@ -353,6 +381,34 @@ def extract_text(message_or_params: dict) -> str:
             chunks.append(f"[data]\n{rendered}")
             continue
     return "\n".join(chunks).strip()
+
+
+def extract_sender(message_or_params: dict) -> Optional[dict]:
+    """Extract sender identity from an A2A Message's standard metadata.
+
+    Sender is carried inside the ``metadata`` field under the key
+    ``a2a.sender`` — never as a non-standard top-level field (the A2A v1.0
+    spec defines a fixed Message shape; unknown top-level keys cause strict
+    parsers to reject the message).
+
+    Returns the sender dict ``{agentId, name, url, ...}`` or ``None`` when
+    absent or malformed.
+    """
+    msg = message_or_params.get("message", message_or_params)
+    if not isinstance(msg, dict):
+        return None
+    metadata = msg.get("metadata")
+    if not isinstance(metadata, dict):
+        return None
+    sender = metadata.get("a2a.sender")
+    return sender if isinstance(sender, dict) else None
+
+
+# A2A v1.0 Message top-level keys — used by the strict shape witness
+# to verify no non-standard fields are emitted on the wire.
+A2A_MESSAGE_KNOWN_KEYS = frozenset({
+    "role", "parts", "messageId", "contextId", "metadata",
+})
 
 
 def extract_context_id(params: dict) -> str:
