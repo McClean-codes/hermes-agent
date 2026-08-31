@@ -25,7 +25,9 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Optional, TypedDict
@@ -74,22 +76,135 @@ def _auth_header(auth: dict) -> dict:
     return {}
 
 
-# --------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Origin + redirect security (ported from #86322)
+# ---------------------------------------------------------------------------
+
+def _url_origin(url: str) -> tuple[str, str]:
+    """(scheme, host:port) of a URL, lowercased; port defaulted per scheme."""
+    parsed = urllib.parse.urlsplit(url.strip())
+    host = (parsed.hostname or "").lower()
+    # parsed.port is None when absent; explicit :0 is a real (if unroutable)
+    # port and must not be silently defaulted.
+    port = parsed.port if parsed.port is not None else (443 if parsed.scheme == "https" else 80)
+    return parsed.scheme.lower(), f"{host}:{port}"
+
+
+def _url_same_origin(candidate: str, configured: str) -> bool:
+    """True when candidate and configured share scheme + host + port."""
+    try:
+        return _url_origin(candidate) == _url_origin(configured)
+    except ValueError:
+        return False
+
+
+def _allowed_rpc_origins(peer: dict) -> list[str]:
+    """Operator-pinned cross-origin RPC URLs exempt from the origin check.
+
+    Entries are compared by ORIGIN (scheme + host + port), so an entry pins
+    the whole service, not one exact path.
+    """
+    raw = peer.get("allowed_rpc_origins") or []
+    if isinstance(raw, str):
+        raw = [raw]
+    return [str(u).rstrip("/") for u in raw if str(u).strip()]
+
+
+def _origin_allowed(candidate: str, peer: dict) -> bool:
+    """True when candidate's origin is the configured origin or a pinned
+    allowed origin (origin-level match, not exact string)."""
+    try:
+        cand = _url_origin(candidate)
+    except ValueError:
+        return False
+    try:
+        if _url_same_origin(candidate, peer.get("url", "")):
+            return True
+    except ValueError:
+        pass
+    for entry in _allowed_rpc_origins(peer):
+        try:
+            if _url_origin(entry) == cand:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+# Redirects are a credential-exfiltration vector: urllib's default opener
+# follows 3xx responses and forwards the full header map (Authorization,
+# proxy service tokens) to whatever host the redirect points at. Peers are
+# semi-trusted (card-controlled), so every hop must stay inside the origin
+# policy or the send dies.
+class _NoCredentialRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Fail-closed redirect policy for credential-bearing requests."""
+
+    def __init__(self, allowed_origins: tuple[str, ...] = ()):
+        self.allowed_origins = allowed_origins
+        super().__init__()
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        original = req.full_url
+        if _url_same_origin(newurl, original) or any(
+                _url_same_origin(newurl, o) for o in self.allowed_origins):
+            return super().redirect_request(req, fp, code, msg, headers, newurl)
+        raise urllib.error.HTTPError(
+            req.full_url, code,
+            f"A2A redirect to cross-origin {newurl} refused (not same-origin, not in allowed_rpc_origins)",
+            headers, fp)
+
+
+def _open_url_no_redirect_leak(req: urllib.request.Request, timeout: int,
+                               allowed_origins: tuple[str, ...] = ()) -> Any:
+    """urlopen with fail-closed cross-origin redirect handling."""
+    opener = urllib.request.build_opener(_NoCredentialRedirectHandler(allowed_origins))
+    return opener.open(req, timeout=timeout)
+
+
+class _A2aIndeterminateError(Exception):
+    """A 524 (origin timeout) — the peer may have executed the task, but the
+    response was lost.  Mutating sends are NEVER auto-retried: without a
+    proven server-side idempotency contract a replay could execute the task
+    twice.  The caller surfaces the indeterminate outcome; recovery composes
+    with explicit task-identity polling instead."""
+
+
+# ---------------------------------------------------------------------------
 # HTTP
-# --------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
-def _http_get_json(url: str, headers: dict, timeout: int) -> dict:
-    req = urllib.request.Request(url, headers=headers, method="GET")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 (configured peers)
+def _http_get_json(url: str, headers: dict, timeout: int,
+                   allowed_origins: tuple[str, ...] = ()) -> dict:
+    req = urllib.request.Request(url, headers={"User-Agent": "Hermes-A2A/1.0", **headers}, method="GET")
+    with _open_url_no_redirect_leak(req, timeout, allowed_origins) as resp:  # noqa: S310 (configured peers)
         return json.loads(resp.read().decode("utf-8"))
 
 
-def _http_post_json(url: str, body: dict, headers: dict, timeout: int) -> dict:
+def _http_post_json(url: str, body: dict, headers: dict, timeout: int,
+                    allowed_origins: tuple[str, ...] = ()) -> dict:
     data = json.dumps(body).encode("utf-8")
-    hdrs = {"Content-Type": "application/json", "A2A-Version": protocol.PROTOCOL_VERSION, **headers}
+    # Custom peer headers are operator-controlled but Content-Type and
+    # A2A-Version are protocol-owned and must not be clobbered; a config typo
+    # would otherwise cause peer rejection or protocol-version mismatches.
+    # User-Agent stays overridable (some proxies filter user agents).
+    hdrs = {
+        "User-Agent": "Hermes-A2A/1.0",
+        **headers,
+        "Content-Type": "application/json",
+        "A2A-Version": protocol.PROTOCOL_VERSION,
+    }
     req = urllib.request.Request(url, data=data, headers=hdrs, method="POST")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 (configured peers)
-        return json.loads(resp.read().decode("utf-8"))
+
+    try:
+        with _open_url_no_redirect_leak(req, timeout, allowed_origins) as resp:  # noqa: S310 (configured peers)
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if e.code == 524:
+            raise _A2aIndeterminateError(
+                f"peer origin timed out behind its proxy (HTTP 524); the task "
+                f"may have executed — outcome indeterminate, not retried"
+            ) from e
+        raise
 
 
 def _card_url(base_url: str) -> str:
@@ -102,13 +217,14 @@ def _legacy_card_url(base_url: str) -> str:
     return base_url.rstrip("/") + "/.well-known/agent.json"
 
 
-def _fetch_card(base_url: str, headers: dict, timeout: int) -> dict:
+def _fetch_card(base_url: str, headers: dict, timeout: int,
+                allowed_origins: tuple[str, ...] = ()) -> dict:
     try:
-        return _http_get_json(_card_url(base_url), headers, timeout)
+        return _http_get_json(_card_url(base_url), headers, timeout, allowed_origins)
     except urllib.error.HTTPError as e:
         if e.code != 404:
             raise
-    return _http_get_json(_legacy_card_url(base_url), headers, timeout)
+    return _http_get_json(_legacy_card_url(base_url), headers, timeout, allowed_origins)
 
 
 def _select_jsonrpc_interface(card: Optional[dict]) -> Optional[dict]:
@@ -218,15 +334,39 @@ def _send_task(agent_label: str, peer: dict, message: str, context_id: str) -> t
     outbound redaction, audit, persistence, and metrics.
     """
     base_url = peer.get("url", "")
-    headers = _auth_header(peer.get("auth", {}) or {})
+    headers = {**_auth_header(peer.get("auth", {}) or {}), **(peer.get("headers", {}) or {})}
     timeout = int(peer.get("timeout", _DEFAULT_TIMEOUT))
+    auth = peer.get("auth", {}) or {}
+    if auth and any(k.lower() == "authorization" for k in (peer.get("headers", {}) or {})):
+        logger.warning(
+            "A2A: peer '%s' custom headers override the derived Authorization "
+            "header — deliberate proxy auth schemes only",
+            agent_label)
+    allowed = tuple(_allowed_rpc_origins(peer))
 
     # Best-effort card fetch (to learn the rpc URL); non-fatal on failure.
+    # The card is fetched AT the configured origin with the full credential
+    # map — same destination the operator pinned the credentials for (a
+    # Cloudflare-Access-fronted peer otherwise 403s the card and streaming
+    # discovery is lost). The egress bound is enforced on the RPC destination
+    # after the fetch: a card-advertised cross-origin URL never receives them.
     card = None
     try:
-        card = _fetch_card(base_url, headers, min(timeout, 30))
+        card = _fetch_card(base_url, headers, min(timeout, 30), allowed)
     except Exception:
         pass
+
+    rpc_url = _rpc_url(base_url, card)
+    if not _origin_allowed(rpc_url, peer):
+        # The card advertised an RPC interface on a different origin than the
+        # configured base URL. Sending there would forward operator secrets
+        # (bearer tokens, proxy service tokens) to a card-controlled host.
+        # Refuse: fall back to the configured origin, never follow the card.
+        logger.warning(
+            "A2A: peer '%s' card advertised cross-origin RPC URL %s; not in "
+            "peer's allowed_rpc_origins — using configured origin %s instead",
+            agent_label, rpc_url, base_url)
+        rpc_url = base_url.rstrip("/")
 
     ctx = context_id or protocol.new_context_id()
     safe_message = security.redact_outbound(message)
@@ -285,7 +425,7 @@ def _send_task(agent_label: str, peer: dict, message: str, context_id: str) -> t
     protocol.persist_message(ctx, "user", safe_message, rpc_body["id"])
     protocol.metrics.outbound_total += 1
 
-    resp = _http_post_json(_rpc_url(base_url, card), rpc_body, headers, timeout)
+    resp = _http_post_json(rpc_url, rpc_body, headers, timeout, allowed_origins=allowed)
     if "error" in resp:
         err = resp["error"]
         raise ValueError(f"Peer '{agent_label}' returned an error: {err.get('message', err)}")
@@ -398,6 +538,11 @@ def a2a_call(args: dict, **_: Any) -> str:
 
     try:
         reply, reply_ctx, state = _send_task(agent, peer, message, context_id)
+    except _A2aIndeterminateError as e:
+        return (f"Error: call to '{agent}' is INDETERMINATE — {e}. "
+                f"Do not blindly retry a mutating request; check with the peer "
+                f"(task id {getattr(e, 'task_id', 'unknown')}) or retry only "
+                f"if the operation is safe to repeat.")
     except urllib.error.HTTPError as e:
         if e.code in (401, 403):
             return f"Error: peer '{agent}' rejected auth (HTTP {e.code}). Check the configured token."
