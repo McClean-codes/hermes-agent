@@ -330,6 +330,18 @@ def _merge_fanout_children(
     return out
 
 
+_TASK_LEDGER_FILE = "a2a_task_ledger.json"
+
+
+def _task_ledger_path() -> Path:
+    try:
+        from hermes_constants import get_hermes_home
+        base = Path(get_hermes_home())
+    except Exception:
+        base = Path(os.path.expanduser("~/.hermes"))
+    return base / _TASK_LEDGER_FILE
+
+
 def _reset_worker_session_vars() -> None:
     """Reset session-context vars bound on an HTTP worker thread.
 
@@ -1537,6 +1549,17 @@ class A2AAdapter(BasePlatformAdapter):
                 restored_fanout, _fanout_children_path(),
             )
 
+        # Restore task ledger so GetTask/ListTasks/SubscribeToTask survive
+        # gateway restarts.  Terminal task records (COMPLETED, FAILED,
+        # CANCELED) and recent non-terminal tasks are persisted by
+        # _persist_task_ledger on every task completion.
+        restored_tasks = self.tasks.restore(_task_ledger_path())
+        if restored_tasks:
+            logger.info(
+                "A2A: restored %d task record(s) from %s",
+                restored_tasks, _task_ledger_path(),
+            )
+
         self._mark_connected()
 
         exposure = (
@@ -2288,6 +2311,13 @@ class A2AAdapter(BasePlatformAdapter):
             protocol.metrics.tasks_failed += 1
 
         self.tasks.complete(task_id, state, reply)
+        # Persist the task ledger so GetTask/ListTasks/SubscribeToTask
+        # survive a gateway restart.  Best-effort: persistence failure
+        # must not break the task completion path.
+        try:
+            self.tasks.persist(_task_ledger_path())
+        except Exception:
+            logger.debug("A2A: could not persist task ledger", exc_info=True)
         self._send_push_notification(task_id, context_id, reply, state)
         return state, reply
 
