@@ -540,6 +540,22 @@ def scoped_current_board(slug: str):
     finally:
         _CURRENT_BOARD_OVERRIDE.reset(token)
 
+
+def is_worker_scoped() -> bool:
+    """Return True when the current process is a dispatcher-spawned worker.
+
+    Workers have ``HERMES_KANBAN_TASK`` injected by the dispatcher at spawn
+    time.  Orchestrator and CLI sessions never have this env var set (the
+    var name is exclusively owned by the dispatcher→worker handoff).
+
+    Used by :func:`kanban_db_path` to decide whether an explicit ``board``
+    argument may override the env-pinned ``HERMES_KANBAN_DB`` path: workers
+    are board-isolated and must not escape; orchestrators may route to an
+    explicit project board.
+    """
+    return bool(os.environ.get("HERMES_KANBAN_TASK"))
+
+
 # Slug validator: lowercase alphanumerics, digits, hyphens; 1–64 chars.
 # Strict enough to stop traversal (`..`) and embedded path separators, loose
 # enough that kebab-case names like ``atm10-server`` or ``hermes-agent``
@@ -710,6 +726,42 @@ def board_exists(board: Optional[str] = None) -> bool:
     return (d / "board.json").exists() or (d / "kanban.db").exists()
 
 
+def _board_slug_from_db_path(db_path: Path) -> str:
+    """Infer the board slug from a ``HERMES_KANBAN_DB`` path.
+
+    The default board DB lives at ``<root>/kanban.db`` (no board slug in
+    the path).  Non-default boards use
+    ``<root>/kanban/boards/<slug>/kanban.db``.
+
+    Returns the slug string (``DEFAULT_BOARD`` for the legacy path).
+    """
+    parts = db_path.parts
+    # Look for the 'boards' directory segment; the slug is the next one.
+    try:
+        idx = len(parts) - 1 - parts[::-1].index("boards")
+        return parts[idx + 1]
+    except ValueError:
+        pass
+    # Fallback: if the DB is at <root>/kanban.db (no boards/ in path),
+    # it's the default board.
+    if db_path.name == "kanban.db" and "boards" not in db_path.parts:
+        return DEFAULT_BOARD
+    # Last resort: treat it as the default board.
+    return DEFAULT_BOARD
+
+
+def _resolve_board_db_path(slug: str) -> Path:
+    """Resolve a board slug to its ``kanban.db`` path.
+
+    This is the resolution that applies when the env pin is intentionally
+    bypassed (e.g. unscoped orchestrator with an explicit ``board`` arg).
+    ``default`` keeps the legacy path for back-compat.
+    """
+    if slug == DEFAULT_BOARD:
+        return kanban_home() / "kanban.db"
+    return board_dir(slug) / "kanban.db"
+
+
 def kanban_db_path(board: Optional[str] = None) -> Path:
     """Return the path to the ``kanban.db`` for ``board``.
 
@@ -719,15 +771,54 @@ def kanban_db_path(board: Optional[str] = None) -> Path:
        back-compat and for the dispatcher→worker handoff (defense in
        depth: dispatcher injects this into worker env so workers are
        immune to any path-resolution disagreement).
+
+       **Worker isolation:** when the caller is a dispatcher-spawned worker
+       (``HERMES_KANBAN_TASK`` set) and an explicit ``board`` is passed
+       that differs from the pinned DB's board, a ``ValueError`` is raised
+       — workers must not escape their assigned board.
+
     2. When ``board`` arg is None, the active board from
        :func:`get_current_board` is used.
+
     3. Board ``default`` → ``<root>/kanban.db`` (back-compat path).
        Other boards → ``<root>/kanban/boards/<slug>/kanban.db``.
+
+    **Unscoped orchestrator override:** when ``board`` is explicitly passed
+    and the caller is *not* a worker (``HERMES_KANBAN_TASK`` absent), the
+    explicit board is resolved directly — the env pin is bypassed so that
+    an orchestrator can route ``kanban_create(board="caribbean-monitor")``
+    to the correct project DB even when ``HERMES_KANBAN_DB`` is set to a
+    different board.
     """
     override = os.environ.get("HERMES_KANBAN_DB", "").strip()
+    explicit_slug = _normalize_board_slug(board)
+
     if override:
-        return Path(override).expanduser()
-    slug = _normalize_board_slug(board)
+        pinned_path = Path(override).expanduser()
+        if explicit_slug is not None:
+            # An explicit board was passed.  Decide whether to honour it
+            # or the env pin based on worker-scoping.
+            if is_worker_scoped():
+                # Worker: enforce isolation.  The pinned DB must belong to
+                # the requested board — if not, refuse.
+                pinned_slug = _board_slug_from_db_path(pinned_path)
+                if pinned_slug != explicit_slug:
+                    raise ValueError(
+                        f"worker is board-pinned to {pinned_slug!r} via "
+                        f"HERMES_KANBAN_DB; refusing to route to "
+                        f"{explicit_slug!r}. Use kanban_create without a "
+                        f"board argument, or let the dispatcher assign "
+                        f"tasks on the correct board."
+                    )
+                # Same board — use the pinned path (keeps worker consistent).
+                return pinned_path
+            else:
+                # Unscoped orchestrator with explicit board: honour it.
+                return _resolve_board_db_path(explicit_slug)
+        # No explicit board — use the env pin (existing behaviour).
+        return pinned_path
+
+    slug = explicit_slug
     if slug is None:
         slug = get_current_board()
     if slug == DEFAULT_BOARD:
