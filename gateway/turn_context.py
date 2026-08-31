@@ -42,6 +42,7 @@ class TurnContext:
     progress_mode: str = "off"
     progress_grouping: str = "grouped"
     tool_progress_enabled: bool = False
+    tool_progress_filter: Optional[dict] = None
 
     # --- queues ----------------------------------------------------------
     progress_queue: Any = None
