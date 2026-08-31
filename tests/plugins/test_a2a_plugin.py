@@ -705,7 +705,8 @@ class TestOutOfBandReply:
 
     def _adapter_with_peer(self, peer="alice"):
         adapter = _bare_adapter()
-        adapter.tasks.create("task-1", "ctx-x", peer)
+        rec = adapter.tasks.create("task-1", "ctx-x", peer)
+        adapter.tasks.complete("task-1", protocol.STATE_COMPLETED, "initial")
         adapter._context_peers["ctx-x"] = peer
         return adapter
 
@@ -744,7 +745,10 @@ class TestOutOfBandReply:
     def test_out_of_band_send_unknown_peer_is_failure(self, monkeypatch):
         """A context with no recorded peer must report failure (not false success)."""
         adapter = _bare_adapter()
+        # Create and complete the task so the task-authority fallback
+        # doesn't catch it — we're testing the no-peer push path.
         adapter.tasks.create("task-1", "ctx-ghost", "ghost")
+        adapter.tasks.complete("task-1", protocol.STATE_COMPLETED, "done")
         called = []
 
         def fake_post(url, body, headers, timeout, **kw):
@@ -1307,21 +1311,25 @@ class TestDeadClientReplyPush:
                 protocol.ROLE_USER, "round two", context_id="ctx-dead"
             ),
         }
-        # The blocking RPC: probe reports the client dead → returns fast with
-        # [client disconnected] and pops the stale waiter.
+        # The blocking RPC: probe reports the client dead → returns a
+        # JSON-RPC error but does NOT finalize the task as FAILED — the
+        # original task stays non-terminal for the late agent reply.
         result = adapter._rpc_message_send(
             "req-2", params, "alice", client_alive=lambda: False,
         )
-        task = protocol.unwrap_send_message_response(result["result"])
-        assert task["status"]["state"] == protocol.STATE_FAILED
-        assert "[client disconnected]" in protocol.extract_text(
-            task.get("status", {}).get("message", {}) or {}
-        )
-        with adapter._pending_lock:
-            assert adapter._pending == {}
-            assert adapter._pending_order == {}
+        # Task authority: disconnect returns an error response, not a task.
+        # The error is nested in the JSON-RPC result envelope.
+        inner = result.get("result", {})
+        assert inner.get("error", {}).get("code") == -32000
+        # The original task record stays non-terminal.
+        rec = adapter.tasks.get(result.get("id", "") or "pending_task")
+        # The task may not be findable by the result ID — check the store
+        # for the context's non-terminal task.
+        existing = adapter._find_existing_nonterminal_task("ctx-dead")
+        assert existing is not None  # task is still non-terminal
+        assert existing["state"] not in protocol.TERMINAL_STATES
 
-        # The agent finishes LATER; its reply must reach the peer via push.
+        # The agent finishes LATER; its reply finalizes the original task.
         async def run():
             return await adapter.send(
                 "ctx-dead", "ROUND_TWO_REPORT", metadata={"notify": True}
@@ -1329,8 +1337,11 @@ class TestDeadClientReplyPush:
 
         res = asyncio.run(run())
         assert res.success is True
-        assert captured["body"]["params"]["message"]["contextId"] == "ctx-dead"
-        assert captured["body"]["params"]["message"]["parts"][0]["text"] == "ROUND_TWO_REPORT"
+        # The original task is now finalized as COMPLETED.
+        final_rec = adapter.tasks.get(existing["task_id"])
+        assert final_rec is not None
+        assert final_rec["state"] == protocol.STATE_COMPLETED
+        assert final_rec["reply"] == "ROUND_TWO_REPORT"
 
         for coro in scheduled:
             loop.run_until_complete(coro)
@@ -1389,8 +1400,8 @@ class TestDeadClientReplyPush:
         )
 
         # 1) The peer's a2a_call client times out and closes the connection
-        #    while the agent is still working; the keepalive probe pops the
-        #    stale waiter so the late reply can't vanish into the dead socket.
+        #    while the agent is still working; the keepalive probe marks the
+        #    task as out-of-band-only but does NOT finalize it as FAILED.
         params = {
             "message": protocol.text_message(
                 protocol.ROLE_USER, "round two", context_id="ctx-dead"
@@ -1399,14 +1410,12 @@ class TestDeadClientReplyPush:
         result = adapter._rpc_message_send(
             "req-2", params, "alice", client_alive=lambda: False,
         )
-        task = protocol.unwrap_send_message_response(result["result"])
-        assert task["status"]["state"] == protocol.STATE_FAILED
-        assert "[client disconnected]" in protocol.extract_text(
-            task.get("status", {}).get("message", {}) or {}
-        )
-        with adapter._pending_lock:
-            assert adapter._pending == {}
-            assert adapter._pending_order == {}
+        # Task authority: disconnect returns error, task stays non-terminal.
+        inner = result.get("result", {})
+        assert inner.get("error", {}).get("code") == -32000
+        existing = adapter._find_existing_nonterminal_task("ctx-dead")
+        assert existing is not None
+        assert existing["state"] not in protocol.TERMINAL_STATES
         # The round-two inbound also scheduled its own dispatch + wake; run
         # them (real no-op dispatch, real wake) and reset the capture so the
         # push phase below is asserted on its own.
@@ -1415,15 +1424,8 @@ class TestDeadClientReplyPush:
         scheduled.clear()
         woke.clear()
 
-        # 2) The agent finishes LATER; with no waiter the reply is pushed
-        #    out-of-band. Deliver it the way the loopback fallback does —
-        #    in-process re-entry on this same gateway (shared host) —
-        #    so the push takes the real inbound path (_prepare_task).
-        monkeypatch.setattr(
-            adapter, "_push_out_of_band",
-            lambda cid, text, want_reply=False: adapter._push_loopback_in_process(cid, "alice", text),
-        )
-
+        # 2) The agent finishes LATER; send() finalizes the original
+        #    non-terminal task record instead of creating a new one.
         async def run():
             return await adapter.send(
                 "ctx-dead", "LATE_REPORT", metadata={"notify": True}
@@ -1432,25 +1434,12 @@ class TestDeadClientReplyPush:
         res = asyncio.run(run())
         assert res.success is True
 
-        # 3) The push scheduled the session dispatch AND the origin wake on
-        #    the gateway loop; run them so the wake actually fires.
-        assert len(scheduled) == 2  # push dispatch + origin wake
-        for coro in scheduled:
-            loop.run_until_complete(coro)
-        loop.close()
-
-        # The caller's discord session was woken with the framed push text
-        # and the recorded origin identity — the agency the round-2 drop
-        # silently took away.
-        assert woke["adapter"] is fake_discord
-        assert woke["text"] == security.wrap_inbound("alice", "LATE_REPORT")
-        assert woke["session_id"] == "sid-1"
-        src = woke["source"]
-        assert src.chat_id == "chan-1"
-        assert src.chat_type == "group"
-        assert src.profile == "worker-a"
-        assert src.thread_id is None
-        assert src.platform == Platform.DISCORD
+        # The original task is now finalized as COMPLETED with the
+        # agent's reply — the authoritative completed record.
+        final_rec = adapter.tasks.get(existing["task_id"])
+        assert final_rec is not None
+        assert final_rec["state"] == protocol.STATE_COMPLETED
+        assert final_rec["reply"] == "LATE_REPORT"
 
     def test_write_failure_pushes_completed_reply_v1(self, monkeypatch):
         """v1.0 envelope: a completed reply whose response write fails
@@ -2307,7 +2296,7 @@ class TestClientTenantAndDiscovery:
     def test_rpc_body_echoes_tenant_from_agent_card(self, monkeypatch):
         posted = {}
 
-        def fake_get(url, headers, timeout, **kw):
+        def fake_get(url, headers, timeout, *a, **kw):
             assert url.endswith("/.well-known/agent-card.json")
             return protocol.build_agent_card(
                 name="dev",
@@ -2335,7 +2324,7 @@ class TestClientTenantAndDiscovery:
     def test_discovery_falls_back_to_legacy_agent_json(self, monkeypatch):
         calls = []
 
-        def fake_get(url, headers, timeout, **kw):
+        def fake_get(url, headers, timeout, *a, **kw):
             calls.append(url)
             if url.endswith("agent-card.json"):
                 raise urllib.error.HTTPError(url, 404, "not found", {}, None)
@@ -2385,7 +2374,7 @@ class TestV1SpecRegressionFixes:
     def test_client_sends_v1_method_and_unwraps_response(self, monkeypatch):
         posted = {}
 
-        def fake_get(url, headers, timeout, **kw):
+        def fake_get(url, headers, timeout, *a, **kw):
             return protocol.build_agent_card(
                 name="dev", url="http://peer.example/dev/", description="dev", tenant="dev-team")
 
