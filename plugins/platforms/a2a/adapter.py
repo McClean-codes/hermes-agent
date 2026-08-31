@@ -1813,6 +1813,19 @@ class A2AAdapter(BasePlatformAdapter):
 
     # ── Inbound task handling ─────────────────────────────────────────────
 
+    def _find_existing_nonterminal_task(self, context_id: str) -> Optional[dict]:
+        """Find an existing non-terminal task for ``context_id`` in the task store.
+
+        Used by ``send()`` to finalize the original task record on late
+        agent completion after a client disconnect, instead of creating a
+        duplicate task.  Returns the task record dict or None.
+        """
+        recs, _ = self.tasks.list(context_id=context_id)
+        for rec in recs:
+            if rec["state"] not in protocol.TERMINAL_STATES:
+                return rec
+        return None
+
     def _prepare_task(self, params: dict, peer: str, agent: Optional[dict] = None) -> tuple[Optional[dict], Optional[dict]]:
         """Validate, register, and dispatch an inbound message.
 
@@ -2387,7 +2400,7 @@ class A2AAdapter(BasePlatformAdapter):
             self._inbound_seen[key] = now
             return False
 
-    def _await_reply(self, pending: dict, keepalive=None, patience: Optional[float] = None) -> tuple[str, str, bool]:
+    def _await_reply(self, pending: dict, keepalive=None, patience: Optional[float] = None) -> tuple[str, str, bool, bool]:
         """Block until the task's future resolves (or times out).
 
         ``keepalive`` is an optional zero-arg callable invoked every
@@ -2404,7 +2417,11 @@ class A2AAdapter(BasePlatformAdapter):
         out_of_band_only and the loop KEEPS waiting for the reply so it can
         be pushed directly instead of written into the dead socket.
 
-        Returns (state, reply, out_of_band_only).
+        Returns (state, reply, out_of_band_only, defer_finalization).
+        ``defer_finalization`` is True when the client disconnected but the
+        agent may still complete the task later — the caller must NOT call
+        ``_finalize_task`` and must leave the task record non-terminal so
+        the late agent reply can finalize the original task record.
         """
         fut: Future = pending["future"]
         deadline = pending["started"] + _reply_timeout()
@@ -2421,20 +2438,26 @@ class A2AAdapter(BasePlatformAdapter):
                 wait = min(wait, _SSE_KEEPALIVE)
             try:
                 state, reply = fut.result(timeout=wait)
-                return state, reply, pending.get("out_of_band_only", False)
+                return state, reply, pending.get("out_of_band_only", False), False
             except FuturesTimeout:
                 now = time.time()
                 if now >= deadline:
                     return (
                         protocol.STATE_FAILED, "[agent did not reply in time]",
-                        pending.get("out_of_band_only", False),
+                        pending.get("out_of_band_only", False), False,
                     )
                 if keepalive:
                     try:
                         keepalive()
                     except Exception:
                         self._mark_out_of_band(pending, "[client disconnected]", pop_waiter=True)
-                        return (protocol.STATE_FAILED, "[client disconnected]", True)
+                        # Task authority: the client is gone but the agent may
+                        # still complete this task.  Do NOT finalize the task as
+                        # FAILED here — the late agent reply must finalize the
+                        # original task record.  The caller skips
+                        # _finalize_task and returns a transient error to the
+                        # HTTP client.
+                        return (protocol.STATE_FAILED, "[client disconnected]", True, True)
                 if now >= patience_deadline:
                     self._mark_out_of_band(pending, "[client patience exceeded]", pop_waiter=False)
                     # Keep waiting: when the reply resolves it must be pushed
@@ -2443,7 +2466,7 @@ class A2AAdapter(BasePlatformAdapter):
             except Exception:
                 return (
                     protocol.STATE_FAILED, "[agent did not reply in time]",
-                    pending.get("out_of_band_only", False),
+                    pending.get("out_of_band_only", False), False,
                 )
 
     def _rpc_message_send(self, req_id: Any, params: dict, peer: str, agent: Optional[dict] = None, v1_response: bool = False, client_alive=None) -> Optional[dict]:
@@ -2476,11 +2499,23 @@ class A2AAdapter(BasePlatformAdapter):
                     raise ConnectionResetError(
                         "A2A client disconnected while awaiting reply"
                     )
-            state, reply, out_of_band_only = self._await_reply(
+            state, reply, out_of_band_only, defer_finalization = self._await_reply(
                 pending, keepalive=_probe, patience=patience)
         else:
-            state, reply, out_of_band_only = self._await_reply(
+            state, reply, out_of_band_only, defer_finalization = self._await_reply(
                 pending, patience=patience)
+        # Task authority: when the client disconnected but the agent may
+        # still complete, skip _finalize_task — the original task record
+        # stays non-terminal so the late reply can finalize it.
+        if defer_finalization:
+            logger.info(
+                "A2A: client disconnected for task %s; deferring finalization "
+                "(original task record stays non-terminal for late agent reply)",
+                pending["task_id"],
+            )
+            return protocol.jsonrpc_result(
+                req_id, {"error": {"code": -32000, "message": "client disconnected, task pending"}}
+            )
         state, reply = self._finalize_task(pending, state, reply)
         if out_of_band_only:
             # The client was known gone when the reply resolved (patience
@@ -2556,12 +2591,20 @@ class A2AAdapter(BasePlatformAdapter):
             self._sse_write(handler, protocol.sse_data(
                 protocol.status_update(task_id, context_id, protocol.STATE_WORKING), req_id))
 
-            state, reply, _ = self._await_reply(
+            state, reply, _, defer_finalization = self._await_reply(
                 pending, keepalive=lambda: self._sse_write(handler, ": keepalive\n\n"),
                 # SSE clients stay connected for the whole stream; the client
                 # patience applies only to the blocking POST path.
                 patience=None,
             )
+            if defer_finalization:
+                # Client disconnected; leave task non-terminal for late reply.
+                self._emit_terminal(
+                    handler, task_id, context_id,
+                    protocol.STATE_WORKING, "[client disconnected, task pending]",
+                    req_id=req_id,
+                )
+                return
             state, reply = self._finalize_task(pending, state, reply)
             self._emit_terminal(handler, task_id, context_id, state, reply, req_id=req_id)
         except (BrokenPipeError, ConnectionResetError):
@@ -2788,6 +2831,26 @@ class A2AAdapter(BasePlatformAdapter):
             logger.debug("A2A: ignoring non-final send for context %s", chat_id)
             return SendResult(success=True, message_id=message_id)
         if self._resolve_oldest_for_context(chat_id, protocol.STATE_COMPLETED, content or ""):
+            return SendResult(success=True, message_id=message_id)
+        # Task authority fallback: when the client disconnected but the agent
+        # completed (defer_finalization=True), the original task record is
+        # still non-terminal in the task store.  Finalize it here instead of
+        # creating a new task — the original task ID/state is the
+        # authoritative completed record.
+        existing_task = self._find_existing_nonterminal_task(chat_id)
+        if existing_task is not None:
+            task_id = existing_task["task_id"]
+            logger.info(
+                "A2A: late completion for disconnected task %s (context %s) — "
+                "finalizing original task record",
+                task_id, chat_id,
+            )
+            self._finalize_task(
+                {"task_id": task_id, "context_id": chat_id, "peer": existing_task.get("peer", ""),
+                 "started": existing_task.get("created_at", time.time()), "created_iso": existing_task.get("created_iso", "")},
+                protocol.STATE_COMPLETED, content or "",
+                audit_direction="push",
+            )
             return SendResult(success=True, message_id=message_id)
         # No waiter (e.g. a late chunk or out-of-band send) — push the message
         # back to the peer that owns this context as a NEW task, reusing the
