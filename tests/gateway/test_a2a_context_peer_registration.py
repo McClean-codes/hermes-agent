@@ -35,7 +35,7 @@ def test_outbound_call_registers_context_peer_on_local_adapter(monkeypatch):
             lambda: {"a2a_agents": {"peer-agent": {"url": "http://127.0.0.1:8801"}}},
         )
 
-        def fake_post(url, body, headers, timeout):
+        def fake_post(url, body, headers, timeout, **kw):
             return protocol.jsonrpc_result(
                 body["id"],
                 protocol.build_task("t2", "ctx-discord-born", protocol.STATE_COMPLETED, "ok"),
@@ -63,7 +63,7 @@ def test_outbound_registration_is_best_effort(monkeypatch):
         lambda: {"a2a_agents": {"peer-agent": {"url": "http://127.0.0.1:8801"}}},
     )
 
-    def fake_post(url, body, headers, timeout):
+    def fake_post(url, body, headers, timeout, **kw):
         return protocol.jsonrpc_result(
             body["id"],
             protocol.build_task("t2", "ctx-x", protocol.STATE_COMPLETED, "ok"),
@@ -99,7 +99,7 @@ def test_push_out_of_band_writes_push_audit(monkeypatch, tmp_path):
             lambda: {"a2a_agents": {"peer-agent": {"url": "http://127.0.0.1:8801"}}},
         )
 
-        def fake_post(url, body, headers, timeout):
+        def fake_post(url, body, headers, timeout, **kw):
             return protocol.jsonrpc_result(
                 body["id"],
                 protocol.build_task("t2", "ctx-audit", protocol.STATE_COMPLETED, "ok"),
