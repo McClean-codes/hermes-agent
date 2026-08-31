@@ -1132,15 +1132,17 @@ class A2AAdapter(BasePlatformAdapter):
         # Write-through so the registration survives a gateway restart:
         # a restart wipes the in-memory map and no later inbound/outbound
         # task re-registered the context, so the completion push would be
-        # dropped before any side effect. Merge with
-        # the on-disk state so a registration made with no live adapters
-        # (e.g. a CLI/ACP process) is still persisted for the next gateway
-        # start, and never clobber the disk map with an empty union.
+        # dropped before any side effect.  Always include the new
+        # context_id→peer mapping directly (not only via union) so a
+        # registration made with no live adapters (e.g. a CLI/ACP process)
+        # is still persisted for the next gateway start.  Merge with
+        # the on-disk state and never clobber existing entries.
         # Serialise the load→merge→write cycle with a file lock so
         # two concurrent registrations (e.g. two outbound a2a_call
         # threads) don't clobber each other's disk state.
         with _file_lock(_context_peers_path().with_suffix(".lock")):
             disk = _load_context_peers()
+            disk[context_id] = peer
             disk.update(union)
             _persist_context_peers(_merge_context_peers({}, disk))
 
@@ -3023,7 +3025,18 @@ class A2AAdapter(BasePlatformAdapter):
                 self._push_loopback_in_process(context_id, peer, text, want_reply=False)
                 return
             else:
-                logger.debug("A2A: out-of-band send for %s: peer %r not configured; dropping", context_id, peer)
+                # Stale/unresolvable peer: a registered peer identity that
+                # can't be resolved to a URL.  Loud failure so notifier/cursor
+                # logic cannot advance over a dropped event.
+                security.audit(
+                    "push_dropped", peer, context_id,
+                    "registered peer not resolvable", context_id=context_id,
+                )
+                logger.warning(
+                    "A2A: out-of-band send for %s: peer %r registered but "
+                    "not resolvable — delivery dropped",
+                    context_id, peer,
+                )
                 return
         base_url = entry["url"]
         # Own-endpoint guard: if the resolved target is THIS gateway (the
