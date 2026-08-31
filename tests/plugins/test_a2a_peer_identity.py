@@ -226,7 +226,7 @@ def test_push_out_of_band_hits_refined_peer_url(monkeypatch, tmp_path):
     monkeypatch.setattr(tools, "_fetch_card", lambda *a, **k: (_ for _ in ()).throw(ConnectionError("no card")))
     posted: dict = {}
 
-    def fake_post(url, body, headers, timeout):
+    def fake_post(url, body, headers, timeout, **kw):
         posted["url"] = url
         posted["body"] = body
         return {"jsonrpc": "2.0", "id": body["id"], "result": {}}
@@ -255,7 +255,7 @@ def test_push_out_of_band_own_endpoint_delivers_in_process(monkeypatch, tmp_path
     monkeypatch.setattr(tools, "_load_config", lambda: {})
     posted: dict = {}
 
-    def fake_post(url, body, headers, timeout):
+    def fake_post(url, body, headers, timeout, **kw):
         posted["url"] = url
         return {"jsonrpc": "2.0", "id": body["id"], "result": {}}
 
@@ -300,7 +300,7 @@ def test_send_task_stamps_sender_on_outbound(monkeypatch, tmp_path):
     monkeypatch.setattr(tools, "_fetch_card", lambda *a, **k: None)
     posted: dict = {}
 
-    def fake_post(url, body, headers, timeout):
+    def fake_post(url, body, headers, timeout, **kw):
         posted["url"] = url
         posted["body"] = body
         return {"jsonrpc": "2.0", "id": body["id"], "result": protocol.build_task(

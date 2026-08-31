@@ -484,7 +484,7 @@ class TestClientTools:
             description="finds things",
             skills=[{"id": "s", "name": "search", "description": "web search"}],
         )
-        monkeypatch.setattr(tools, "_http_get_json", lambda url, h, t: card)
+        monkeypatch.setattr(tools, "_http_get_json", lambda url, h, t, *a, **kw: card)
         out = tools.a2a_discover({"url": "http://localhost:8805"})
         assert "researcher" in out
         assert "search" in out
@@ -494,11 +494,11 @@ class TestClientTools:
         """Outbound params: contextId inside the message, v1.0 role, no kind."""
         monkeypatch.setattr(tools, "_load_config",
                             lambda: {"a2a_agents": {"r": {"url": "http://localhost:8805"}}})
-        monkeypatch.setattr(tools, "_http_get_json", lambda url, h, t: None)
+        monkeypatch.setattr(tools, "_http_get_json", lambda url, h, t, *a, **kw: None)
 
         captured = {}
 
-        def fake_post(url, body, headers, timeout):
+        def fake_post(url, body, headers, timeout, **kw):
             captured["body"] = body
             ctx = body["params"]["message"].get("contextId", "c1")
             return protocol.jsonrpc_result(
@@ -524,9 +524,9 @@ class TestClientTools:
     def test_call_reports_input_required(self, monkeypatch):
         monkeypatch.setattr(tools, "_load_config",
                             lambda: {"a2a_agents": {"r": {"url": "http://localhost:8805"}}})
-        monkeypatch.setattr(tools, "_http_get_json", lambda url, h, t: None)
+        monkeypatch.setattr(tools, "_http_get_json", lambda url, h, t, *a, **kw: None)
 
-        def fake_post(url, body, headers, timeout):
+        def fake_post(url, body, headers, timeout, **kw):
             return protocol.jsonrpc_result(
                 body["id"],
                 protocol.build_task("t", "ctx-q", protocol.STATE_INPUT_REQUIRED, "Which repo?"),
@@ -589,10 +589,10 @@ class TestRegistryDispatchConvention:
         alias for 'agent' so the call doesn't fail the required-arg guard."""
         monkeypatch.setattr(tools, "_load_config",
                             lambda: {"a2a_agents": {"peer": {"url": "http://localhost:8805"}}})
-        monkeypatch.setattr(tools, "_http_get_json", lambda url, h, t: None)
+        monkeypatch.setattr(tools, "_http_get_json", lambda url, h, t, *a, **kw: None)
         captured = {}
 
-        def fake_post(url, body, headers, timeout):
+        def fake_post(url, body, headers, timeout, **kw):
             captured["sent"] = True
             return protocol.jsonrpc_result(
                 body["id"],
@@ -719,7 +719,7 @@ class TestOutOfBandReply:
         )
         captured = {}
 
-        def fake_post(url, body, headers, timeout):
+        def fake_post(url, body, headers, timeout, **kw):
             captured["url"] = url
             captured["body"] = body
             return protocol.jsonrpc_result(
@@ -747,7 +747,7 @@ class TestOutOfBandReply:
         adapter.tasks.create("task-1", "ctx-ghost", "ghost")
         called = []
 
-        def fake_post(url, body, headers, timeout):
+        def fake_post(url, body, headers, timeout, **kw):
             called.append(url)
             return {}
 
@@ -770,7 +770,7 @@ class TestOutOfBandReply:
             lambda: {"a2a_agents": {"alice": {"url": "http://localhost:8805"}}},
         )
 
-        def fake_post(url, body, headers, timeout):
+        def fake_post(url, body, headers, timeout, **kw):
             raise urllib.error.URLError("peer down")
 
         monkeypatch.setattr(tools, "_http_post_json", fake_post)
@@ -845,7 +845,7 @@ class TestOutOfBandReply:
             lambda: {"a2a_agents": {"alice": {"url": "http://localhost:8805"}}},
         )
 
-        def fake_post(url, body, headers, timeout):
+        def fake_post(url, body, headers, timeout, **kw):
             raise urllib.error.URLError("timed out")
 
         monkeypatch.setattr(tools, "_http_post_json", fake_post)
@@ -896,9 +896,9 @@ class TestContextOriginWake:
             tools, "_load_config",
             lambda: {"a2a_agents": {"r": {"url": "http://localhost:8805"}}},
         )
-        monkeypatch.setattr(tools, "_http_get_json", lambda url, h, t: None)
+        monkeypatch.setattr(tools, "_http_get_json", lambda url, h, t, *a, **kw: None)
 
-        def fake_post(url, body, headers, timeout):
+        def fake_post(url, body, headers, timeout, **kw):
             return protocol.jsonrpc_result(
                 body["id"],
                 protocol.build_task("t", "ctx-origin-1", protocol.STATE_COMPLETED, "done"),
@@ -1223,7 +1223,7 @@ class TestContextOriginWake:
         fut = adapter._add_pending("task-1", "ctx-y")
         called = []
 
-        def fake_post(url, body, headers, timeout):
+        def fake_post(url, body, headers, timeout, **kw):
             called.append(url)
             return {}
 
@@ -1278,7 +1278,7 @@ class TestDeadClientReplyPush:
         )
         captured = {}
 
-        def fake_post(url, body, headers, timeout):
+        def fake_post(url, body, headers, timeout, **kw):
             captured["url"] = url
             captured["body"] = body
             return protocol.jsonrpc_result(
@@ -2307,7 +2307,7 @@ class TestClientTenantAndDiscovery:
     def test_rpc_body_echoes_tenant_from_agent_card(self, monkeypatch):
         posted = {}
 
-        def fake_get(url, headers, timeout):
+        def fake_get(url, headers, timeout, **kw):
             assert url.endswith("/.well-known/agent-card.json")
             return protocol.build_agent_card(
                 name="dev",
@@ -2316,7 +2316,7 @@ class TestClientTenantAndDiscovery:
                 tenant="dev-team",
             )
 
-        def fake_post(url, body, headers, timeout):
+        def fake_post(url, body, headers, timeout, **kw):
             posted["url"] = url
             posted["body"] = body
             return {"jsonrpc": "2.0", "id": body["id"], "result": protocol.build_task(
@@ -2335,7 +2335,7 @@ class TestClientTenantAndDiscovery:
     def test_discovery_falls_back_to_legacy_agent_json(self, monkeypatch):
         calls = []
 
-        def fake_get(url, headers, timeout):
+        def fake_get(url, headers, timeout, **kw):
             calls.append(url)
             if url.endswith("agent-card.json"):
                 raise urllib.error.HTTPError(url, 404, "not found", {}, None)
@@ -2385,11 +2385,11 @@ class TestV1SpecRegressionFixes:
     def test_client_sends_v1_method_and_unwraps_response(self, monkeypatch):
         posted = {}
 
-        def fake_get(url, headers, timeout):
+        def fake_get(url, headers, timeout, **kw):
             return protocol.build_agent_card(
                 name="dev", url="http://peer.example/dev/", description="dev", tenant="dev-team")
 
-        def fake_post(url, body, headers, timeout):
+        def fake_post(url, body, headers, timeout, **kw):
             posted["headers"] = headers
             posted["body"] = body
             return {"jsonrpc": "2.0", "id": body["id"], "result": {"task": protocol.build_task(
