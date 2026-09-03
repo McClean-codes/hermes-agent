@@ -462,19 +462,24 @@ def _send_task(agent_label: str, peer: dict, message: str, context_id: str) -> t
     protocol.metrics.outbound_total += 1
 
     resp = _http_post_json(rpc_url, rpc_body, headers, timeout, allowed_origins=allowed)
-    if "error" in resp:
+    if isinstance(resp, dict) and "error" in resp:
+        # JSON-RPC peer operation failure — distinct from malformed result, propagate as jsonrpc category
         err = resp["error"]
-        raise ValueError(f"Peer '{agent_label}' returned an error: {err.get('message', err)}")
-
-    result = resp.get("result", {})
-    if not protocol.is_valid_a2a_result(result):
-        raise ValueError(f"Peer '{agent_label}' returned malformed result: {result!r}")
-    payload = protocol.unwrap_send_message_response(result)
-    reply = _reply_text_from_result(payload)
-    reply_ctx, state = ctx, ""
-    if isinstance(payload, dict):
-        reply_ctx = payload.get("contextId", ctx)
-        state = (payload.get("status") or {}).get("state", "")
+        # Do not record inbound success metrics or persist reply for peer error
+        raise ValueError(f"Peer '{agent_label}' returned JSON-RPC error {err.get('code', '')}: {err.get('message', err)}")
+    result = resp.get("result") if isinstance(resp, dict) else None
+    # Strict V1 parsing — peer must return a valid SendMessageResponse wrapper
+    try:
+        parsed = protocol.parse_send_message_result(result, "V1_WRAPPED")
+    except protocol.A2AResultValidationError as ve:
+        # Invalid/foreign result must never become empty successful reply — propagate structured invalid_response
+        raise ValueError(f"Peer '{agent_label}' returned invalid A2A result ({ve.reason}): {ve.detail or result!r}") from ve
+    payload = parsed.payload
+    reply = parsed.text
+    # Use validated context/state from parser, not raw payload fallback
+    reply_ctx = parsed.context_id or ctx
+    state = parsed.state
+    # Persist and metrics only after successful validation
     protocol.persist_message(reply_ctx, "agent", reply, rpc_body["id"])
     protocol.metrics.inbound_total += 1
     return reply, reply_ctx, state

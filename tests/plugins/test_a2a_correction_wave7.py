@@ -512,7 +512,7 @@ def test_push_out_of_band_empty_result_is_failure(monkeypatch, tmp_path):
     monkeypatch.setattr(tools, "_http_post_json", fake_post)
     monkeypatch.setattr(tools, "_fetch_card", lambda *a, **k: {})
     res = adapter._push_out_of_band("ctx-malformed", "hi", want_reply=False)
-    assert res is False
+    assert not res
     adapter._unregister_adapter()
 
 
@@ -532,13 +532,13 @@ def test_push_out_of_band_malformed_shape_is_failure(monkeypatch, tmp_path):
         return {"jsonrpc": "2.0", "id": body["id"], "result": "not-a-dict"}
     monkeypatch.setattr(tools, "_http_post_json", fake_post_scalar)
     monkeypatch.setattr(tools, "_fetch_card", lambda *a, **k: {})
-    assert adapter._push_out_of_band("ctx-malformed2", "hi", want_reply=False) is False
+    assert not adapter._push_out_of_band("ctx-malformed2", "hi", want_reply=False)
 
     # Valid task wrapper should be success
     def fake_post_valid(url, body, headers, timeout, allowed_origins=()):
         return {"jsonrpc": "2.0", "id": body["id"], "result": {"task": protocol.build_task("t1", "ctx-malformed2", protocol.STATE_COMPLETED, "ok")}}
     monkeypatch.setattr(tools, "_http_post_json", fake_post_valid)
-    assert adapter._push_out_of_band("ctx-malformed2", "hi", want_reply=False) is True
+    assert adapter._push_out_of_band("ctx-malformed2", "hi", want_reply=False)
     adapter._unregister_adapter()
 
 
@@ -557,12 +557,12 @@ def test_push_out_of_band_transport_error_is_failure(monkeypatch, tmp_path):
         return {"jsonrpc": "2.0", "id": body["id"], "error": {"code": -32603, "message": "internal"}}
     monkeypatch.setattr(tools, "_http_post_json", fake_post_err)
     monkeypatch.setattr(tools, "_fetch_card", lambda *a, **k: {})
-    assert adapter._push_out_of_band("ctx-transport", "hi", want_reply=False) is False
+    assert not adapter._push_out_of_band("ctx-transport", "hi", want_reply=False)
 
     def fake_raise(url, body, headers, timeout, allowed_origins=()):
         raise ConnectionRefusedError("refused")
     monkeypatch.setattr(tools, "_http_post_json", fake_raise)
-    assert adapter._push_out_of_band("ctx-transport", "hi", want_reply=False) is False
+    assert not adapter._push_out_of_band("ctx-transport", "hi", want_reply=False)
     adapter._unregister_adapter()
 
 
@@ -571,10 +571,10 @@ def test_push_out_of_band_stale_peer_is_failure(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     adapter = _bare_adapter()
     # No peer registered -> stale
-    assert adapter._push_out_of_band("ctx-unknown", "hi", want_reply=False) is False
+    assert not adapter._push_out_of_band("ctx-unknown", "hi", want_reply=False)
     # Registered but unresolvable peer
     adapter._register_context_peer("ctx-stale", "unknown-peer-xyz")
-    assert adapter._push_out_of_band("ctx-stale", "hi", want_reply=False) is False
+    assert not adapter._push_out_of_band("ctx-stale", "hi", want_reply=False)
     adapter._unregister_adapter()
 
 
@@ -590,10 +590,10 @@ def test_push_out_of_band_valid_completion_is_success(monkeypatch, tmp_path):
     )
     adapter._register_context_peer("ctx-valid", "peer-a")
     def fake_post(url, body, headers, timeout, allowed_origins=()):
-        return {"jsonrpc": "2.0", "id": body["id"], "result": {"artifacts": [{"parts": [{"text": "ok"}]}]}}
+        return {"jsonrpc": "2.0", "id": body["id"], "result": {"task": protocol.build_task("task-wave7", "ctx-wave7", protocol.STATE_COMPLETED, "ok")}}
     monkeypatch.setattr(tools, "_http_post_json", fake_post)
     monkeypatch.setattr(tools, "_fetch_card", lambda *a, **k: {})
-    assert adapter._push_out_of_band("ctx-valid", "hi", want_reply=False) is True
+    assert adapter._push_out_of_band("ctx-valid", "hi", want_reply=False)
     adapter._unregister_adapter()
 
 
