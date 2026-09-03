@@ -52,6 +52,40 @@ def _load_config() -> dict:
         return {}
 
 
+def _a2a_tools_available() -> bool:
+    """check_fn for the outbound client tools: serve them ONLY when the
+    operator has opted into A2A somehow -- peers configured under
+    ``a2a_agents`` in config.yaml, or the inbound platform enabled
+    (a peer-reachable Hermes plausibly dials back).
+
+    Maintainer-directed (#95681): these registered unconditionally, so
+    every session on every install paid ~561 tok/call for tools whose
+    only possible output without config is 'no peers configured'. A2A is
+    unrelated to Bot Mode (bots talk over gateway RPCs) -- for most
+    installs this toolset is foreign-agent plumbing they never enabled.
+    Config adds mid-session surface at the next compaction (#97073).
+    """
+    cfg = {}
+    try:
+        cfg = _load_config()
+        if cfg.get("a2a_agents"):
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        import os as _os
+
+        if _os.getenv("A2A_PORT"):
+            return True
+        platforms = cfg.get("platforms") or {}
+        a2a_cfg = platforms.get("a2a") or {}
+        if isinstance(a2a_cfg, dict) and a2a_cfg.get("enabled"):
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    return False
+
+
 def _resolve_peer(agent: str) -> Optional[dict]:
     """Resolve a peer name to {url, auth, timeout, capabilities}, or treat ``agent`` as a URL."""
     if agent.startswith("http://") or agent.startswith("https://"):
@@ -716,7 +750,7 @@ def a2a_orchestrate(args: dict, **_: Any) -> str:
     # Fan-out: each peer gets a distinct child context_id.
     # Track all submitted peer→child mappings at submission time so the
     # ownership map is complete regardless of result mode or early break.
-    submitted_children: dict[str, str] = {}  # peer_name → child_ctx (all submitted)
+    submitted_children: dict[str, str] = {}  # peer_name -> child_ctx (all submitted)
     results: list[tuple[str, str, str]] = []  # (name, reply, child_ctx)
     with ThreadPoolExecutor(max_workers=min(len(matches), _ORCHESTRATE_MAX_WORKERS)) as pool:
         futures = {}
@@ -736,7 +770,15 @@ def a2a_orchestrate(args: dict, **_: Any) -> str:
         for fut in as_completed(futures):
             name = futures[fut]
             try:
-                result = fut.result()
+                raw = fut.result()
+                # Normalize: production _call_peer_sync returns
+                # (name, reply, child_context), but compatible callers and
+                # test doubles may return (name, reply).  Pad to 3-tuple
+                # so downstream code has a uniform shape.
+                if len(raw) == 2:
+                    result = (raw[0], raw[1], "")
+                else:
+                    result = raw
                 results.append(result)
                 # Update submitted mapping if _send_task returned a different
                 # confirmed context for this peer.
@@ -912,7 +954,7 @@ _HANDLERS = {
 
 
 def register_tools(ctx) -> None:
-    """Register the client tools in the ``a2a`` toolset."""
+    """Register the client tools in the ``a2a`` toolset (config-gated)."""
     for name, definition in _TOOL_DEFINITIONS.items():
         fn_schema = definition.get("function") or {}
         if not fn_schema.get("name"):
@@ -924,4 +966,5 @@ def register_tools(ctx) -> None:
             handler=_HANDLERS[name],
             description=fn_schema.get("description", ""),
             emoji="\U0001f9e9",  # puzzle piece
+            check_fn=_a2a_tools_available,
         )
