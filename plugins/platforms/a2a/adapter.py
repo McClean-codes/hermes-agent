@@ -1,31 +1,3 @@
-"""
-A2A inbound platform adapter — exposes Hermes as an A2A-discoverable agent.
-
-Design (the #11025 insight, done as a plugin with zero core edits):
-  - Runs a stdlib http.server in a daemon thread (no a2a-sdk, no asyncio loop
-    dependency at register() time — avoids the a2a_fleet "register outside a
-    loop" bug class).
-  - Serves the A2A v1.0 Agent Card at GET /.well-known/agent-card.json (and legacy agent.json).
-  - JSON-RPC at POST /: message/send, message/stream (SSE), tasks/get,
-    tasks/list, tasks/cancel, tasks/subscribe, tasks/pushNotificationConfig/create,
-    tasks/pushNotificationConfig/get, tasks/pushNotificationConfig/list,
-    tasks/pushNotificationConfig/delete.
-  - Push notifications: config accepted inline in message/send
-    (configuration.taskPushNotificationConfig) or via the create method;
-    payloads are v1.0 StreamResponse objects, HMAC-signed.
-  - Metrics at GET /metrics.
-  - Each inbound task is filtered + framed (security.wrap_inbound) and routed
-    into the agent's LIVE gateway session via the normal MessageEvent path, so
-    the agent that replies is the same one talking to its user — full memory
-    and context, not a throwaway clone.
-  - The agent's reply comes back through ``adapter.send()``; we override that to
-    fulfil a per-task Future the HTTP handler is blocked on, turning the
-    async gateway into a synchronous request/response for the A2A caller.
-    ``on_processing_complete`` resolves failures/cancellations promptly.
-  - Every exchange is persisted to disk and audit-logged.
-
-Bind safety: with no token configured, the server binds 127.0.0.1 only.
-"""
 
 from __future__ import annotations
 
@@ -143,7 +115,6 @@ from .a2a_persistence import (
 )
 
 def _method_info(method: str) -> tuple[str, bool]:
-    """Return (canonical_operation, is_v1_method)."""
     mapping = {
         "SendMessage": ("send", True),
         "message/send": ("send", False),
@@ -171,41 +142,79 @@ def _method_info(method: str) -> tuple[str, bool]:
     return mapping.get(method, ("", False))
 
 
+def _sanitize_string_for_jsonrpc(value: str, max_len: int = 300) -> str:
+    r = security.redact_outbound(value)
+    return r if len(r) <= max_len else r[:max_len] + "...[truncated]"
+
+def _sanitize_jsonrpc_value(value: Any, depth: int) -> Any:
+    if depth > 4:
+        return "[redacted]"
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else "[redacted]"
+    if isinstance(value, str):
+        return _sanitize_string_for_jsonrpc(value, 300)
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for i, (k, v) in enumerate(value.items()):
+            if i >= 16:
+                break
+            sk = _sanitize_string_for_jsonrpc(str(k) if not isinstance(k, str) else k, 64)
+            out[sk] = _sanitize_jsonrpc_value(v, depth + 1)
+        return out
+    if isinstance(value, list):
+        return [_sanitize_jsonrpc_value(x, depth + 1) for x in value[:16]]
+    return "[redacted]"
+
 def _redacted_jsonrpc_detail(raw_error):
-    """Bounded redacted detail for JSON-RPC peer error (Finding 2).
-
-    Uses security.redact_outbound to scrub credential-shaped content,
-    retains category jsonrpc via caller, returns (error_str, payload_redacted).
-    Bounded to 300 chars plus truncation marker; audit truncates to 500 anyway.
-    """
-    raw_str = str(raw_error)
-    redacted = security.redact_outbound(raw_str)
-    if len(redacted) > 300:
-        redacted = redacted[:300] + "...[truncated]"
-    payload_redacted = None
+    payload: dict[str, Any] = {}
     if isinstance(raw_error, dict):
-        payload_redacted = {}
-        for k, v in raw_error.items():
-            if isinstance(v, str):
-                rv = security.redact_outbound(v)
-                if len(rv) > 300:
-                    rv = rv[:300] + "...[truncated]"
-                payload_redacted[k] = rv
-            else:
-                payload_redacted[k] = v
+        rc = raw_error.get("code")
+        if isinstance(rc, int) and not isinstance(rc, bool):
+            payload["code"] = rc
+        rm = raw_error.get("message")
+        if isinstance(rm, str):
+            payload["message"] = _sanitize_string_for_jsonrpc(rm, 300)
+        elif rm is not None:
+            payload["message"] = _sanitize_string_for_jsonrpc(str(rm), 300)
+        if "data" in raw_error:
+            payload["data"] = _sanitize_jsonrpc_value(raw_error["data"], 0)
     else:
-        payload_redacted = redacted
-    return redacted, payload_redacted
+        payload["message"] = _sanitize_string_for_jsonrpc(str(raw_error), 300)
+    try:
+        if len(json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")) > 2048:
+            tp: dict[str, Any] = {}
+            if "code" in payload:
+                tp["code"] = payload["code"]
+            if "message" in payload:
+                tp["message"] = payload["message"]
+            tp["data"] = "[truncated]"
+            payload = tp
+    except Exception:
+        payload = {"message": _sanitize_string_for_jsonrpc(str(raw_error), 300)}
+    parts: list[str] = []
+    if "code" in payload:
+        parts.append(str(payload["code"]))
+    if "message" in payload and isinstance(payload["message"], str):
+        parts.append(payload["message"])
+    err = ": ".join(parts) if len(parts) == 2 else (parts[0] if parts else "[redacted]")
+    if len(err) > 300:
+        err = err[:300] + "...[truncated]"
+    err = security.redact_outbound(err)
+    if len(err) > 300:
+        err = err[:300] + "...[truncated]"
+    return err, payload
 
+def _audit_safe(direction: str, peer: str, tid: str, detail: str, context_id: str = "") -> None:
+    try:
+        security.audit(direction, peer, tid, detail, context_id=context_id)
+    except Exception:
+        pass
 
 def _audit_loopback_failure(peer: str, context_id: str, error: str, category: str, task_id: str = "") -> None:
-    """Emit exactly one failure audit for loopback (Finding 1, centralized seam).
-
-    Durability -> push_failed; routing -> push_dropped (existing choice) or
-    push_failed; transport/invalid -> push_failed. Bounded via security.audit's
-    500-char truncation; redact credential shapes as defense-in-depth.
-    Guarded best-effort so audit never raises into the push path.
-    """
     # Redact as defense-in-depth even for internal errors (no credential expected)
     safe_error = security.redact_outbound(error)
     if len(safe_error) > 500:
@@ -223,7 +232,6 @@ def _audit_loopback_failure(peer: str, context_id: str, error: str, category: st
 
 
 class _A2AServer(ThreadingHTTPServer):
-    """ThreadingHTTPServer that carries a reference to its adapter."""
 
     daemon_threads = True
 
@@ -233,7 +241,6 @@ class _A2AServer(ThreadingHTTPServer):
 
 
 class A2ARequestHandler(BaseHTTPRequestHandler):
-    """HTTP handler for the A2A JSON-RPC surface."""
 
     @property
     def adapter(self) -> "A2AAdapter":
@@ -258,7 +265,6 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
         self.wfile.flush()
 
     def _request_public_url(self) -> str:
-        """Derive the routable URL for this request."""
         explicit = os.getenv("A2A_PUBLIC_URL", "").strip()
         if explicit:
             return explicit
@@ -298,7 +304,6 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
         self._json(404, {"error": "not found"})
 
     def _a2a_client_alive(self) -> bool:
-        """Best-effort liveness probe for the client behind this request."""
         sock = getattr(self, "connection", None)
         if sock is None:
             return True
@@ -320,7 +325,6 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
             return False
 
     def _handle_send(self, req_id, params, identity, agent, is_v1):
-        """Route a message/send with dead-client protection."""
         result = self.adapter._rpc_message_send(
             req_id, params, identity, agent=agent, v1_response=is_v1,
             client_alive=self._a2a_client_alive,
@@ -448,7 +452,6 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
 
 
 class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
-    """Inbound A2A server adapter."""
 
     def __init__(self, config, **kwargs):
         platform = Platform("a2a")
@@ -542,7 +545,6 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
 
     @classmethod
     def _register_context_peer(cls, context_id: str, peer: str) -> None:
-        """Record ``context_id`` → ``peer`` on every live local A2A adapter."""
         if not context_id or not peer:
             return
         with _ADAPTERS_GUARD:
@@ -576,7 +578,6 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
 
     @classmethod
     def _register_context_session(cls, context_id: str, origin: dict) -> None:
-        """Record ``context_id`` → the LOCAL session that created it."""
         if not context_id or not isinstance(origin, dict) or not origin.get("platform"):
             return
         with _ADAPTERS_GUARD:
@@ -605,7 +606,6 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
 
     @classmethod
     def _own_sender(cls) -> dict:
-        """Return this process's A2A AgentName identity for outbound messages."""
         with _ADAPTERS_GUARD:
             refs = list(_ADAPTERS.values())
         for ref in refs:
@@ -616,7 +616,6 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
 
     @classmethod
     def _sender_from_config(cls) -> dict:
-        """Sender identity for processes with no live adapter (CLI/helpers)."""
         name = os.getenv("A2A_AGENT_NAME", "").strip() or _default_agent_name()
         port = _DEFAULT_PORT
         try:
@@ -638,7 +637,6 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
         return {"agentId": name, "name": name, "url": url}
 
     def _sender_identity(self) -> dict:
-        """This adapter's A2A v1.0 AgentName (``agentId``/``name``/``url``)."""
         return {
             "agentId": self.agent_name,
             "name": self.agent_name,
@@ -646,14 +644,6 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
         }
 
     def _refine_peer_identity(self, peer: str, params: dict, context_id: str) -> str:
-        """Resolve a port-less ``ip:`` identity to a routable peer.
-
-        Security: never promote an ``ip:`` identity to a configured peer
-        from ``agentId`` alone.  Require authenticated binding or exact
-        configured endpoint/origin validation before using the peer's
-        auth/headers; otherwise retain the authenticated identity and fail
-        closed for an unresolvable callback.
-        """
         if not peer.startswith("ip:"):
             return peer
         sender = protocol.extract_sender(params)
@@ -723,7 +713,6 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
 
     @classmethod
     def _origin_delivery_target(cls, context_id: str, platform_name: str) -> dict:
-        """Delivery target of the local session that started this A2A context."""
         origin: dict = {}
         with _ADAPTERS_GUARD:
             refs = list(_ADAPTERS.values())
@@ -760,7 +749,6 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
 
     @property
     def authorization_is_upstream(self) -> bool:
-        """A2A authenticates every inbound request via bearer token (or"""
         return True
 
     # ── Fan-out children registration ────────────────────────────────────
@@ -770,7 +758,6 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
         cls, parent_context_id: str, peer_children: Dict[str, str],
         origin: Optional[dict] = None,
     ) -> None:
-        """Record a fan-out operation: parent → {peer: child_context_id}."""
         if not parent_context_id or not peer_children:
             return
         new_entry = {parent_context_id: dict(peer_children)}
@@ -792,7 +779,6 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
 
     @classmethod
     def _get_fanout_children(cls, parent_context_id: str) -> dict:
-        """Return {peer: child_context_id} for a fan-out parent, or {}."""
         if not parent_context_id:
             return {}
         with _ADAPTERS_GUARD:
@@ -810,7 +796,6 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
 
     @classmethod
     def _reject_child_reuse(cls, child_context_id: str, requesting_peer: str) -> str:
-        """Check if a child context is already claimed by a different peer."""
         if not child_context_id:
             return ""
         with _ADAPTERS_GUARD:
@@ -1036,7 +1021,6 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
     # ── Orphaned task watchdog ─────────────────────────────────────────────
 
     def _watchdog_loop(self) -> None:
-        """Background thread that fails orphaned tasks (keeps them queryable)."""
         while not self._watchdog_stop.wait(_WATCHDOG_INTERVAL):
             try:
                 failed = self.tasks.fail_orphans(_ORPHAN_TIMEOUT)
@@ -1059,7 +1043,6 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
             return {}
 
     def _load_served_agents(self, extra: dict) -> dict[str, dict]:
-        """Load served-agent routing config."""
         raw = extra.get("agents") or extra.get("served_agents")
         if raw is None:
             cfg = self._load_global_a2a_config()
@@ -1188,7 +1171,6 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
         )
 
     def _advertised_skills(self, agent: Optional[dict] = None) -> list[dict]:
-        """Dynamic Agent Card skills from the live tool registry."""
         try:
             from tools.registry import registry as tool_registry
             names = tool_registry.get_registered_toolset_names()
@@ -1270,7 +1252,6 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
     # ── Inbound task handling ─────────────────────────────────────────────
 
     def _find_existing_nonterminal_task(self, context_id: str) -> Optional[dict]:
-        """Find an existing non-terminal task for ``context_id`` in the task store."""
         recs, _ = self.tasks.list(context_id=context_id)
         for rec in recs:
             if rec["state"] not in protocol.TERMINAL_STATES:
@@ -1278,7 +1259,6 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
         return None
 
     def _prepare_task(self, params: dict, peer: str, agent: Optional[dict] = None) -> tuple[Optional[dict], Optional[dict]]:
-        """Validate, register, and dispatch an inbound message."""
         agent = agent or self._agents[""]
         text = protocol.extract_text(params)
         context_id = protocol.extract_context_id(params) or protocol.new_context_id()
@@ -1594,7 +1574,6 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
         }
 
     def _restore_persisted_context_sessions(self) -> int:
-        """Merge persisted context→origin-session registrations into memory."""
         with self._context_sessions_lock:
             restored = _load_context_sessions()
             merged = _merge_context_sessions(self._context_sessions, restored, _MAX_CONTEXT_PEERS)
@@ -1603,7 +1582,6 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
         return len(restored)
 
     def _restore_persisted_fanout_children(self) -> int:
-        """Merge persisted fan-out parent→children map into memory."""
         disk = _load_fanout_children()
         if not disk:
             return 0
@@ -1614,7 +1592,6 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
         return len(disk)
 
     async def _wake_origin_session(self, context_id: str, text: str) -> None:
-        """Wake the local session that created this A2A context (if any)."""
         with self._context_sessions_lock:
             origin = dict(self._context_sessions.get(context_id) or {})
         if not origin:
@@ -1737,7 +1714,6 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
             logger.debug("A2A: could not title forwarded session", exc_info=True)
 
     def _forward_to_profile(self, agent: dict, peer: str, context_id: str, framed_text: str, task_id: str) -> tuple[str, str]:
-        """Forward a routed A2A task to another local Hermes profile."""
         profile = str(agent.get("profile") or agent.get("slug") or "").strip()
         slug = str(agent.get("slug") or profile or "agent")
         safe_ctx = _safe_context_slug(context_id)
@@ -1789,7 +1765,6 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
 
 
     def _patience_for(self, params: dict, peer: str) -> float:
-        """Client patience for a blocking message/send."""
         _TIMEOUT_CEILING = _ORPHAN_TIMEOUT - _PATIENCE_MARGIN  # 270s
         sender = protocol.extract_sender(params)
         if isinstance(sender, dict):
@@ -1811,7 +1786,6 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
         return 120.0
 
     def _mark_out_of_band(self, pending: dict, reason: str, pop_waiter: bool) -> None:
-        """Record that a pending task's client is gone."""
         with self._pending_lock:
             if pending.get("out_of_band_only"):
                 return
@@ -1835,8 +1809,8 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
         )
 
     def _try_push_reply(self, pending: dict, state: str, reply: str) -> protocol.PushOutcome:
-        """Push a completed reply out-of-band, dedupe-guarded. Returns typed PushOutcome."""
         if state not in (protocol.STATE_COMPLETED, protocol.STATE_INPUT_REQUIRED) or not reply:
+            _audit_safe("push_dropped", str(pending.get("peer", "")), str(pending.get("task_id", "")), "no reply to push", context_id=str(pending.get("context_id", "")))
             return protocol.PushOutcome(success=False, category="routing", error="no reply to push")
         with self._pending_lock:
             if pending.get("pushed"):
@@ -1850,16 +1824,20 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
                     "A2A: out-of-band push for task %s returned failure %s: %s",
                     pending.get("task_id"), outcome.category, outcome.error,
                 )
+            # Propagate inner outcome without re-audit (owner is inner)
             return outcome
         except Exception as exc:
             logger.warning(
                 "A2A: out-of-band push for task %s failed: %s",
                 pending.get("task_id"), exc,
             )
-            return protocol.PushOutcome(success=False, category="transport", error=str(exc))
+            safe = security.redact_outbound(str(exc))
+            if len(safe) > 500:
+                safe = safe[:500]
+            _audit_safe("push_failed", str(pending.get("peer", "")), str(pending.get("task_id", "")), safe, context_id=str(pending.get("context_id", "")))
+            return protocol.PushOutcome(success=False, category="transport", error=safe)
 
     def _is_duplicate_inbound(self, context_id: str, message_id: str) -> bool:
-        """Windowed (contextId, messageId) dedupe."""
         key = (context_id, message_id)
         now = time.time()
         with self._inbound_seen_lock:
@@ -1876,7 +1854,6 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
             return False
 
     def _await_reply(self, pending: dict, keepalive=None, patience: Optional[float] = None) -> tuple[str, str, bool, bool]:
-        """Block until the task's future resolves (or times out)."""
         fut: Future = pending["future"]
         deadline = pending["started"] + _reply_timeout()
         patience_deadline = (
@@ -1928,14 +1905,6 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
     # ── Sending (the agent's reply path) ──────────────────────────────────
 
     def _durable_complete_pending(self, task_id: str, chat_id: str, content: str, message_id: str) -> tuple[bool, str]:
-        """Single durable completion coordinator for send paths.
-
-        Stages the terminal candidate, calls TaskStore.publish_durable, and
-        only after published=True/newly_published=True resolves/removes the
-        Future and returns success.  On failed publish, keeps waiter/task
-        coherent, leaves last durable state visible, and returns structured
-        failure with no successful side effect.
-        """
         # Stage candidate from current durable record — pending map/Future is NOT Task authority (Amendment D)
         rec = self.tasks.get(task_id)
         if rec is None:
@@ -1988,7 +1957,6 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ):
-        """Fulfil the pending reply Future for this context."""
         message_id = str(int(time.time() * 1000))
         # Task-authority: prefer the specific task via thread_id (ContextVar) to avoid cross-talk
         task_id_via_thread = ""
@@ -2137,10 +2105,7 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
             with self._context_peers_lock:
                 _loop_peer = self._context_peers.get(chat_id, "")
             if _loop_peer and _loopback_fallback_url(_loop_peer, self.host, self.port):
-                security.audit(
-                    "push_dropped", _loop_peer, message_id,
-                    "peer identity not resolvable", context_id=chat_id,
-                )
+                _audit_safe("push_dropped", _loop_peer, message_id, "peer identity not resolvable", context_id=chat_id)
                 logger.warning(
                     "A2A: dropping out-of-band send for %s: loopback peer %r "
                     "is unresolvable and the message is an unmarked session "
@@ -2156,10 +2121,7 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
         with self._context_peers_lock:
             _push_peer = self._context_peers.get(chat_id, "")
         if not _push_peer:
-            security.audit(
-                "push_dropped", "", message_id,
-                "no peer registered for context", context_id=chat_id,
-            )
+            _audit_safe("push_dropped", "", message_id, "no peer registered for context", context_id=chat_id)
             logger.warning(
                 "A2A: out-of-band send for %s has no registered peer; "
                 "reporting failure (success=False)",
@@ -2179,14 +2141,23 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
                 return SendResult(success=False, message_id=message_id, error=f"{outcome.category}: {outcome.error}")
         except Exception as exc:
             logger.warning("A2A: out-of-band push for context %s failed: %s", chat_id, exc)
-            return SendResult(success=False, message_id=message_id, error=str(exc))
+            safe = security.redact_outbound(str(exc))
+            if len(safe) > 500:
+                safe = safe[:500]
+            try:
+                with self._context_peers_lock:
+                    _audit_peer = self._context_peers.get(chat_id, "")
+            except Exception:
+                _audit_peer = ""
+            _audit_safe("push_failed", _audit_peer, message_id, safe, context_id=chat_id)
+            return SendResult(success=False, message_id=message_id, error=f"transport: {safe}")
         return SendResult(success=True, message_id=message_id)
     def _push_out_of_band(self, context_id: str, text: str, want_reply: bool = False) -> protocol.PushOutcome:
-        """POST a new message/send to the peer that owns ``context_id``. Returns typed PushOutcome (Amendment A/B)."""
         with self._context_peers_lock:
             peer = self._context_peers.get(context_id, "")
         if not peer:
             logger.debug("A2A: out-of-band send for %s has no known peer; dropping", context_id)
+            _audit_safe("push_dropped", "", context_id, "no peer registered for context", context_id=context_id)
             return protocol.PushOutcome(success=False, category="routing", error="no peer registered for context")
         from . import tools as a2a_tools
 
@@ -2221,13 +2192,7 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
                 # message/send, minus the connection and the wait.
                 return self._push_loopback_in_process(context_id, peer, text, want_reply=False)
             else:
-                # Stale/unresolvable peer: a registered peer identity that
-                # can't be resolved to a URL.  Loud failure so notifier/cursor
-                # logic cannot advance over a dropped event.
-                security.audit(
-                    "push_dropped", peer, context_id,
-                    "registered peer not resolvable", context_id=context_id,
-                )
+                _audit_safe("push_dropped", peer, context_id, "registered peer not resolvable", context_id=context_id)
                 logger.warning(
                     "A2A: out-of-band send for %s: peer %r registered but "
                     "not resolvable — delivery dropped",
@@ -2302,20 +2267,27 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
                     _push_outcome = protocol.PushOutcome(success=False, category="invalid_response", error=f"{ve.reason}: {ve.detail}", payload=None)
         except Exception as exc:
             logger.warning("A2A: out-of-band push for context %s failed: %s", context_id, exc)
-            _push_outcome = protocol.PushOutcome(success=False, category="transport", error=str(exc))
+            # Redact to ensure no credential leak in error; preserve category transport
+            safe = security.redact_outbound(str(exc))
+            if len(safe) > 300:
+                safe = safe[:300] + "...[truncated]"
+            _push_outcome = protocol.PushOutcome(success=False, category="transport", error=safe)
         finally:
             # Amendment A: conversation agent entry is evidence of validated successful push only.
             # All failure categories must NOT persist agent entry, must emit exactly one failure audit, no success metric/log.
+            # Post-commit side effects are best-effort and cannot downgrade committed success.
             if _push_outcome.success:
-                protocol.persist_message(context_id, "agent", text)
-                security.audit("push", peer, rpc_body["id"], text, context_id=context_id)
+                try:
+                    protocol.persist_message(context_id, "agent", text)
+                except Exception as exc:
+                    logger.warning("A2A: out-of-band push conversation persist failed for %s (best-effort): %s", context_id, exc)
+                try:
+                    security.audit("push", peer, rpc_body["id"], text, context_id=context_id)
+                except Exception as exc:
+                    logger.warning("A2A: out-of-band push audit failed for %s (best-effort): %s", context_id, exc)
                 logger.info("A2A: pushed out-of-band reply for context %s to peer %s", context_id, peer)
             else:
-                # Failure-only audit with redacted detail; no conversation persist, no success audit/metric/log.
-                try:
-                    security.audit("push_failed", peer, rpc_body["id"], _push_outcome.error, context_id=context_id)
-                except Exception:
-                    pass
+                _audit_safe("push_failed", peer, rpc_body["id"], _push_outcome.error, context_id=context_id)
                 logger.warning("A2A: out-of-band push for context %s to peer %s failed or got invalid result: %s", context_id, peer, _push_outcome.error)
         if not _push_outcome.success:
             return _push_outcome
@@ -2355,7 +2327,6 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
 
         return _push_outcome
     def _drop_unresolvable_reply(self, context_id: str, peer: str) -> None:
-        """Loud failure for a reply push with no resolvable external target."""
         security.audit(
             "push_dropped", peer, "", "peer identity not resolvable",
             context_id=context_id,
@@ -2367,7 +2338,6 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
         )
 
     def _push_reply_after_client_gone(self, req_id: Any, result: Optional[dict], is_v1: bool = True) -> protocol.PushOutcome:
-        """Deliver a completed reply whose HTTP client disconnected first. Returns typed PushOutcome."""
         try:
             inner = (result or {}).get("result")
             _mode = "V1_WRAPPED" if is_v1 else "LEGACY_BARE"
@@ -2375,13 +2345,19 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
                 _parsed = protocol.parse_send_message_result(inner, _mode)
             except protocol.A2AResultValidationError as ve:
                 logger.warning("A2A: rescue found invalid result for req %s: %s (%s)", req_id, ve.reason, ve.detail)
-                return protocol.PushOutcome(success=False, category="invalid_response", error=f"{ve.reason}: {ve.detail}")
+                err = f"{ve.reason}: {ve.detail}"
+                safe = security.redact_outbound(err)
+                if len(safe) > 500:
+                    safe = safe[:500]
+                _audit_safe("push_failed", "", str(req_id), safe, context_id="")
+                return protocol.PushOutcome(success=False, category="invalid_response", error=err)
             if _parsed.kind == "task":
                 context_id = _parsed.context_id
                 state = _parsed.state
                 reply = _parsed.text
             else:
                 logger.debug("A2A: rescue got message result, not task terminal, skipping")
+                _audit_safe("push_dropped", "", str(req_id), "message result not pushable via rescue", context_id="")
                 return protocol.PushOutcome(success=False, category="routing", error="message result not pushable via rescue")
             if not context_id or state not in (
                 protocol.STATE_COMPLETED, protocol.STATE_INPUT_REQUIRED,
@@ -2390,8 +2366,10 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
                     "A2A: not pushing reply after client disconnect for %s (state=%r)",
                     context_id, state,
                 )
+                _audit_safe("push_dropped", "", str(req_id), f"state not pushable: {state!r}", context_id=context_id or "")
                 return protocol.PushOutcome(success=False, category="routing", error=f"state not pushable: {state!r}")
             if not reply:
+                _audit_safe("push_dropped", "", str(req_id), "no reply to push", context_id=context_id)
                 return protocol.PushOutcome(success=False, category="routing", error="no reply to push")
             outcome = self._push_out_of_band(context_id, reply, want_reply=True)
             if not outcome.success:
@@ -2411,16 +2389,14 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
                 "A2A: could not push reply after client disconnect (req %s): %s",
                 req_id, exc,
             )
-            return protocol.PushOutcome(success=False, category="transport", error=str(exc))
+            safe = security.redact_outbound(str(exc))
+            if len(safe) > 500:
+                safe = safe[:500]
+            _audit_safe("push_failed", "", str(req_id), safe, context_id="")
+            return protocol.PushOutcome(success=False, category="transport", error=safe)
 
     def _push_loopback_in_process(self, context_id: str, peer: str, text: str,
                                   want_reply: bool = False) -> protocol.PushOutcome:
-        """Deliver an out-of-band push to this gateway's own session in-process. Returns typed PushOutcome (Amendment B).
-
-        Fire-and-forget loopback durably creates WORKING before dispatch and durably publishes COMPLETED
-        before any terminal side effects. Failed WORKING leaves ABSENT; failed COMPLETED leaves WORKING,
-        unresolved Future/watcher, no terminal side effects, and category durability.
-        """
         params = {
             "message": protocol.text_message(
                 protocol.ROLE_USER, text, context_id=context_id, sender=self._sender_identity()
@@ -2444,16 +2420,18 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
         assert pending is not None  # _prepare_task returns (terminal, None) or (None, pending)
         if want_reply:
             # Session-reply path: the task stays pending for send() to resolve.
-            # WORKING already durably created; emit success side effects for the inbound leg.
+            # WORKING already durably created and dispatch scheduled — commit point.
+            # Post-commit side effects are best-effort and cannot downgrade committed success.
             try:
                 protocol.persist_message(context_id, "agent", text)
-                security.audit("push", peer, pending["task_id"], text, context_id=context_id)
-                logger.info("A2A: pushed out-of-band reply for context %s to peer %s (want_reply)", context_id, peer)
-                return protocol.PushOutcome(success=True, category="transport", error="")
             except Exception as exc:
-                logger.error("A2A: loopback want_reply side effect failed for %s: %s", context_id, exc)
-                _audit_loopback_failure(peer, context_id, str(exc), "durability", task_id=pending.get("task_id", "") if isinstance(pending, dict) else "")
-                return protocol.PushOutcome(success=False, category="durability", error=str(exc))
+                logger.warning("A2A: loopback want_reply conversation persist failed for %s (best-effort): %s", context_id, exc)
+            try:
+                security.audit("push", peer, pending["task_id"], text, context_id=context_id)
+            except Exception as exc:
+                logger.warning("A2A: loopback want_reply push audit failed for %s (best-effort): %s", context_id, exc)
+            logger.info("A2A: pushed out-of-band reply for context %s to peer %s (want_reply)", context_id, peer)
+            return protocol.PushOutcome(success=True, category="transport", error="")
         else:
             # Fire-and-forget (notifier): complete the task immediately
             # Durable COMPLETED publication must precede terminal effects and success (Amendment B).
