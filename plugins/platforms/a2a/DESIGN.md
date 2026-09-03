@@ -312,6 +312,40 @@ For every `publish_durable`:
    transition; unrelated IDs may merge without stale same-task
    overwrite.
 
+### F. Local loopback failure audit cardinality (Wave 14 — b7384ce correction)
+
+Every local loopback `PushOutcome` failure emits exactly one failure-only
+audit and no success side effect. ` _push_loopback_in_process` is the
+central audit seam for loopback: WORKING publish failure and COMPLETED
+publish failure emit one `push_failed` with `category="durability"`;
+terminal rejection emits one `push_dropped` with `category="routing"`;
+want-reply side-effect failure emits one `push_failed` durability audit.
+The loopback helper audits before returning; `_push_out_of_band`'s two
+in-process branches (`2171`, `2204`) return that outcome unchanged without
+re-auditing, and `_try_push_reply` / `_push_reply_after_client_gone` /
+rescue / `adapter.send` preserve the typed `PushOutcome`/`SendResult`
+propagation without double-auditing. No `persist_message(..., "agent", ...)`,
+success-direction `push` audit, success metric, terminal callback, or
+success log is emitted on failure. Failed terminal publication leaves
+memory/disk WORKING and observers/Futures unresolved, and `adapter.send`
+maps durability to `SendResult(success=False, error=<durability plus detail>)`.
+This is an audit-event cardinality guarantee, not an exactly-once delivery
+guarantee (see §8 bounded duplicate suppression). `_drop_unresolvable_reply`
+retains its existing `push_dropped` for reply-path unresolvable peers.
+
+### G. JSON-RPC peer error redaction (Wave 14 — b7384ce correction)
+
+A JSON-RPC top-level `error` is never persisted or returned verbatim.
+`_push_out_of_band` builds a bounded redacted detail via
+`security.redact_outbound` before constructing `PushOutcome`: raw
+`resp["error"]` (code/message, including bearer-shaped sentinels) is
+redacted, truncated to 300 chars, and stored as `PushOutcome.error`;
+`PushOutcome.payload` carries the same redacted copy (dict values redacted
+individually). The warning log for the peer error and the `push_failed`
+audit both use the redacted detail; no raw peer code/message reaches
+callers, logs, or the audit ledger. `category="jsonrpc"` and the failure
+mapping are retained; no `security.py` change was required.
+
 ## Files
 ```
 plugins/platforms/a2a/

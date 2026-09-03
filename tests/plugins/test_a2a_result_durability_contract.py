@@ -1584,3 +1584,250 @@ def test_same_task_terminal_conflict_uses_locked_disk_authority_across_stores(mo
     data3 = __import__("json").loads(ledger.read_text())
     assert "t-cross" in data3 and "t-new-unrelated" in data3
     assert data3["t-cross"]["reply"] == "reply-a"
+
+
+# ---------------------------------------------------------------------------
+# 26. Wave 14 regression: loopback audit cardinality + JSON-RPC redaction via real callers
+# ---------------------------------------------------------------------------
+def test_wave14_loopback_audit_and_jsonrpc_redaction(monkeypatch, tmp_path):
+    """Wave 14 regression through real _push_out_of_band / _try_push_reply / adapter.send path.
+
+    Asserts:
+    - category preservation (routing/durability/jsonrpc)
+    - SendResult mapping for durability
+    - no agent persist / no success audit on failure
+    - exactly one failure audit per failed push invocation
+    - absence of synthetic bearer sentinel from returned/audited detail (redaction via security.redact_outbound)
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from plugins.platforms.a2a import protocol, security
+    from plugins.platforms.a2a import tools as a2a_tools
+    from plugins.platforms.a2a.adapter import A2AAdapter
+    from gateway.config import PlatformConfig
+    import asyncio
+    import threading
+
+    sentinel = "Bearer abcdefghijklmnopqrstuvwx"
+    # -- Remote JSON-RPC redaction via real _push_out_of_band --
+    adapter = A2AAdapter(PlatformConfig(enabled=True, extra={"port": 0}))
+    ctx_remote = "ctx-wave14-remote"
+    adapter._context_peers[ctx_remote] = "peer1"
+    fake_peer = {"url": "http://peer.example/rpc", "auth": {}, "timeout": 10, "headers": {}, "allowed_rpc_origins": [], "tenant": ""}
+    monkeypatch.setattr(a2a_tools, "_resolve_peer", lambda _: fake_peer)
+    monkeypatch.setattr(a2a_tools, "_fetch_card", lambda *a, **k: None)
+
+    def fake_jsonrpc_bearer(url, body, headers, timeout, allowed_origins=()):
+        return {"jsonrpc": "2.0", "id": body["id"], "error": {"code": -32000, "message": sentinel}}
+
+    monkeypatch.setattr(a2a_tools, "_http_post_json", fake_jsonrpc_bearer)
+
+    persist_calls = []
+    audit_calls = []
+    orig_persist = protocol.persist_message
+    orig_audit = security.audit
+
+    def tracking_persist(context_id, role, text, task_id=""):
+        persist_calls.append((context_id, role, text))
+        return orig_persist(context_id, role, text, task_id)
+
+    def tracking_audit(direction, peer, tid, detail, context_id=None):
+        audit_calls.append((direction, peer, tid, detail, context_id))
+        return orig_audit(direction, peer, tid, detail, context_id=context_id)
+
+    monkeypatch.setattr(protocol, "persist_message", tracking_persist)
+    monkeypatch.setattr(security, "audit", tracking_audit)
+    import plugins.platforms.a2a.adapter as adapter_mod
+    monkeypatch.setattr(adapter_mod.security, "audit", tracking_audit)
+
+    # Direct _push_out_of_band must be redacted and have exactly one push_failed
+    persist_calls.clear()
+    audit_calls.clear()
+    out = adapter._push_out_of_band(ctx_remote, "hello", want_reply=False)
+    assert isinstance(out, protocol.PushOutcome)
+    assert not out.success
+    assert out.category == "jsonrpc"
+    assert sentinel not in out.error, "bearer sentinel must be redacted from PushOutcome.error"
+    assert sentinel not in str(out.payload), "bearer sentinel must be redacted from payload"
+    # audit detail also redacted, exactly one failure audit, no success push, no agent persist
+    assert persist_calls == [] or all(c[1] != "agent" for c in persist_calls)
+    push = [a for a in audit_calls if a[0] == "push"]
+    failed = [a for a in audit_calls if a[0] == "push_failed"]
+    assert push == [], f"must not have success push audit on failure, got {push}"
+    assert len(failed) == 1, f"expected exactly one push_failed, got {failed}"
+    assert sentinel not in failed[0][3], "bearer sentinel must be redacted from audit"
+    # Bearer pattern should be replaced by redact_outbound marker
+    assert "[redacted]" in out.error or "redacted" in out.error.lower()
+
+    # _try_push_reply propagation retains typed redacted failure without double-audit
+    persist_calls.clear()
+    audit_calls.clear()
+    monkeypatch.setattr(a2a_tools, "_http_post_json", fake_jsonrpc_bearer)
+    pending = {"task_id": "t-wave14-try", "context_id": ctx_remote, "peer": "peer1", "pushed": False}
+    res_try = adapter._try_push_reply(pending, protocol.STATE_COMPLETED, "hello")
+    assert isinstance(res_try, protocol.PushOutcome)
+    assert not res_try.success
+    assert res_try.category == "jsonrpc"
+    assert sentinel not in res_try.error
+    failed_try = [a for a in audit_calls if a[0] == "push_failed"]
+    assert len(failed_try) == 1
+    assert sentinel not in failed_try[0][3]
+
+    # rescue propagation also redacted
+    persist_calls.clear()
+    audit_calls.clear()
+    monkeypatch.setattr(a2a_tools, "_http_post_json", fake_jsonrpc_bearer)
+    valid_task = protocol.build_task("t-rescue-wave14", ctx_remote, protocol.STATE_COMPLETED, "rescue reply")
+    rescue_result = {"result": {"task": valid_task}}
+    res_rescue = adapter._push_reply_after_client_gone("req-wave14", rescue_result, is_v1=True)
+    assert isinstance(res_rescue, protocol.PushOutcome)
+    assert not res_rescue.success
+    assert res_rescue.category == "jsonrpc"
+    assert sentinel not in res_rescue.error
+    persist_agent = [c for c in persist_calls if c[1] == "agent"]
+    assert persist_agent == []
+    failed_rescue = [a for a in audit_calls if a[0] == "push_failed"]
+    assert len(failed_rescue) == 1
+    assert sentinel not in failed_rescue[0][3]
+
+    # adapter.send mapping via same oob path retains redacted detail
+    persist_calls.clear()
+    audit_calls.clear()
+    monkeypatch.setattr(a2a_tools, "_http_post_json", fake_jsonrpc_bearer)
+    adapter._pending.clear()
+    adapter._pending_order.clear()
+    ctx_send = "ctx-wave14-send"
+    adapter._context_peers[ctx_send] = "peer1"
+    send_res = asyncio.run(adapter.send(ctx_send, "send via oob", metadata={"notify": True}))
+    assert not send_res.success
+    assert "jsonrpc" in send_res.error.lower()
+    assert sentinel not in send_res.error
+
+    # -- Local loopback durability / routing audit exactly-once via real loopback --
+    # Use an in-process loop + failing COMPLETED publish to trigger durability
+    old_home = __import__("os").environ.get("HERMES_HOME")
+    loop_tmp = tmp_path / "loopback_home"
+    loop_tmp.mkdir(parents=True, exist_ok=True)
+    __import__("os").environ["HERMES_HOME"] = str(loop_tmp)
+    adapter2 = A2AAdapter(PlatformConfig(enabled=True, extra={"port": 0}))
+    # Track audits/persists separately for loopback
+    audits2 = []
+    persists2 = []
+
+    def track_audit2(direction, peer, tid, summary, context_id=None):
+        audits2.append((direction, peer, tid, summary))
+
+    def track_persist2(context_id, role, text, task_id=""):
+        persists2.append((context_id, role, text))
+        return orig_persist(context_id, role, text, task_id)
+
+    monkeypatch.setattr(security, "audit", track_audit2)
+    monkeypatch.setattr(protocol, "persist_message", track_persist2)
+    monkeypatch.setattr(adapter_mod.security, "audit", track_audit2)
+    # Inject durability failure for COMPLETED
+    orig_pub = adapter2.tasks.publish_durable
+
+    def fail_completed(path, task_id, candidate):
+        if candidate.get("state") == protocol.STATE_COMPLETED:
+            return protocol.DurablePublishOutcome(published=False, newly_published=False, record=adapter2.tasks.get(task_id), durable_state=protocol.STATE_WORKING, error="injected terminal failure")
+        return orig_pub(path, task_id, candidate)
+
+    adapter2.tasks.publish_durable = fail_completed
+    adapter2._agents = {"": {"local": True}}
+    adapter2.host = "127.0.0.1"
+    adapter2.port = 19914
+    import gateway.session_context as session_context
+    monkeypatch.setattr(session_context, "get_session_env", lambda _: "")
+    import asyncio as _asyncio
+    loop = _asyncio.new_event_loop()
+    ready = threading.Event()
+
+    def loop_runner():
+        _asyncio.set_event_loop(loop)
+        ready.set()
+        loop.run_forever()
+
+    th = threading.Thread(target=loop_runner, daemon=True)
+    th.start()
+    ready.wait(2)
+    adapter2._loop = loop
+    adapter2._message_handler = object()
+    async def _no_op(_e):
+        return None
+    adapter2.handle_message = _no_op
+
+    try:
+        audits2.clear()
+        persists2.clear()
+        out_lb = adapter2._push_loopback_in_process("ctx-lb-wave14", "peer-lb", "hello-lb", want_reply=False)
+        assert isinstance(out_lb, protocol.PushOutcome)
+        assert not out_lb.success
+        assert out_lb.category == "durability"
+        # Exactly one failure audit, no agent persist, no success push
+        assert persists2 == [] or all(p[1] != "agent" for p in persists2)
+        push2 = [a for a in audits2 if a[0] == "push"]
+        failed2 = [a for a in audits2 if a[0] in ("push_failed", "push_dropped")]
+        # durability must be push_failed
+        assert len([a for a in audits2 if a[0] == "push_failed"]) == 1, f"durability must emit exactly one push_failed, got {audits2}"
+        assert push2 == []
+        # Task remains WORKING, no watcher resolved
+        recs = adapter2.tasks.list(context_id="ctx-lb-wave14")[0]
+        assert recs and recs[0]["state"] == protocol.STATE_WORKING
+
+        # Routing rejection via terminal (rejected) also exactly one audit, no double via _push_out_of_band wrapper
+        audits2.clear()
+        persists2.clear()
+        # Create a rejected terminal by exceeding deduplicate? Simpler: call _push_loopback with terminal not None by seeding a REJECTED record first?
+        # Use _prepare_task to create a REJECTED anti-loop then attempt loopback for same context with same messageId dedupe
+        # Instead directly test via _push_out_of_band loopback branch: set peer to loopback address so _push_loopback is called via _push_out_of_band
+        adapter2._context_peers["ctx-lb-oob-wave14"] = "ip:127.0.0.1"
+        # Reset publish to fail again but also need WORKING to succeed then COMPLETED to fail; for routing test we need terminal rejection not durability.
+        # For routing, we simulate terminal by having _prepare_task return terminal via anti-loop: fill turns
+        for _ in range(10):
+            adapter2._turns.track("ctx-lb-routing-wave14")
+        out_route = adapter2._push_loopback_in_process("ctx-lb-routing-wave14", "peer-lb", "hello-route", want_reply=False)
+        assert isinstance(out_route, protocol.PushOutcome)
+        assert not out_route.success
+        assert out_route.category == "routing"
+        # routing emits push_dropped exactly once
+        assert len([a for a in audits2 if a[0] in ("push_dropped", "push_failed")]) == 1
+        assert all(p[1] != "agent" for p in persists2)
+
+        # Via _push_out_of_band wrapper for loopback: should still be exactly one (inner audits, outer does not double)
+        audits2.clear()
+        persists2.clear()
+        adapter2.tasks.publish_durable = fail_completed  # reset
+        # Restore _resolve_peer so loopback fallback is triggered (ip: peer has no a2a_agents entry)
+        monkeypatch.setattr(a2a_tools, "_resolve_peer", lambda x: None)
+        monkeypatch.setattr(a2a_tools, "_fetch_card", lambda *a, **k: None)
+        adapter2._context_peers["ctx-lb-via-oob"] = "ip:127.0.0.1"
+        out_via_oob = adapter2._push_out_of_band("ctx-lb-via-oob", "hello via oob", want_reply=False)
+        assert isinstance(out_via_oob, protocol.PushOutcome)
+        assert not out_via_oob.success
+        assert out_via_oob.category == "durability"
+        assert len([a for a in audits2 if a[0] == "push_failed"]) == 1
+
+        # adapter.send mapping for durability retains category
+        audits2.clear()
+        # Mock _push_out_of_band to durability for send mapping; use non-loopback peer
+        orig_oob = adapter2._push_out_of_band
+        adapter2._push_out_of_band = lambda *a, **k: protocol.PushOutcome(success=False, category="durability", error="injected mapping failure")
+        # Ensure peer resolves so early loopback-drop does not fire
+        monkeypatch.setattr(a2a_tools, "_resolve_peer", lambda x: {"url": "http://peer.example/rpc", "auth": {}, "timeout": 10, "headers": {}, "allowed_rpc_origins": [], "tenant": ""} if x == "peer1" else None)
+        try:
+            adapter2._context_peers["ctx-send-wave14"] = "peer1"
+            send_dur = _asyncio.run(adapter2.send("ctx-send-wave14", "reply", metadata={"notify": True}))
+            assert not send_dur.success
+            assert "durability" in send_dur.error.lower()
+        finally:
+            adapter2._push_out_of_band = orig_oob
+
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        th.join(timeout=2)
+        loop.close()
+        adapter2._unregister_adapter()
+        if old_home is None:
+            __import__("os").environ.pop("HERMES_HOME", None)
+        else:
+            __import__("os").environ["HERMES_HOME"] = old_home
+        adapter._unregister_adapter()

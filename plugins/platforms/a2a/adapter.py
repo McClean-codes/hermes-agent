@@ -171,6 +171,57 @@ def _method_info(method: str) -> tuple[str, bool]:
     return mapping.get(method, ("", False))
 
 
+def _redacted_jsonrpc_detail(raw_error):
+    """Bounded redacted detail for JSON-RPC peer error (Finding 2).
+
+    Uses security.redact_outbound to scrub credential-shaped content,
+    retains category jsonrpc via caller, returns (error_str, payload_redacted).
+    Bounded to 300 chars plus truncation marker; audit truncates to 500 anyway.
+    """
+    raw_str = str(raw_error)
+    redacted = security.redact_outbound(raw_str)
+    if len(redacted) > 300:
+        redacted = redacted[:300] + "...[truncated]"
+    payload_redacted = None
+    if isinstance(raw_error, dict):
+        payload_redacted = {}
+        for k, v in raw_error.items():
+            if isinstance(v, str):
+                rv = security.redact_outbound(v)
+                if len(rv) > 300:
+                    rv = rv[:300] + "...[truncated]"
+                payload_redacted[k] = rv
+            else:
+                payload_redacted[k] = v
+    else:
+        payload_redacted = redacted
+    return redacted, payload_redacted
+
+
+def _audit_loopback_failure(peer: str, context_id: str, error: str, category: str, task_id: str = "") -> None:
+    """Emit exactly one failure audit for loopback (Finding 1, centralized seam).
+
+    Durability -> push_failed; routing -> push_dropped (existing choice) or
+    push_failed; transport/invalid -> push_failed. Bounded via security.audit's
+    500-char truncation; redact credential shapes as defense-in-depth.
+    Guarded best-effort so audit never raises into the push path.
+    """
+    # Redact as defense-in-depth even for internal errors (no credential expected)
+    safe_error = security.redact_outbound(error)
+    if len(safe_error) > 500:
+        safe_error = safe_error[:500]
+    # Map category to existing audit direction per Amendment A
+    direction = "push_failed"
+    if category == "routing":
+        # Preserve existing push_dropped semantics for routing; probe accepts
+        # either but push_dropped is the established routing failure audit.
+        direction = "push_dropped"
+    try:
+        security.audit(direction, peer, task_id or context_id, safe_error, context_id=context_id)
+    except Exception:
+        pass
+
+
 class _A2AServer(ThreadingHTTPServer):
     """ThreadingHTTPServer that carries a reference to its adapter."""
 
@@ -2235,8 +2286,9 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
         try:
             resp = a2a_tools._http_post_json(rpc_url, rpc_body, headers, timeout, allowed_origins=allowed)
             if isinstance(resp, dict) and "error" in resp:
-                logger.warning("A2A: out-of-band push for context %s got JSON-RPC error: %s", context_id, resp["error"])
-                _push_outcome = protocol.PushOutcome(success=False, category="jsonrpc", error=str(resp["error"]), payload=resp.get("error"))
+                _redacted, _payload = _redacted_jsonrpc_detail(resp["error"])
+                logger.warning("A2A: out-of-band push for context %s got JSON-RPC error: %s", context_id, _redacted)
+                _push_outcome = protocol.PushOutcome(success=False, category="jsonrpc", error=_redacted, payload=_payload)
             elif resp is None or not isinstance(resp, dict):
                 logger.warning("A2A: out-of-band push for context %s got invalid response: %r", context_id, resp)
                 _push_outcome = protocol.PushOutcome(success=False, category="transport", error=f"invalid response: {resp!r}")
@@ -2378,13 +2430,16 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
             terminal, pending = self._prepare_task(params, peer)
         except protocol.DurablePublishError as dpe:
             logger.error("A2A: loopback WORKING publish failed for context %s: %s", context_id, dpe)
+            _audit_loopback_failure(peer, context_id, f"durability failure: {dpe}", "durability", task_id=getattr(dpe, "task_id", "") or "")
             return protocol.PushOutcome(success=False, category="durability", error=f"durability failure: {dpe}")
         except Exception as exc:
             logger.error("A2A: loopback _prepare_task exception for context %s: %s", context_id, exc)
+            _audit_loopback_failure(peer, context_id, str(exc), "transport")
             return protocol.PushOutcome(success=False, category="transport", error=str(exc))
         if terminal is not None:
             state = (terminal.get("status") or {}).get("state", "unknown")
             logger.warning("A2A: loopback push for context %s rejected (%s)", context_id, state)
+            _audit_loopback_failure(peer, context_id, f"rejected: {state}", "routing", task_id=str(terminal.get("id", "")) if isinstance(terminal, dict) else "")
             return protocol.PushOutcome(success=False, category="routing", error=f"rejected: {state}")
         assert pending is not None  # _prepare_task returns (terminal, None) or (None, pending)
         if want_reply:
@@ -2397,6 +2452,7 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
                 return protocol.PushOutcome(success=True, category="transport", error="")
             except Exception as exc:
                 logger.error("A2A: loopback want_reply side effect failed for %s: %s", context_id, exc)
+                _audit_loopback_failure(peer, context_id, str(exc), "durability", task_id=pending.get("task_id", "") if isinstance(pending, dict) else "")
                 return protocol.PushOutcome(success=False, category="durability", error=str(exc))
         else:
             # Fire-and-forget (notifier): complete the task immediately
@@ -2407,9 +2463,11 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
                 return protocol.PushOutcome(success=True, category="transport", error="")
             except protocol.DurablePublishError as dpe:
                 logger.error("A2A: loopback COMPLETED publish failed for context %s task %s: %s", context_id, pending.get("task_id", ""), dpe)
+                _audit_loopback_failure(peer, context_id, f"durability failure: {dpe}", "durability", task_id=pending.get("task_id", "") if isinstance(pending, dict) else "")
                 return protocol.PushOutcome(success=False, category="durability", error=f"durability failure: {dpe}")
             except Exception as exc:
                 logger.error("A2A: loopback finalize exception for context %s: %s", context_id, exc)
+                _audit_loopback_failure(peer, context_id, str(exc), "transport", task_id=pending.get("task_id", "") if isinstance(pending, dict) else "")
                 return protocol.PushOutcome(success=False, category="transport", error=str(exc))
 
 
