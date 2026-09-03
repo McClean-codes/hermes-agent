@@ -120,13 +120,14 @@ def test_refine_matches_configured_agent_id(monkeypatch):
 
 
 def test_refine_matches_configured_name(monkeypatch):
+    # Security: agentId alone must not promote ip: identity without URL/origin validation
     monkeypatch.setattr(
         tools, "_load_config",
         lambda: {"a2a_agents": {"peer-a": {"url": "http://127.0.0.1:8802"}}},
     )
     adapter = _bare_adapter()
     params = {"message": _sender_message(name="peer-a")}
-    assert adapter._refine_peer_identity("ip:127.0.0.1", params, "ctx-1") == "peer-a"
+    assert adapter._refine_peer_identity("ip:127.0.0.1", params, "ctx-1") == "ip:127.0.0.1"
 
 
 def test_refine_uses_loopback_sender_url(monkeypatch):
