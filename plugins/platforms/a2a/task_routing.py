@@ -99,11 +99,13 @@ class TaskRPCHandler:
             return protocol.durable_persistence_error(req_id, dpe.task_id, dpe.context_id, dpe.attempted_state, dpe.durable_state, dpe.dispatched)
         if out_of_band_only:
             if state in (protocol.STATE_COMPLETED, protocol.STATE_INPUT_REQUIRED) and reply:
-                # _try_push_reply now returns PushOutcome; handle structured result
                 _push_res = self._try_push_reply(pending, state, reply)
-                # _try_push_reply returns bool or PushOutcome; treat truthy as success
-                if _push_res is True or (hasattr(_push_res, 'success') and _push_res.success):
+                # Strictly typed PushOutcome — no bool compatibility (Amendment B)
+                if isinstance(_push_res, protocol.PushOutcome) and _push_res.success:
                     return None
+                # Failed push: log but do not hide failure; return task response to client
+                # so client does not assume out-of-band delivery succeeded.
+                # No success side effect has been emitted for this failure.
         task = protocol.build_task(
             pending["task_id"], pending["context_id"], state, reply,
             created_at=pending["created_iso"],
