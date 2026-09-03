@@ -94,7 +94,7 @@ class TestToolSchemaRegistration:
                 f"{name}: schema has 'function' key — likely the full wrapper"
             )
 
-    def test_descriptions_round_trip(self):
+    def test_descriptions_round_trip(self, monkeypatch):
         """tool_describe must return non-empty descriptions."""
         import tools.tool_search as ts
 
@@ -107,23 +107,26 @@ class TestToolSchemaRegistration:
                     handler=handler, **kwargs,
                 )
 
+        # Gate must pass so get_definitions includes the tools.
+        monkeypatch.setattr(a2a_tools, "_a2a_tools_available", lambda: True)
         a2a_tools.register_tools(_Context())
         definitions = registry.get_definitions({"a2a_call"})
 
         original = ts.is_deferrable_tool_name
-        ts.is_deferrable_tool_name = lambda name: name == "a2a_call"
+        ts.is_deferrable_tool_name = lambda name, _dt=None: name == "a2a_call"
         try:
             described = json.loads(
                 ts.dispatch_tool_describe(
-                    {"name": "a2a_call"}, current_tool_defs=definitions,
+                    {"names": ["a2a_call"]}, current_tool_defs=definitions,
                 )
             )
         finally:
             ts.is_deferrable_tool_name = original
 
-        assert described["description"], "a2a_call description must not be empty"
-        assert described["parameters"]["required"] == ["agent", "message"]
-        assert set(described["parameters"]["properties"]) == {
+        tool_info = described["tools"]["a2a_call"]
+        assert tool_info["description"], "a2a_call description must not be empty"
+        assert tool_info["parameters"]["required"] == ["agent", "message"]
+        assert set(tool_info["parameters"]["properties"]) == {
             "agent", "message", "context_id",
         }
 
