@@ -312,39 +312,28 @@ For every `publish_durable`:
    transition; unrelated IDs may merge without stale same-task
    overwrite.
 
-### F. Local loopback failure audit cardinality (Wave 14 — b7384ce correction)
+### F. Failure audit ownership and commit-latched side effects (Wave 15 — 0b707259 successor)
 
-Every local loopback `PushOutcome` failure emits exactly one failure-only
-audit and no success side effect. ` _push_loopback_in_process` is the
-central audit seam for loopback: WORKING publish failure and COMPLETED
-publish failure emit one `push_failed` with `category="durability"`;
-terminal rejection emits one `push_dropped` with `category="routing"`;
-want-reply side-effect failure emits one `push_failed` durability audit.
-The loopback helper audits before returning; `_push_out_of_band`'s two
-in-process branches (`2171`, `2204`) return that outcome unchanged without
-re-auditing, and `_try_push_reply` / `_push_reply_after_client_gone` /
-rescue / `adapter.send` preserve the typed `PushOutcome`/`SendResult`
-propagation without double-auditing. No `persist_message(..., "agent", ...)`,
-success-direction `push` audit, success metric, terminal callback, or
-success log is emitted on failure. Failed terminal publication leaves
-memory/disk WORKING and observers/Futures unresolved, and `adapter.send`
-maps durability to `SendResult(success=False, error=<durability plus detail>)`.
-This is an audit-event cardinality guarantee, not an exactly-once delivery
-guarantee (see §8 bounded duplicate suppression). `_drop_unresolvable_reply`
-retains its existing `push_dropped` for reply-path unresolvable peers.
+The layer that first creates a failed `PushOutcome` owns exactly one failure-audit attempt; propagators (`_try_push_reply`, rescue, `adapter.send`, OOB wrappers) return the existing outcome unchanged and never re-audit. `routing` maps to `push_dropped`, `transport`/`jsonrpc`/`invalid_response`/`durability` map to `push_failed`. The owner invokes `security.audit` once; a best-effort writer failure preserves the original outcome, makes no second attempt, and triggers no outer compensation (diagnostic log only, sanitized and bounded). Every failed push has `agent` conversation appends `==0`, success `push` audits `==0`, success logs/metrics `==0`, exactly one failure audit attempt, and leaves durable state at `ABSENT` (WORKING publish failed) or last durable `WORKING` (terminal publish failed) with no terminal Future/watcher resolution.
 
-### G. JSON-RPC peer error redaction (Wave 14 — b7384ce correction)
+Side effects are commit-latched. Before the authoritative commit point, failures return typed outcomes, make no `agent` append or success `push` audit, emit one owner audit, and leave the required durable state. After commit, `agent` append, success `push` audit, metrics, logs, and callbacks are best-effort and cannot downgrade a committed success; an audit-writer fault after commit is not a durability failure.
 
-A JSON-RPC top-level `error` is never persisted or returned verbatim.
-`_push_out_of_band` builds a bounded redacted detail via
-`security.redact_outbound` before constructing `PushOutcome`: raw
-`resp["error"]` (code/message, including bearer-shaped sentinels) is
-redacted, truncated to 300 chars, and stored as `PushOutcome.error`;
-`PushOutcome.payload` carries the same redacted copy (dict values redacted
-individually). The warning log for the peer error and the `push_failed`
-audit both use the redacted detail; no raw peer code/message reaches
-callers, logs, or the audit ledger. `category="jsonrpc"` and the failure
-mapping are retained; no `security.py` change was required.
+- Remote `_push_out_of_band` commits only after a valid strict `V1_WRAPPED` parse. Before commit, transport/jsonrpc/invalid_response return typed failures with one owner audit and no `agent`/`push`. After commit, the `agent` append and success `push` audit are attempted independently; exceptions are caught and logged as warnings with sanitized bounded detail. A nested reply surfacing via local loopback is a separate child operation; its failure owns its own audit and does not downgrade the already committed remote success.
+
+- Local loopback `want_reply=True` commits after durable `WORKING` publication and successful local dispatch scheduling. Before commit, WORKING failure returns `durability` (`ABSENT`) and dispatch failure returns `transport`, each with one `push_failed` audit and no `agent`/`push`. After commit, the task remains `WORKING` for `adapter.send` to complete; the `agent` append and success `push` audit are best-effort and cannot downgrade the committed `success=True, category="transport"`.
+
+- Local loopback fire-and-forget commits after durable `COMPLETED` publication. Before commit, WORKING failure leaves `ABSENT` and COMPLETED failure leaves `WORKING`, each with one `push_failed` and no terminal `agent`/`push`/watcher. After `COMPLETED` commits, the terminal `agent` append, success `push` audit, metrics, and push notification are best-effort.
+
+Direct `_push_out_of_band` routing exits (`no peer`, `registered peer not resolvable`, loopback `want_reply` refusal, own-endpoint reply refusal) each emit one `push_dropped` at the owner. `_try_push_reply` invalid/empty, rescue parse/message/state/empty, and `adapter.send` unmarked loopback/missing-peer are owned `push_dropped` or `push_failed` exactly once. Delegated `_push_out_of_band` failures propagate unchanged without outer re-audit, and `adapter.send` maps them to `SendResult(success=False, error="<category>: <sanitized bounded detail>")`.
+
+### G. Recursive and globally bounded JSON-RPC sanitizer (Wave 15 — 0b707259 successor)
+
+`PushOutcome.payload` for a JSON-RPC `error` exposes only a new recursively sanitized bounded object with top-level `code`, `message`, and `data`; all other peer fields are dropped. A non-object error becomes `{"message": <sanitized bounded string>}`. The sanitizer never mutates or returns the peer object.
+
+- `code` is preserved only when it is an integer not a boolean.
+- `message` and `data` string values (and mapping keys) pass through `security.redact_outbound` before truncation; credential replacements from `redact_outbound` are authoritative.
+- Recursive rules: maximum depth `4` (`data` is depth `0`); maximum mapping entries `16` and list items `16` at each level; sanitized key length `64` Unicode code points; string value length `300` code points; final compact UTF-8 serialization `<=2048` bytes. `None`, booleans, integers, and finite floats are preserved; non-finite numbers and non-JSON values become `"[redacted]"`; removed values for depth/width safety use `"[redacted]"`, truncation uses `"...[truncated]"`. When the sanitized object exceeds `2048` bytes, retain sanitized `code` and `message` and replace `data` with `"[truncated]"`.
+- `PushOutcome.category` remains `jsonrpc`; `PushOutcome.error` is built from sanitized `code` and `message` only (never `str(raw_error)`), capped at `300` code points, and already redacted. Warning logs, failure audits, and `SendResult.error` use only the sanitized `error`. No credential-shaped value reaches `error`/`payload`/log/audit/`SendResult`. The sanitizer is private to `adapter.py`; no new public API is added.
 
 ## Files
 ```

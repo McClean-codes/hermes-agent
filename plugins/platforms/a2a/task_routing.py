@@ -388,16 +388,30 @@ class TaskRPCHandler:
             # Do not invent INDETERMINATE; keep WORKING visible
             raise protocol.DurablePublishError(task_id, context_id, state, _outcome.durable_state, True)
         # Post-commit ordering: only on newly_published do audit/metrics/push
+        # These are best-effort append-only side effects; failure cannot downgrade committed success.
         if _outcome.newly_published:
-            protocol.persist_message(context_id, "agent", reply, task_id)
-            security.audit(audit_direction, peer, task_id, reply, context_id=context_id)
-            if state in (protocol.STATE_COMPLETED, protocol.STATE_INPUT_REQUIRED):
-                protocol.metrics.outbound_total += 1
-                protocol.metrics.tasks_completed += 1
-                protocol.metrics.record_latency(time.time() - pending["started"])
-            else:
-                protocol.metrics.tasks_failed += 1
-            self._send_push_notification(task_id, context_id, reply, state)
+            try:
+                protocol.persist_message(context_id, "agent", reply, task_id)
+            except Exception as exc:
+                logger.warning("A2A: _finalize_task persist failed for task %s (best-effort): %s", task_id, exc)
+            try:
+                security.audit(audit_direction, peer, task_id, reply, context_id=context_id)
+            except Exception as exc:
+                logger.warning("A2A: _finalize_task audit failed for task %s (best-effort): %s", task_id, exc)
+            # Metrics and push notification are also best-effort
+            try:
+                if state in (protocol.STATE_COMPLETED, protocol.STATE_INPUT_REQUIRED):
+                    protocol.metrics.outbound_total += 1
+                    protocol.metrics.tasks_completed += 1
+                    protocol.metrics.record_latency(time.time() - pending["started"])
+                else:
+                    protocol.metrics.tasks_failed += 1
+            except Exception as exc:
+                logger.warning("A2A: _finalize_task metrics failed for task %s (best-effort): %s", task_id, exc)
+            try:
+                self._send_push_notification(task_id, context_id, reply, state)
+            except Exception as exc:
+                logger.warning("A2A: _finalize_task push notification failed for task %s (best-effort): %s", task_id, exc)
         return state, reply
 
 
