@@ -374,44 +374,65 @@ class TaskRPCHandler:
         # Retrieve existing durable record to build candidate
         _existing = self.tasks.get(task_id)
         if _existing is None:
-            logger.error("A2A: _finalize_task called for unknown task %s", task_id)
+            bounded_tid = self._bounded_redacted_detail(task_id, 128) if hasattr(self, '_bounded_redacted_detail') else str(task_id)[:128]
+            logger.error("A2A: _finalize_task called for unknown task %s", bounded_tid)
             return protocol.STATE_FAILED, "[unknown task]"
         _candidate = dict(_existing)
         _candidate["state"] = state
         _candidate["reply"] = reply
         _candidate["completed_at"] = time.time()
         from .a2a_persistence import _task_ledger_path
-        _outcome = self.tasks.publish_durable(_task_ledger_path(), task_id, _candidate)
+        try:
+            _outcome = self.tasks.publish_durable(_task_ledger_path(), task_id, _candidate)
+        except Exception as exc:
+            # Convert publication exception to DurablePublishError before commit
+            bounded = self._bounded_redacted_detail(exc, 300) if hasattr(self, '_bounded_redacted_detail') else str(exc)[:300]
+            logger.error("A2A: publish_durable exception for task %s: %s", self._bounded_redacted_detail(task_id, 128) if hasattr(self, '_bounded_redacted_detail') else task_id, bounded)
+            raise protocol.DurablePublishError(task_id, context_id, state, getattr(_existing, 'get', lambda k, d=None: None)('state') if isinstance(_existing, dict) else "WORKING", True)
         if not _outcome.published:
-            logger.error("A2A: failed to durably publish terminal %s for task %s: %s", state, task_id, _outcome.error)
+            bounded_err = self._bounded_redacted_detail(_outcome.error, 300) if hasattr(self, '_bounded_redacted_detail') else str(_outcome.error)[:300]
+            logger.error("A2A: failed to durably publish terminal %s for task %s: %s", self._bounded_redacted_detail(state, 64) if hasattr(self, '_bounded_redacted_detail') else state, self._bounded_redacted_detail(task_id, 128) if hasattr(self, '_bounded_redacted_detail') else task_id, bounded_err)
             # Terminal-write failure leaves last durable state (normally WORKING) visible, no success side effects
             # Do not invent INDETERMINATE; keep WORKING visible
             raise protocol.DurablePublishError(task_id, context_id, state, _outcome.durable_state, True)
         # Post-commit ordering: only on newly_published do audit/metrics/push
         # These are best-effort append-only side effects; failure cannot downgrade committed success.
+        # Enclose entire post-commit tail so no exception escapes a published success.
         if _outcome.newly_published:
             try:
-                protocol.persist_message(context_id, "agent", reply, task_id)
+                try:
+                    protocol.persist_message(context_id, "agent", reply, task_id)
+                except Exception as exc:
+                    bounded = self._bounded_redacted_detail(exc, 300) if hasattr(self, '_bounded_redacted_detail') else str(exc)[:300]
+                    logger.warning("A2A: _finalize_task persist failed for task %s (best-effort): %s", self._bounded_redacted_detail(task_id, 128) if hasattr(self, '_bounded_redacted_detail') else task_id, bounded)
+                try:
+                    security.audit(audit_direction, peer, task_id, reply, context_id=context_id)
+                except Exception as exc:
+                    bounded = self._bounded_redacted_detail(exc, 300) if hasattr(self, '_bounded_redacted_detail') else str(exc)[:300]
+                    logger.warning("A2A: _finalize_task audit failed for task %s (best-effort): %s", self._bounded_redacted_detail(task_id, 128) if hasattr(self, '_bounded_redacted_detail') else task_id, bounded)
+                # Metrics and push notification are also best-effort
+                try:
+                    if state in (protocol.STATE_COMPLETED, protocol.STATE_INPUT_REQUIRED):
+                        protocol.metrics.outbound_total += 1
+                        protocol.metrics.tasks_completed += 1
+                        protocol.metrics.record_latency(time.time() - pending["started"])
+                    else:
+                        protocol.metrics.tasks_failed += 1
+                except Exception as exc:
+                    bounded = self._bounded_redacted_detail(exc, 300) if hasattr(self, '_bounded_redacted_detail') else str(exc)[:300]
+                    logger.warning("A2A: _finalize_task metrics failed for task %s (best-effort): %s", self._bounded_redacted_detail(task_id, 128) if hasattr(self, '_bounded_redacted_detail') else task_id, bounded)
+                try:
+                    self._send_push_notification(task_id, context_id, reply, state)
+                except Exception as exc:
+                    bounded = self._bounded_redacted_detail(exc, 300) if hasattr(self, '_bounded_redacted_detail') else str(exc)[:300]
+                    logger.warning("A2A: _finalize_task push notification failed for task %s (best-effort): %s", self._bounded_redacted_detail(task_id, 128) if hasattr(self, '_bounded_redacted_detail') else task_id, bounded)
             except Exception as exc:
-                logger.warning("A2A: _finalize_task persist failed for task %s (best-effort): %s", task_id, exc)
-            try:
-                security.audit(audit_direction, peer, task_id, reply, context_id=context_id)
-            except Exception as exc:
-                logger.warning("A2A: _finalize_task audit failed for task %s (best-effort): %s", task_id, exc)
-            # Metrics and push notification are also best-effort
-            try:
-                if state in (protocol.STATE_COMPLETED, protocol.STATE_INPUT_REQUIRED):
-                    protocol.metrics.outbound_total += 1
-                    protocol.metrics.tasks_completed += 1
-                    protocol.metrics.record_latency(time.time() - pending["started"])
-                else:
-                    protocol.metrics.tasks_failed += 1
-            except Exception as exc:
-                logger.warning("A2A: _finalize_task metrics failed for task %s (best-effort): %s", task_id, exc)
-            try:
-                self._send_push_notification(task_id, context_id, reply, state)
-            except Exception as exc:
-                logger.warning("A2A: _finalize_task push notification failed for task %s (best-effort): %s", task_id, exc)
+                # Post-commit tail must never escape; log bounded and preserve success
+                try:
+                    bounded = self._bounded_redacted_detail(exc, 300) if hasattr(self, '_bounded_redacted_detail') else str(exc)[:300]
+                    logger.warning("A2A: _finalize_task post-commit tail failed for task %s (best-effort): %s", self._bounded_redacted_detail(task_id, 128) if hasattr(self, '_bounded_redacted_detail') else task_id, bounded)
+                except Exception:
+                    pass
         return state, reply
 
 
