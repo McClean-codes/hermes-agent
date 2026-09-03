@@ -897,10 +897,10 @@ class TestOutOfBandReply:
 
         res = asyncio.run(run())
         assert not res.success  # timeout still surfaces to the notifier
-        assert audited and audited[0][0] == "push"
+        assert audited and audited[0][0] == "push_failed"
         assert audited[0][4] == "ctx-x"  # push rows carry the context id
         assert ("ctx-x", "agent", "late") in persisted
-        assert audited and audited[0][0] == "push"
+        assert audited and audited[0][0] == "push_failed"
 
 
 class TestContextOriginWake:

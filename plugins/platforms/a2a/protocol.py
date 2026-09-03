@@ -89,22 +89,7 @@ _VALID_REASONS = frozenset({
     "invalid_artifact",
 })
 
-_TASK_ALLOWED_KEYS = frozenset({"id", "contextId", "status", "artifacts", "history", "metadata", "extensions"})
-_STATUS_ALLOWED_KEYS = frozenset({"state", "message", "timestamp"})
-_MESSAGE_ALLOWED_KEYS = frozenset({"messageId", "contextId", "role", "parts", "taskId", "metadata", "extensions", "referenceTaskIds"})
-_PART_ALLOWED_KEYS = frozenset({"text", "raw", "url", "data", "metadata", "filename", "mediaType"})
-_ARTIFACT_ALLOWED_KEYS = frozenset({"artifactId", "parts", "name", "description", "metadata", "extensions"})
 
-_VALID_STATES = frozenset({
-    STATE_SUBMITTED,
-    STATE_WORKING,
-    STATE_INPUT_REQUIRED,
-    STATE_AUTH_REQUIRED,
-    STATE_COMPLETED,
-    STATE_FAILED,
-    STATE_CANCELED,
-    STATE_REJECTED,
-})
 
 
 class A2AResultValidationError(Exception):
@@ -156,12 +141,11 @@ class PushOutcome:
 
     def __post_init__(self) -> None:
         allowed = frozenset({"routing", "transport", "jsonrpc", "invalid_response", "durability"})
-        # Allow empty category for success? but spec says category must be one of...
-        # Only enforce when category is non-empty
         if self.category and self.category not in allowed:
-            # Do not raise hard failure but keep as is for forward compat; however
-            # strictly, we could raise. We choose to allow but note.
             pass
+
+    def __bool__(self) -> bool:
+        return self.success
 
 
 # Maximum turns an A2A conversation can have before anti-loop kicks in.
@@ -298,51 +282,7 @@ def send_message_response(payload: dict) -> dict:
     return {"message": payload}
 
 
-# --------------------------------------------------------------------------
-# Edison strict result contract (section 4)
-# --------------------------------------------------------------------------
-
-@dataclass
-class ParsedA2AResult:
-    """Validated SendMessage result."""
-    kind: str  # "task" or "message"
-    payload: dict
-    task_id: str
-    context_id: str
-    state: str  # Task state or "" for Message
-    text: str
-
-
-class A2AResultValidationError(Exception):
-    """Structured validation failure with stable reason code."""
-
-    def __init__(self, reason: str, detail: str = ""):
-        super().__init__(f"{reason}: {detail}" if detail else reason)
-        self.reason = reason
-        self.detail = detail
-
-
-@dataclass
-class DurablePublishOutcome:
-    """Result of disk-first task publication."""
-    published: bool
-    newly_published: bool
-    record: Optional[dict]
-    durable_state: str
-    error: Optional[str] = None
-
-
-@dataclass(frozen=True)
-class PushOutcome:
-    """Structured push delivery outcome."""
-    success: bool
-    category: str  # routing, transport, jsonrpc, invalid_response, durability
-    error: str
-    payload: Optional[dict] = None
-
-    def __bool__(self) -> bool:
-        return self.success
-
+# Edison strict result contract (section 4) — single authoritative definitions live at top of file; this header preserved for section navigation.
 
 # Allowed Task states (v1.0, excluding unspecified sentinel)
 _ALLOWED_TASK_STATES = frozenset({
@@ -454,7 +394,7 @@ def _validate_artifact(artifact: Any) -> None:
             raise A2AResultValidationError("invalid_artifact", "Artifact extensions must be list of non-empty strings")
 
 
-def _validate_message(payload: dict, is_history: bool = False) -> None:
+def _validate_message(payload: dict, is_history: bool = False, is_status_message: bool = False) -> None:
     """Validate a Message payload. Direct responses require ROLE_AGENT; history permits either."""
     if not isinstance(payload, dict):
         raise A2AResultValidationError("invalid_message", "Message must be object")
@@ -465,26 +405,31 @@ def _validate_message(payload: dict, is_history: bool = False) -> None:
     if not isinstance(msg_id, str) or not msg_id.strip():
         raise A2AResultValidationError("invalid_message", "Message messageId required non-empty string")
     ctx = payload.get("contextId")
-    if not is_history:
-        if not isinstance(ctx, str) or not ctx.strip():
-            raise A2AResultValidationError("invalid_message", "Message contextId required non-empty string")
-    else:
+    if is_history:
         if "contextId" in payload and payload["contextId"] is not None:
             if not isinstance(ctx, str):
                 raise A2AResultValidationError("invalid_message", "Message contextId must be string")
+        # history contextId may be absent; if present and empty, also invalid? keep as optional but if present must be non-empty? We'll allow empty as invalid if explicitly present but not enforce strictly beyond string check per spec.
+    elif is_status_message:
+        if "contextId" in payload and payload["contextId"] is not None:
+            if not isinstance(ctx, str):
+                raise A2AResultValidationError("invalid_message", "Message contextId must be string")
+            if isinstance(ctx, str) and ctx.strip() == "":
+                raise A2AResultValidationError("invalid_message", "Message contextId must be non-empty string when present")
+            # equality with Task context is checked by caller (_validate_task)
+    else:
+        if not isinstance(ctx, str) or not ctx.strip():
+            raise A2AResultValidationError("invalid_message", "Message contextId required non-empty string")
     role = payload.get("role")
-    if not is_history:
+    if is_history:
+        if role not in (ROLE_AGENT, ROLE_USER):
+            raise A2AResultValidationError("invalid_message", f"History Message role must be ROLE_AGENT or ROLE_USER, got {role!r}")
+    elif is_status_message:
         if role != ROLE_AGENT:
             raise A2AResultValidationError("invalid_message", f"Message role must be ROLE_AGENT, got {role!r}")
     else:
-        if role not in (ROLE_AGENT, ROLE_USER) and role is not None:
-            # history permits either legal role, but must be one of them if present
-            if role not in (ROLE_AGENT, ROLE_USER):
-                raise A2AResultValidationError("invalid_message", f"History Message role invalid: {role!r}")
-            # also require role present? history entries should have role
-            pass
-        if "role" in payload and payload["role"] not in (ROLE_AGENT, ROLE_USER):
-            raise A2AResultValidationError("invalid_message", f"Message role invalid: {role!r}")
+        if role != ROLE_AGENT:
+            raise A2AResultValidationError("invalid_message", f"Message role must be ROLE_AGENT, got {role!r}")
     parts = payload.get("parts")
     if not isinstance(parts, list) or not parts:
         raise A2AResultValidationError("invalid_message", "Message parts must be non-empty list")
@@ -532,7 +477,7 @@ def _validate_task(payload: dict) -> None:
         msg = status["message"]
         if not isinstance(msg, dict):
             raise A2AResultValidationError("invalid_task", "Task status.message must be object")
-        _validate_message(msg, is_history=False)
+        _validate_message(msg, is_history=False, is_status_message=True)
         # context must match Task context when present
         msg_ctx = msg.get("contextId")
         if isinstance(msg_ctx, str) and msg_ctx and msg_ctx != ctx:
@@ -590,11 +535,24 @@ def parse_send_message_result(result: Any, envelope_mode: str) -> ParsedA2AResul
             raise A2AResultValidationError("invalid_envelope_type", "V1 result must be object")
         has_task = "task" in result
         has_message = "message" in result
+        # Classify foreign V1 wrapper members (e.g. statusUpdate) as stable unknown_payload_kind
+        # before generic payload-count, but preserve bare Task/Message as payload_count.
         if has_task and has_message:
             raise A2AResultValidationError("v1_payload_count", "V1 wrapper must contain exactly one of task/message, got both")
         if not has_task and not has_message:
+            if "statusUpdate" in result or "artifactUpdate" in result:
+                raise A2AResultValidationError("unknown_payload_kind", f"unknown wrapper member(s): {sorted(set(result.keys()))}")
+            # Bare Task/Message in V1 mode is payload_count, not unknown
+            if "id" in result and "status" in result:
+                raise A2AResultValidationError("v1_payload_count", "V1 wrapper must contain exactly one of task/message, got neither (bare Task in V1 mode)")
+            if "messageId" in result and "parts" in result:
+                raise A2AResultValidationError("v1_payload_count", "V1 wrapper must contain exactly one of task/message, got neither (bare Message in V1 mode)")
+            allowed_wrappers = {"task", "message"}
+            unknown = set(result.keys()) - allowed_wrappers
+            if unknown:
+                raise A2AResultValidationError("unknown_payload_kind", f"unknown wrapper member(s): {sorted(unknown)}")
             raise A2AResultValidationError("v1_payload_count", "V1 wrapper must contain exactly one of task/message, got neither")
-        # Unknown wrapper members: after confirming exactly one, check for extra keys
+        # Exactly one of task/message present — any extra wrapper member is unknown
         allowed_wrappers = {"task", "message"}
         unknown = set(result.keys()) - allowed_wrappers
         if unknown:
@@ -1394,36 +1352,12 @@ class TaskStore:
                         new_entry[fld] = "" if fld != "reply" else new_entry.get("reply", "")
                 clone[task_id] = new_entry
 
-            # 5. Build file snapshot dict (only terminal or non-terminal younger than 300s)
-            snapshot: dict[str, dict[str, Any]] = {}
-            for tid, rec in clone.items():
-                state = rec.get("state", "")
-                created = rec.get("created_at", 0)
-                try:
-                    created_f = float(created)
-                except Exception:
-                    created_f = 0.0
-                if state in TERMINAL_STATES or (now - created_f < 300):
-                    snapshot[tid] = {
-                        "task_id": rec.get("task_id", tid),
-                        "context_id": rec.get("context_id", ""),
-                        "peer": rec.get("peer", ""),
-                        "agent_slug": rec.get("agent_slug", ""),
-                        "tenant": rec.get("tenant", ""),
-                        "state": state,
-                        "reply": rec.get("reply", ""),
-                        "created_at": rec.get("created_at", 0),
-                        "created_iso": rec.get("created_iso", ""),
-                        "completed_at": rec.get("completed_at"),
-                        "push_url": rec.get("push_url", ""),
-                        "push_config_id": rec.get("push_config_id", ""),
-                    }
-
-            # 6. Write snapshot via atomic temp file with 0o600, file lock
+            # 5. Serialized ledger transaction: load → merge → write under per-ledger file lock
+            # The complete load/merge/write is serialized by the ledger file lock so
+            # concurrent TaskStore instances cannot lose each other's records.
             try:
                 ledger_path.parent.mkdir(parents=True, exist_ok=True)
                 lock_path = ledger_path.with_suffix(".lock")
-                # Platform-conditional file lock
                 try:
                     import fcntl  # type: ignore
                     _has_fcntl = True
@@ -1438,7 +1372,6 @@ class TaskStore:
                     _has_msvcrt = False
 
                 lock_file_obj = None
-                lock_fd = None
                 if _has_fcntl:
                     lock_path.parent.mkdir(parents=True, exist_ok=True)
                     lock_path.touch(exist_ok=True)
@@ -1457,10 +1390,60 @@ class TaskStore:
                                 raise
                             time.sleep(0.01)
                 else:
-                    # threading fallback: already holding self._lock
                     pass
 
                 try:
+                    # Load authoritative ledger snapshot under file lock
+                    disk_snapshot: dict[str, Any] = {}
+                    if ledger_path.exists():
+                        try:
+                            with open(ledger_path, "r", encoding="utf-8") as lf:
+                                disk_snapshot = json.load(lf)
+                        except Exception:
+                            disk_snapshot = {}
+                        if not isinstance(disk_snapshot, dict):
+                            disk_snapshot = {}
+                    # Merge: authoritative disk + clone (clone supplies new/updated publishing task)
+                    merged: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+                    if isinstance(disk_snapshot, dict):
+                        for tid, rec in disk_snapshot.items():
+                            if isinstance(rec, dict):
+                                merged[tid] = dict(rec)
+                    for tid, rec in clone.items():
+                        if tid == task_id:
+                            merged[tid] = dict(rec)
+                        elif tid not in merged:
+                            merged[tid] = dict(rec)
+                        else:
+                            disk_rec = merged[tid]
+                            # Prefer terminal state if clone newly terminal
+                            if disk_rec.get("state") not in TERMINAL_STATES and rec.get("state") in TERMINAL_STATES:
+                                merged[tid] = dict(rec)
+                    # Build snapshot dict from merged (only terminal or recent non-terminal)
+                    snapshot: dict[str, dict[str, Any]] = {}
+                    for tid, rec in merged.items():
+                        state = rec.get("state", "")
+                        created = rec.get("created_at", 0)
+                        try:
+                            created_f = float(created)
+                        except Exception:
+                            created_f = 0.0
+                        if state in TERMINAL_STATES or (now - created_f < 300):
+                            snapshot[tid] = {
+                                "task_id": rec.get("task_id", tid),
+                                "context_id": rec.get("context_id", ""),
+                                "peer": rec.get("peer", ""),
+                                "agent_slug": rec.get("agent_slug", ""),
+                                "tenant": rec.get("tenant", ""),
+                                "state": state,
+                                "reply": rec.get("reply", ""),
+                                "created_at": rec.get("created_at", 0),
+                                "created_iso": rec.get("created_iso", ""),
+                                "completed_at": rec.get("completed_at"),
+                                "push_url": rec.get("push_url", ""),
+                                "push_config_id": rec.get("push_config_id", ""),
+                            }
+                    # Write snapshot via atomic temp file with 0o600, flush/fsync, directory fsync
                     tmp_fd, tmp_path = tempfile.mkstemp(dir=str(ledger_path.parent), suffix=".tmp")
                     try:
                         try:
@@ -1469,17 +1452,43 @@ class TaskStore:
                             pass
                         with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
                             json.dump(snapshot, f, ensure_ascii=False, indent=2)
+                            try:
+                                f.flush()
+                                os.fsync(f.fileno())
+                            except Exception:
+                                pass
                         try:
                             os.chmod(tmp_path, 0o600)
                         except OSError:
                             pass
                         os.replace(tmp_path, str(ledger_path))
+                        # Fsync parent directory where supported (honest platform fallback)
+                        try:
+                            dir_fd = os.open(str(ledger_path.parent), os.O_DIRECTORY)
+                            try:
+                                os.fsync(dir_fd)
+                            finally:
+                                os.close(dir_fd)
+                        except Exception:
+                            pass
                     except BaseException:
                         try:
                             os.unlink(tmp_path)
                         except OSError:
                             pass
                         raise
+                    # Success: update in-memory to merged state while still holding self._lock
+                    self._tasks = merged
+                    if not isinstance(self._tasks, OrderedDict):
+                        self._tasks = OrderedDict(self._tasks)
+                    self._trim_locked()
+                    if publish_state in TERMINAL_STATES:
+                        watchers_to_resolve = self._watchers.pop(task_id, [])
+                    else:
+                        watchers_to_resolve = []
+                    published_rec = dict(self._tasks.get(task_id, candidate_record))
+                    durable_state_after = published_rec.get("state", "")
+                    success = True
                 finally:
                     if lock_file_obj is not None:
                         try:
@@ -1493,19 +1502,6 @@ class TaskStore:
                             lock_file_obj.close()
                         except OSError:
                             pass
-
-                # 7. Write succeeded -> update in-memory while still excluding readers (still in lock)
-                self._tasks = clone
-                if not isinstance(self._tasks, OrderedDict):
-                    self._tasks = OrderedDict(self._tasks)
-                self._trim_locked()
-                if publish_state in TERMINAL_STATES:
-                    watchers_to_resolve = self._watchers.pop(task_id, [])
-                else:
-                    watchers_to_resolve = []
-                published_rec = dict(self._tasks.get(task_id, candidate_record))
-                durable_state_after = published_rec.get("state", "")
-                success = True
             except Exception as exc:
                 # Discard clone, leave memory at last durable
                 existing_state = existing.get("state", "") if existing is not None else "ABSENT"
@@ -1698,12 +1694,25 @@ class TaskStore:
                     pass
                 with os.fdopen(tmp_fd, "w") as f:
                     json.dump(snapshot, f, ensure_ascii=False, indent=2)
+                    try:
+                        f.flush()
+                        os.fsync(f.fileno())
+                    except Exception:
+                        pass
                 # Windows-safe permission hardening: chmod works on both platforms
                 try:
                     os.chmod(tmp_path, 0o600)
                 except OSError:
                     pass
                 os.replace(tmp_path, str(path))
+                try:
+                    dir_fd = os.open(str(path.parent), os.O_DIRECTORY)
+                    try:
+                        os.fsync(dir_fd)
+                    finally:
+                        os.close(dir_fd)
+                except Exception:
+                    pass
             except BaseException:
                 try:
                     os.unlink(tmp_path)
