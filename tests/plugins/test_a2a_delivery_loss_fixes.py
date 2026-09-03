@@ -96,20 +96,31 @@ def _live_adapter(monkeypatch, handler):
 
 
 def _stop_adapter(adapter, loop, thread):
+    # Preserve primary test failure: disconnect/thread errors must not swallow
+    # the test's own assertion, but they are real lifecycle failures and must
+    # be surfaced (not silently passed). Thread termination is asserted.
+    disconnect_error = None
     try:
         try:
-            asyncio.run_coroutine_threadsafe(adapter.disconnect(), loop).result(timeout=10)
-        except Exception:
-            pass
+            fut = asyncio.run_coroutine_threadsafe(adapter.disconnect(), loop)
+            fut.result(timeout=10)
+        except Exception as e:
+            disconnect_error = e
+            import warnings
+            warnings.warn(f"A2A adapter disconnect failed: {e}", RuntimeWarning)
     finally:
         try:
             loop.call_soon_threadsafe(loop.stop)
         except Exception:
             pass
         thread.join(timeout=5)
+        if thread.is_alive():
+            raise AssertionError("A2A adapter thread failed to terminate within 5s — potential deadlock or leaked loop")
         # Close the loop and clear policy to avoid ResourceWarning under -W error.
+        # Cleanup is defensive but must not suppress warnings; cancellation/close
+        # must run even if disconnect_error occurred, without hiding the primary
+        # test failure (which is outside this helper).
         try:
-            # Cancel any remaining tasks
             try:
                 pending = asyncio.all_tasks(loop)  # type: ignore[arg-type]
             except RuntimeError:
@@ -121,21 +132,25 @@ def _stop_adapter(adapter, loop, thread):
                     loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
                 except Exception:
                     pass
-        except Exception:
-            pass
-        try:
+        finally:
             if not loop.is_closed():
-                loop.close()
-        except Exception:
-            pass
-        try:
-            if asyncio.get_event_loop_policy().get_event_loop() is loop:
-                asyncio.set_event_loop(None)
-        except Exception:
+                try:
+                    loop.close()
+                except Exception:
+                    pass
             try:
-                asyncio.set_event_loop(None)
+                if asyncio.get_event_loop_policy().get_event_loop() is loop:
+                    asyncio.set_event_loop(None)
+            except RuntimeError:
+                try:
+                    asyncio.set_event_loop(None)
+                except Exception:
+                    pass
             except Exception:
-                pass
+                try:
+                    asyncio.set_event_loop(None)
+                except Exception:
+                    pass
 
 
 # ═════════════════════════════════════════════════════════════════════════════

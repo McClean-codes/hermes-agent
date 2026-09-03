@@ -1054,7 +1054,9 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
             for tid in self.tasks.fail_orphans(0):
                 # fail_orphans with 0 timeout fails all non-terminal immediately
                 pass
-            self.tasks.persist(_task_ledger_path())
+            ok = _try_persist_task_ledger(self.tasks, _task_ledger_path(), "FAILED shutdown")
+            if not ok:
+                logger.error("A2A: failed to persist FAILED state on disconnect/shutdown — tasks remain non-durable")
         except Exception:
             logger.error("A2A: failed to persist FAILED state on disconnect/shutdown", exc_info=True)
 
@@ -1429,11 +1431,33 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
                 _persist_context_peers(_merge_context_peers(_load_context_peers(), {context_id: peer}, _MAX_CONTEXT_PEERS))
         self._register_inline_push(task_id, params, agent=agent)
 
+        # Write-ahead: set WORKING and durably persist BEFORE any agent/origin dispatch.
+        # This must happen before both local and routed/non-local dispatch so that a
+        # crash during the forwarded subprocess cannot lose the WORKING record.
+        # If persistence fails, fail closed — do not dispatch.
+        self.tasks.set_state(task_id, protocol.STATE_WORKING)
+        if not _try_persist_task_ledger(self.tasks, _task_ledger_path(), f"WORKING {task_id}"):
+            try: self.tasks.complete(task_id, protocol.STATE_FAILED, "[persist failed at WORKING]")
+            except Exception: pass
+            _try_persist_task_ledger(self.tasks, _task_ledger_path(), f"FAILED after WORKING fail {task_id}")
+            protocol.metrics.tasks_failed += 1
+            if _session_tokens:
+                try: _reset_worker_session_vars()
+                except Exception: pass
+            return protocol.build_task(task_id, context_id, protocol.STATE_FAILED, "Task persistence failed — not dispatched.", created_at=rec["created_iso"]), None
+
         if not agent.get("local", True):
             try:
                 reply, state = self._forward_to_profile(agent, peer, context_id, framed, task_id)
                 self.tasks.complete(task_id, state, reply)
-                _try_persist_task_ledger(self.tasks, _task_ledger_path(), f"forwarded {state} {task_id}")
+                # Fail-closed terminal persistence for forwarded path: if durable write
+                # fails, caller must not receive a successful terminal result.
+                if not _try_persist_task_ledger(self.tasks, _task_ledger_path(), f"forwarded {state} {task_id}"):
+                    logger.error("A2A: failed to persist forwarded terminal %s for task %s — returning indeterminate failure", state, task_id)
+                    protocol.metrics.tasks_failed += 1
+                    # Return failure to caller so they know durable state is indeterminate.
+                    # Memory is already terminal; disk remains WORKING — evidence of failure.
+                    return protocol.build_task(task_id, context_id, protocol.STATE_FAILED, "Task terminal persistence failed — state indeterminate.", created_at=rec["created_iso"]), None
                 protocol.persist_message(context_id, "agent", reply, task_id)
                 security.audit("outbound", peer, task_id, reply, context_id=context_id)
                 if state == protocol.STATE_COMPLETED:
@@ -1457,20 +1481,6 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
                 created_at=rec["created_iso"],
             ), None
 
-        # Write-ahead: set WORKING and durably persist before any agent/origin dispatch.
-        # If the ledger write fails, fail closed — do not dispatch a live task
-        # whose state is not durable. This closes the handler-observed ledger-missing race.
-        self.tasks.set_state(task_id, protocol.STATE_WORKING)
-        if not _try_persist_task_ledger(self.tasks, _task_ledger_path(), f"WORKING {task_id}"):
-            try: self.tasks.complete(task_id, protocol.STATE_FAILED, "[persist failed at WORKING]")
-            except Exception: pass
-            _try_persist_task_ledger(self.tasks, _task_ledger_path(), f"FAILED after WORKING fail {task_id}")
-            protocol.metrics.tasks_failed += 1
-            if _session_tokens:
-                try: _reset_worker_session_vars()
-                except Exception: pass
-            return protocol.build_task(task_id, context_id, protocol.STATE_FAILED, "Task persistence failed — not dispatched.", created_at=rec["created_iso"]), None
-
         fut = self._add_pending(task_id, context_id)
 
         event = MessageEvent(
@@ -1486,9 +1496,17 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
             message_id=task_id,
         )
 
+        coro = self.handle_message(event)
         try:
-            asyncio.run_coroutine_threadsafe(self.handle_message(event), self._loop)
+            asyncio.run_coroutine_threadsafe(coro, self._loop)
         except Exception as e:
+            # Avoid un-awaited coroutine leak: run_coroutine_threadsafe rejects a
+            # closed/stopping loop without consuming the coroutine, which would
+            # otherwise emit RuntimeWarning: coroutine was never awaited.
+            try:
+                coro.close()
+            except Exception:
+                pass
             self._pop_pending(task_id)
             msg = security.redact_outbound(f"Dispatch failed: {e}")
             self.tasks.complete(task_id, protocol.STATE_FAILED, msg)
@@ -1760,44 +1778,6 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
                     self._title_forward_session(profile, session_id, session_title)
             return security.redact_outbound((proc.stdout or "").strip()), protocol.STATE_COMPLETED
 
-    def _finalize_task(self, pending: dict, state: str, reply: str,
-                       audit_direction: str = "outbound") -> tuple[str, str]:
-        """Record the outcome of a dispatched task. Returns (state, reply) after
-        redaction and input-required detection.
-
-        ``audit_direction`` overrides the security audit direction (default
-        ``"outbound"``).  Fire-and-forget loopback pushes use ``"push"``.
-        """
-        task_id = pending["task_id"]
-        context_id = pending["context_id"]
-        peer = pending["peer"]
-        self._pop_pending(task_id)
-
-        reply = security.redact_outbound(reply or "")
-
-        # The agent flags clarification requests with a leading marker; map
-        # them to the A2A input-required state so the peer knows to answer.
-        if state == protocol.STATE_COMPLETED:
-            stripped = reply.lstrip()
-            if stripped.upper().startswith(protocol.INPUT_REQUIRED_MARKER):
-                state = protocol.STATE_INPUT_REQUIRED
-                reply = stripped[len(protocol.INPUT_REQUIRED_MARKER):].strip()
-
-        protocol.persist_message(context_id, "agent", reply, task_id)
-        security.audit(audit_direction, peer, task_id, reply, context_id=context_id)
-
-        if state in (protocol.STATE_COMPLETED, protocol.STATE_INPUT_REQUIRED):
-            protocol.metrics.outbound_total += 1
-            protocol.metrics.tasks_completed += 1
-            protocol.metrics.record_latency(time.time() - pending["started"])
-        else:
-            protocol.metrics.tasks_failed += 1
-
-        self.tasks.complete(task_id, state, reply)
-        # Persist the task ledger so GetTask/ListTasks/SubscribeToTask survive a gateway restart. Persistence errors are explicit.
-        _try_persist_task_ledger(self.tasks, _task_ledger_path(), f"terminal {state} {task_id}")
-        self._send_push_notification(task_id, context_id, reply, state)
-        return state, reply
 
     def _patience_for(self, params: dict, peer: str) -> float:
         """Client patience for a blocking message/send.
@@ -2037,13 +2017,22 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
                     self._pending.pop(task_id_via_thread, None)
                     try:
                         self.tasks.complete(task_id_via_thread, protocol.STATE_COMPLETED, content or "")
-                        try:
-                            self.tasks.persist(_task_ledger_path())
-                        except Exception:
+                        ok = _try_persist_task_ledger(self.tasks, _task_ledger_path(), f"COMPLETED send thread_id {task_id_via_thread}")
+                        if not ok:
                             logger.error(
-                                "A2A: failed to persist COMPLETED state for task %s (send thread_id path)",
-                                task_id_via_thread, exc_info=True,
+                                "A2A: failed to persist COMPLETED state for task %s (send thread_id path) — state indeterminate",
+                                task_id_via_thread,
                             )
+                            # Fail-closed: force FAILED indeterminate in memory so GetTask does not claim durable success
+                            try:
+                                with self.tasks._lock:
+                                    rec = self.tasks._tasks.get(task_id_via_thread)
+                                    if rec is not None:
+                                        rec["state"] = protocol.STATE_FAILED
+                                        rec["reply"] = "[terminal persistence failed — state indeterminate]"
+                                _try_persist_task_ledger(self.tasks, _task_ledger_path(), f"FAILED after send persist fail {task_id_via_thread}")
+                            except Exception:
+                                pass
                     except Exception:
                         logger.error(
                             "A2A: failed to complete task %s via thread_id path", task_id_via_thread, exc_info=True,
@@ -2290,7 +2279,7 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
             )
             self._push_loopback_in_process(context_id, peer, text, want_reply=False)
             return True
-        headers = a2a_tools._auth_header(entry.get("auth") or {})
+        headers = {**a2a_tools._auth_header(entry.get("auth") or {}), **(entry.get("headers", {}) or {})}
         timeout = int(entry.get("timeout", 120))
         allowed = tuple(a2a_tools._allowed_rpc_origins(entry))
         card = None
@@ -2482,22 +2471,13 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
             self._finalize_task(pending, protocol.STATE_COMPLETED, text, audit_direction="push")
             logger.info("A2A: delivered fire-and-forget loopback for context %s (task %s completed)", context_id, pending["task_id"])
 
-    async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
-        """Resolve the task future when processing ends without a reply send.
 
-        The success path resolves via send(); this hook catches failures,
-        cancellations, and empty runs so the HTTP thread returns promptly
-        instead of waiting out the reply timeout.
-        """
-        task_id = str(getattr(event, "message_id", "") or "")
-        if not task_id:
-            return
-        if outcome == ProcessingOutcome.FAILURE:
-            self._resolve_task(task_id, protocol.STATE_FAILED, "[agent processing failed]")
-        elif outcome == ProcessingOutcome.CANCELLED:
-            self._resolve_task(task_id, protocol.STATE_CANCELED, "")
-        else:
-            self._resolve_task(task_id, protocol.STATE_COMPLETED, "")
+    async def on_processing_complete(self, event, outcome):
+        # Delegate to TaskRPCHandler's implementation (which handles deferred failure/cancel persistence)
+        # This wrapper ensures TaskRPCHandler takes precedence over BasePlatformAdapter's no-op hook
+        # despite MRO BasePlatformAdapter -> TaskRPCHandler.
+        from .task_routing import TaskRPCHandler as _TRH
+        return await _TRH.on_processing_complete(self, event, outcome)
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         return None

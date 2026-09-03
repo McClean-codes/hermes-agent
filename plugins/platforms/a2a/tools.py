@@ -87,9 +87,9 @@ def _a2a_tools_available() -> bool:
 
 
 def _resolve_peer(agent: str) -> Optional[dict]:
-    """Resolve a peer name to {url, auth, timeout, capabilities}, or treat ``agent`` as a URL."""
+    """Resolve a peer name to {url, auth, timeout, capabilities, headers, allowed_rpc_origins}, or treat ``agent`` as a URL."""
     if agent.startswith("http://") or agent.startswith("https://"):
-        return {"url": agent, "auth": {}, "timeout": _DEFAULT_TIMEOUT, "capabilities": []}
+        return {"url": agent, "auth": {}, "timeout": _DEFAULT_TIMEOUT, "capabilities": [], "headers": {}, "allowed_rpc_origins": [], "tenant": ""}
     cfg = _load_config()
     peers = cfg.get("a2a_agents") or {}
     entry = peers.get(agent)
@@ -101,6 +101,8 @@ def _resolve_peer(agent: str) -> Optional[dict]:
         "timeout": int(entry.get("timeout", _DEFAULT_TIMEOUT)),
         "capabilities": entry.get("capabilities", []) or [],
         "tenant": entry.get("tenant", ""),
+        "headers": entry.get("headers", {}) or {},
+        "allowed_rpc_origins": entry.get("allowed_rpc_origins", []) or [],
     }
 
 
@@ -691,6 +693,10 @@ def _call_peer_sync(agent_name: str, peer_entry: dict, message: str, context_id:
             "url": peer_entry.get("url", ""),
             "auth": peer_entry.get("auth", {}) or {},
             "timeout": int(peer_entry.get("timeout", _DEFAULT_TIMEOUT)),
+            "headers": peer_entry.get("headers", {}) or {},
+            "allowed_rpc_origins": peer_entry.get("allowed_rpc_origins", []) or [],
+            "tenant": peer_entry.get("tenant", "") or "",
+            "capabilities": peer_entry.get("capabilities", []) or [],
         }
         reply, _ctx, _state = _send_task(agent_name, peer, message, context_id)
         return (agent_name, reply or "(no reply)", _ctx)
