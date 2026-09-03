@@ -34,12 +34,10 @@ import json
 import logging
 import math
 import os
-import re
 import select
 import socket
 import sqlite3
 import subprocess
-import tempfile
 import threading
 import time
 import urllib.parse
@@ -51,20 +49,6 @@ from concurrent.futures import TimeoutError as FuturesTimeout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Optional
-
-try:
-    import fcntl
-    _HAS_FCNTL = True
-except ImportError:
-    fcntl = None  # type: ignore[assignment]
-    _HAS_FCNTL = False
-
-try:
-    import msvcrt
-    _HAS_MSVCRT = True
-except ImportError:
-    msvcrt = None  # type: ignore[assignment]
-    _HAS_MSVCRT = False
 
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -80,12 +64,11 @@ from . import protocol, security
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_PORT = 9900
+# _DEFAULT_PORT and _MAX_CONTEXT_PEERS imported from a2a_persistence
 _ORPHAN_TIMEOUT = 300  # seconds before a pending task is considered orphaned
 _WATCHDOG_INTERVAL = 60  # seconds between orphaned task watchdog runs
 _MAX_BODY = 1_048_576  # 1MB max request body — prevents DoS via memory exhaustion
 _SSE_KEEPALIVE = 5  # seconds between SSE keepalive comments
-_MAX_CONTEXT_PEERS = 4096  # cap on the context→peer map (LRU-ish, insertion order)
 # Seconds past the client's advertised read timeout (sender.timeout) before
 # the server assumes the client gave up and marks the pending task
 # out_of_band_only. The MSG_PEEK probe catches clients that CLOSE; this is
@@ -114,590 +97,49 @@ _INBOUND_DEDUPE_MAX = 1024
 _ADAPTERS: "dict[int, weakref.ReferenceType[A2AAdapter]]" = {}
 _ADAPTERS_GUARD = threading.Lock()
 
-# ── Portable file-based locking for persistence transactions ──────────────
-# The load→merge→write cycle for context→peer and context→session maps is
-# NOT atomic without a lock: two concurrent writers each load the same
-# state, merge their own entry, and write — the second clobbers the first.
-# On Unix we use ``fcntl.flock()`` (advisory, per-fd, process-safe).
-# On Windows we use ``msvcrt.locking()`` (advisory, per-fd, process-safe).
-# On platforms with neither (unlikely), a threading lock provides
-# within-process serialisation only — sufficient for single-gateway
-# deployments.  The lock file is ``<data-file>.lock`` alongside the JSON
-# data file; created on demand.
-import contextlib
-import threading
-
-# In-process fallback when no OS-level file lock is available.
-_THREAD_FALLBACK_LOCK = threading.Lock()
-
-# Retry budget for Windows msvcrt.locking transient failures (another
-# process holds the lock momentarily).  Each retry sleeps 10ms.
-_MSVCRT_RETRIES = 50
-_MSVCRT_RETRY_DELAY = 0.01
-
-
-@contextlib.contextmanager
-def _file_lock(lock_path: Path):
-    """Portable advisory file lock: serialises concurrent load→merge→write
-    transactions across threads AND processes.
-
-    On Unix, ``fcntl.flock(LOCK_EX)`` blocks until the lock is acquired.
-    On Windows, ``msvcrt.locking(LOCK_EX)`` retries with back-off until
-    the lock is acquired.
-    On platforms with neither (fallback), a threading lock provides
-    within-process serialisation only.
-    The lock is released when the context manager exits (even on exception).
-    """
-    if _HAS_FCNTL:
-        yield from _file_lock_fcntl(lock_path)
-    elif _HAS_MSVCRT:
-        yield from _file_lock_msvcrt(lock_path)
-    else:
-        yield from _file_lock_thread_fallback(lock_path)
-
-
-def _file_lock_fcntl(lock_path: Path):
-    """Unix file lock via fcntl.flock(2)."""
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    fd = None
-    try:
-        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        yield
-    finally:
-        if fd is not None:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-            except OSError:
-                pass
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-
-
-def _file_lock_msvcrt(lock_path: Path):
-    """Windows file lock via msvcrt.locking.
-
-    msvcrt.locking() locks exactly one byte (at offset 0).  It raises
-    OSError on transient contention (errno EACCES or EAGAIN), so we
-    retry with exponential-ish back-off up to _MSVCRT_RETRIES times
-    before giving up — avoids false negatives when two gateways pulse
-    at the same instant.
-    """
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    fd = None
-    try:
-        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
-        for attempt in range(_MSVCRT_RETRIES):
-            try:
-                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)  # type: ignore[union-attr]
-                break
-            except OSError:
-                if attempt == _MSVCRT_RETRIES - 1:
-                    raise
-                time.sleep(_MSVCRT_RETRY_DELAY)
-        yield
-    finally:
-        if fd is not None:
-            try:
-                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)  # type: ignore[union-attr]
-            except OSError:
-                pass
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-
-
-def _file_lock_thread_fallback(lock_path: Path):
-    """Thread-only fallback for platforms with neither fcntl nor msvcrt.
-
-    Provides within-process serialisation via a threading.Lock.  Does NOT
-    protect against concurrent OS processes — acceptable for single-gateway
-    deployments where only threads contend on the same data file.
-    """
-    with _THREAD_FALLBACK_LOCK:
-        yield
-
-
-# ── Context→peer persistence ──────────────────────────────────────────────
-# _context_peers is otherwise in-memory only. A gateway restart wipes every
-# registration, and nothing re-registers afterwards unless a fresh inbound
-# A2A task or outbound a2a_call touches the same context — so out-of-band
-# completion pushes silently drop until then: the notifier wakes the agent
-# post-restart, adapter.send() has no peer, and the push never fires. We
-# write-through on registration and reload on adapter start so the mapping
-# survives restarts. Best-effort: persistence must never fail the call.
-_CONTEXT_PEERS_FILE = "a2a_context_peers.json"
-
-# ── Context→origin-session persistence ───────────────────────────────────
-# Which LOCAL gateway session created each outbound A2A context (recorded by
-# the client tools at a2a_call time). When an out-of-band push later arrives
-# on that context, the adapter wakes the originating session via the same
-# self-post mechanism the task watchers use — an explicit wake rather than a
-# polled store read.
-# Persisted alongside the peer map so the mapping survives a gateway restart
-# (a context born before a restart must still wake its session afterwards).
-_CONTEXT_SESSIONS_FILE = "a2a_context_sessions.json"
-
-# ── Fan-out children persistence ───────────────────────────────────────
-# a2a_orchestrate fans out to N peers, each receiving a distinct child
-# context_id. The parent→children map lets callers resume a specific
-# child branch with a2a_call(context_id=child_context_id) and traces
-# late callbacks back to the originating Hermes session. Persisted so
-# the mapping survives restarts (same write-through pattern as peers
-# and sessions).
-_FANOUT_CHILDREN_FILE = "a2a_fanout_children.json"
-
-
-def _fanout_children_path() -> Path:
-    try:
-        from hermes_constants import get_hermes_home
-        base = Path(get_hermes_home())
-    except Exception:
-        base = Path(os.path.expanduser("~/.hermes"))
-    return base / _FANOUT_CHILDREN_FILE
-
-
-def _persist_fanout_children(data: dict) -> None:
-    """Best-effort write-through of the fan-out children map (atomic).
-
-    Uses a unique temp file in the same directory (not a fixed .tmp suffix)
-    so concurrent writers never collide on the same temp path.  chmod 0o600
-    before the atomic replace so the final path never inherits a permissive
-    umask.  Caller is responsible for holding _file_lock on the path when
-    performing a load→merge→write transaction.
-    """
-    try:
-        path = _fanout_children_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp_path = tempfile.mkstemp(
-            suffix=".tmp", prefix="a2a_fanout_", dir=str(path.parent)
-        )
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump(data, fh, ensure_ascii=False)
-            try:
-                os.chmod(tmp_path, 0o600)
-            except OSError:
-                pass
-            os.replace(tmp_path, str(path))
-        except BaseException:
-            # Clean up the temp file on any failure (including KeyboardInterrupt)
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
-    except Exception:
-        logger.debug("A2A: could not persist fan-out children", exc_info=True)
-
-
-def _load_fanout_children() -> dict:
-    """Load the persisted fan-out children map (empty dict on any failure)."""
-    try:
-        path = _fanout_children_path()
-        if not path.exists():
-            return {}
-        with path.open("r", encoding="utf-8") as fh:
-            data = json.load(fh)
-        if isinstance(data, dict):
-            return data
-    except Exception:
-        logger.debug("A2A: could not load persisted fan-out children", exc_info=True)
-    return {}
-
-
-def _merge_fanout_children(
-    existing: Dict[str, Dict[str, str]], extra: Dict[str, Dict[str, str]],
-) -> Dict[str, Dict[str, str]]:
-    """Merge ``extra`` into ``existing``, bounded by _MAX_CONTEXT_PEERS.
-
-    New entries are always inserted/refreshed (moved to the end).  When at
-    capacity, the oldest entry is evicted to make room.  This prevents an
-    unbounded parent→children map from growing across long-running fan-out
-    use.
-    """
-    out = dict(existing)
-    for parent, children in extra.items():
-        if parent in out:
-            # Refresh: move to the end (most-recently-used).
-            out.pop(parent, None)
-        elif len(out) >= _MAX_CONTEXT_PEERS:
-            # Evict the oldest (first) entry to make room.
-            out.pop(next(iter(out)), None)
-        out[parent] = dict(children)
-    return out
-
-
-_TASK_LEDGER_FILE = "a2a_task_ledger.json"
-
-
-def _task_ledger_path() -> Path:
-    try:
-        from hermes_constants import get_hermes_home
-        base = Path(get_hermes_home())
-    except Exception:
-        base = Path(os.path.expanduser("~/.hermes"))
-    return base / _TASK_LEDGER_FILE
-
-
-def _reset_worker_session_vars() -> None:
-    """Reset session-context vars bound on an HTTP worker thread.
-
-    ``_prepare_task`` binds the A2A session identity via ``set_session_vars``
-    on the inbound HTTP worker thread so the asyncio Task created by
-    ``run_coroutine_threadsafe`` snapshots it (Task construction copies the
-    calling thread's context). After the dispatch is scheduled, the worker
-    thread's OWN context must be restored to pristine ``_UNSET`` so the
-    bindings don't linger on the threadpool thread for the next request.
-    Best-effort: resetting must never fail the dispatch.
-    """
-    try:
-        from gateway.session_context import reset_session_vars
-
-        reset_session_vars()
-    except Exception:
-        pass
-
-
-def _context_peers_path() -> Path:
-    try:
-        from hermes_constants import get_hermes_home
-        base = Path(get_hermes_home())
-    except Exception:
-        base = Path(os.path.expanduser("~/.hermes"))
-    return base / _CONTEXT_PEERS_FILE
-
-
-def _persist_context_peers(peers: Dict[str, str]) -> None:
-    """Best-effort write-through of the context→peer map to disk (atomic).
-
-    Uses a unique temp file in the same directory (not a fixed .tmp suffix)
-    so concurrent writers never collide on the same temp path.  chmod 0o600
-    before the atomic replace so the final path never inherits a permissive
-    umask.
-    """
-    try:
-        path = _context_peers_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp_path = tempfile.mkstemp(
-            suffix=".tmp", prefix="a2a_peers_", dir=str(path.parent)
-        )
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump(peers, fh, ensure_ascii=False)
-            try:
-                os.chmod(tmp_path, 0o600)
-            except OSError:
-                pass
-            os.replace(tmp_path, str(path))
-        except BaseException:
-            # Clean up the temp file on any failure (including KeyboardInterrupt)
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
-    except Exception:
-        logger.debug("A2A: could not persist context peers", exc_info=True)
-
-
-def _load_context_peers() -> Dict[str, str]:
-    """Load the persisted context→peer map (empty dict on any failure)."""
-    try:
-        path = _context_peers_path()
-        if not path.exists():
-            return {}
-        with path.open("r", encoding="utf-8") as fh:
-            data = json.load(fh)
-        if isinstance(data, dict):
-            return {str(k): str(v) for k, v in data.items() if v}
-    except Exception:
-        logger.debug("A2A: could not load persisted context peers", exc_info=True)
-    return {}
-
-
-def _merge_context_peers(peers: Dict[str, str], extra: Dict[str, str]) -> Dict[str, str]:
-    """Merge ``extra`` into ``peers``, bounded by _MAX_CONTEXT_PEERS.
-
-    New entries are always inserted/refreshed (moved to the end).  When at
-    capacity, the oldest entry is evicted to make room — the reviewer's
-    finding was that the old code dropped new entries at the cap instead.
-    """
-    out = dict(peers)
-    for cid, peer in extra.items():
-        if cid in out:
-            # Refresh: move to the end (most-recently-used).
-            out.pop(cid, None)
-        elif len(out) >= _MAX_CONTEXT_PEERS:
-            # Evict the oldest (first) entry to make room.
-            out.pop(next(iter(out)), None)
-        out[cid] = peer
-    return out
-
-
-def _context_sessions_path() -> Path:
-    try:
-        from hermes_constants import get_hermes_home
-        base = Path(get_hermes_home())
-    except Exception:
-        base = Path(os.path.expanduser("~/.hermes"))
-    return base / _CONTEXT_SESSIONS_FILE
-
-
-def _persist_context_sessions(sessions: Dict[str, dict]) -> None:
-    """Best-effort write-through of the context→origin-session map (atomic).
-
-    The map carries durable session ids + user/chat ids — same exposure
-    class as the peers file, so write 0600 (never inherit a permissive
-    umask).  Uses a unique temp file so concurrent writers never collide.
-    """
-    try:
-        path = _context_sessions_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp_path = tempfile.mkstemp(
-            suffix=".tmp", prefix="a2a_sessions_", dir=str(path.parent)
-        )
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump(sessions, fh, ensure_ascii=False)
-            try:
-                os.chmod(tmp_path, 0o600)
-            except OSError:
-                pass
-            os.replace(tmp_path, str(path))
-        except BaseException:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
-    except Exception:
-        logger.debug("A2A: could not persist context sessions", exc_info=True)
-
-
-def _load_context_sessions() -> Dict[str, dict]:
-    """Load the persisted context→origin-session map (empty on any failure)."""
-    try:
-        path = _context_sessions_path()
-        if not path.exists():
-            return {}
-        with path.open("r", encoding="utf-8") as fh:
-            data = json.load(fh)
-        if isinstance(data, dict):
-            out: Dict[str, dict] = {}
-            for k, v in data.items():
-                if isinstance(v, dict) and v.get("platform"):
-                    out[str(k)] = v
-            return out
-    except Exception:
-        logger.debug("A2A: could not load persisted context sessions", exc_info=True)
-    return {}
-
-
-def _merge_context_sessions(sessions: Dict[str, dict], extra: Dict[str, dict]) -> Dict[str, dict]:
-    """Merge ``extra`` into ``sessions``, bounded by _MAX_CONTEXT_PEERS.
-
-    Same insert/refresh + evict-oldest semantics as
-    :func:`_merge_context_peers`.
-    """
-    out = dict(sessions)
-    for cid, origin in extra.items():
-        if cid in out:
-            out.pop(cid, None)
-        elif len(out) >= _MAX_CONTEXT_PEERS:
-            out.pop(next(iter(out)), None)
-        out[cid] = origin
-    return out
-
-
-_LOOPBACK_ADDRS = {"127.0.0.1", "localhost", "::1"}
-
-
-def _is_ipv6_literal(host: str) -> bool:
-    """Return True when *host* is an IPv6 address literal (e.g. ``::1``).
-
-    IPv6 literals in URLs must be wrapped in brackets per RFC 2732 /
-    RFC 3986 §3.2.2 so that ``urlparse`` can separate host from port.
-    """
-    return ":" in host
-
-
-def _bracket_ipv6(host: str) -> str:
-    """Bracket an IPv6 literal for inclusion in a URL, if needed."""
-    return f"[{host}]" if _is_ipv6_literal(host) else host
-
-
-def _own_a2a_url(host: str, port: int) -> str:
-    """Build this gateway's own A2A endpoint URL (the one peers push to)."""
-    bind_host = host or "127.0.0.1"
-    if bind_host in ("0.0.0.0", "::", ""):
-        bind_host = "127.0.0.1"
-    return f"http://{_bracket_ipv6(bind_host)}:{int(port or _DEFAULT_PORT)}"
-
-
-def _sender_url_acceptable(url: str, peers_cfg: dict) -> bool:
-    """Whether a message ``sender.url`` may be trusted as a push target.
-
-    Only http(s) URLs whose host is loopback (the shared-host case —
-    every local gateway is ``127.0.0.1`` with a distinct port) or whose host
-    already appears in a configured ``a2a_agents`` entry are accepted. This
-    keeps a body-supplied URL from routing pushes to arbitrary external
-    hosts: in localhost-only mode the connection is local anyway, and a
-    remote/bearer-authenticated peer must appear in the operator's config
-    before its URL is honored.
-    """
-    try:
-        parsed = urllib.parse.urlparse(url)
-    except Exception:
-        return False
-    if parsed.scheme not in ("http", "https") or not parsed.hostname:
-        return False
-    host = parsed.hostname.lower()
-    if host in _LOOPBACK_ADDRS or host.startswith("127."):
-        return True
-    for entry in peers_cfg.values():
-        if not isinstance(entry, dict):
-            continue
-        try:
-            eu = urllib.parse.urlparse(str(entry.get("url") or ""))
-        except Exception:
-            continue
-        if eu.hostname and eu.hostname.lower() == host:
-            return True
-    return False
-
-
-def _is_own_endpoint(url: str, host: str, port: int) -> bool:
-    """Whether ``url`` points at this gateway's own A2A endpoint.
-
-    A loopback-hosted URL whose port matches ours can only be this gateway
-    when several gateways share one host (each binds a distinct port). Used by
-    ``_push_out_of_band`` to catch a context→peer map that was refined to
-    our own URL (an in-process loopback push stamps our own sender, and the
-    inbound refinement accepts it) and deliver in-process instead of a
-    synchronous HTTP self-call.
-    """
-    try:
-        parsed = urllib.parse.urlparse(url)
-    except Exception:
-        return False
-    if parsed.scheme not in ("http", "https") or not parsed.hostname:
-        return False
-    hostname = parsed.hostname.lower()
-    if hostname not in _LOOPBACK_ADDRS and not hostname.startswith("127."):
-        return False
-    try:
-        peer_port = int(parsed.port or (443 if parsed.scheme == "https" else 80))
-    except (ValueError, TypeError):
-        return False
-    return peer_port == int(port or _DEFAULT_PORT)
-
-
-def _loopback_fallback_url(identity: str, host: str, port: int) -> str:
-    """Return this gateway's own A2A URL when ``identity`` is a loopback ``ip:`` identity.
-
-    Localhost-only mode (no bearer tokens configured) authenticates every
-    inbound caller as ``ip:<addr>`` — the caller's listening port is not part
-    of the identity, so the only port we can know is this gateway's own. The
-    push re-enters the local gateway on the same contextId, which the owning
-    session sees as the follow-up."""
-    if not identity.startswith("ip:"):
-        return ""
-    addr = identity[3:].strip().lower()
-    if addr not in _LOOPBACK_ADDRS and not addr.startswith("127."):
-        return ""
-    bind_host = host or "127.0.0.1"
-    if bind_host in ("0.0.0.0", "::", ""):
-        bind_host = "127.0.0.1"
-    return f"http://{_bracket_ipv6(bind_host)}:{int(port or _DEFAULT_PORT)}"
-
-
-def _reply_timeout() -> float:
-    """Seconds to wait for the agent to answer an inbound task."""
-    try:
-        return max(1.0, float(os.getenv("A2A_REPLY_TIMEOUT", "300")))
-    except (ValueError, TypeError):
-        return 300.0
-
-
-def _profile_scoped() -> bool:
-    """True when running inside a multiplexed secondary profile's scope.
-
-    Secondary-profile adapters are constructed inside ``_profile_runtime_scope``
-    (secret scope installed + multiplex active) — the same discriminator the
-    Buzz/SimpleX adapters use for this bug class (#98738). The DEFAULT profile
-    under multiplexing runs unscoped: ``os.environ`` holds its own bridge
-    output there and keeps its legacy precedence.
-    """
-    try:
-        from agent.secret_scope import current_secret_scope, is_multiplex_active
-
-        return bool(is_multiplex_active() and current_secret_scope() is not None)
-    except Exception:
-        return False
-
-
-def _default_agent_name() -> str:
-    # Scope-aware: inside a secondary multiplex profile, os.environ holds the
-    # DEFAULT profile's bridged A2A_AGENT_NAME — borrowing it would brand a
-    # secondary profile's Agent Card with another profile's identity. There
-    # is no per-profile config.yaml equivalent yet, so a scoped profile just
-    # falls through to the hostname-based default below instead.
-    name = "" if _profile_scoped() else os.getenv("A2A_AGENT_NAME", "").strip()
-    if name:
-        return name
-    try:
-        import socket
-        return f"hermes-{socket.gethostname()}"
-    except Exception:
-        return "hermes-agent"
-
-
-def _clean_slug(value: str) -> str:
-    """Return a URL-safe-ish single-segment slug for a served agent."""
-    slug = str(value or "").strip().strip("/")
-    return "" if slug in ("", "default", "root") else slug.split("/")[0]
-
-
-def _join_url(base: str, prefix: str) -> str:
-    base = (base or "").strip() or "/"
-    if not base.endswith("/"):
-        base += "/"
-    prefix = (prefix or "").strip("/")
-    if not prefix:
-        return base
-    return urllib.parse.urljoin(base, prefix + "/")
-
-
-def _active_profile_name() -> str:
-    try:
-        from hermes_cli.profiles import get_active_profile_name
-        return get_active_profile_name() or "default"
-    except Exception:
-        return os.getenv("HERMES_PROFILE", "default") or "default"
-
-
-def _profile_home(profile: str) -> Optional[str]:
-    try:
-        from hermes_cli.profiles import get_profile_dir
-        return str(get_profile_dir(profile))
-    except Exception:
-        if not profile or profile == "default":
-            try:
-                from hermes_cli.config import get_hermes_home
-                return str(get_hermes_home())
-            except Exception:
-                return None
-        return os.path.expanduser(f"~/.hermes/profiles/{profile}")
-
-def _safe_context_slug(value: str, max_len: int = 96) -> str:
-    """Sanitize attacker-provided context ids before using in session titles."""
-    slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(value or "")).strip("-._")
-    return (slug or "ctx")[:max_len]
-
+# Persistence utilities extracted to a2a_persistence.py
+from .a2a_persistence import (
+    _DEFAULT_PORT,
+    _HAS_FCNTL,
+    _HAS_MSVCRT,
+    _LOOPBACK_ADDRS,
+    _MAX_CONTEXT_PEERS,
+    _MSVCRT_RETRIES,
+    _MSVCRT_RETRY_DELAY,
+    _THREAD_FALLBACK_LOCK,
+    _active_profile_name,
+    _bracket_ipv6,
+    _clean_slug,
+    _context_peers_path,
+    _context_sessions_path,
+    _default_agent_name,
+    _fanout_children_path,
+    _file_lock,
+    _file_lock_fcntl,
+    _file_lock_msvcrt,
+    _file_lock_thread_fallback,
+    _is_ipv6_literal,
+    _is_own_endpoint,
+    _join_url,
+    _load_context_peers,
+    _load_context_sessions,
+    _load_fanout_children,
+    _loopback_fallback_url,
+    _merge_context_peers,
+    _merge_context_sessions,
+    _merge_fanout_children,
+    _own_a2a_url,
+    _persist_context_peers,
+    _persist_context_sessions,
+    _persist_fanout_children,
+    _profile_home,
+    _profile_scoped,
+    _reply_timeout,
+    _reset_worker_session_vars,
+    _safe_context_slug,
+    _sender_url_acceptable,
+    _task_ledger_path,
+)
 
 def _method_info(method: str) -> tuple[str, bool]:
     """Return (canonical_operation, is_v1_method).
@@ -1145,7 +587,7 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
             disk = _load_context_peers()
             disk[context_id] = peer
             disk.update(union)
-            _persist_context_peers(_merge_context_peers({}, disk))
+            _persist_context_peers(_merge_context_peers({}, disk, _MAX_CONTEXT_PEERS))
 
     @classmethod
     def _register_context_session(cls, context_id: str, origin: dict) -> None:
@@ -1188,7 +630,7 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
             disk = _load_context_sessions()
             disk.update(union)
             disk.setdefault(context_id, dict(origin))
-            _persist_context_sessions(_merge_context_sessions({}, disk))
+            _persist_context_sessions(_merge_context_sessions({}, disk, _MAX_CONTEXT_PEERS))
 
     @classmethod
     def _own_sender(cls) -> dict:
@@ -1413,12 +855,12 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
                 continue
             with adapter._fanout_children_lock:
                 adapter._fanout_children = _merge_fanout_children(
-                    adapter._fanout_children, new_entry,
+                    adapter._fanout_children, new_entry, _MAX_CONTEXT_PEERS,
                 )
         # Persist to disk for restart recovery (bounded eviction).
         with _file_lock(_fanout_children_path().with_suffix(".lock")):
             disk = _load_fanout_children()
-            merged = _merge_fanout_children(disk, new_entry)
+            merged = _merge_fanout_children(disk, new_entry, _MAX_CONTEXT_PEERS)
             _persist_fanout_children(merged)
 
     @classmethod
@@ -1523,7 +965,7 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
         # completion, and the push had no peer.
         with self._context_peers_lock:
             restored = _load_context_peers()
-            merged = _merge_context_peers(self._context_peers, restored)
+            merged = _merge_context_peers(self._context_peers, restored, _MAX_CONTEXT_PEERS)
             self._context_peers.clear()
             self._context_peers.update(merged)
         if restored:
@@ -1957,7 +1399,7 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
             # notifier) bypasses this handler — so the disk copy is the only
             # thing that survives to the next start.
             with _file_lock(_context_peers_path().with_suffix(".lock")):
-                _persist_context_peers(_merge_context_peers(_load_context_peers(), {context_id: peer}))
+                _persist_context_peers(_merge_context_peers(_load_context_peers(), {context_id: peer}, _MAX_CONTEXT_PEERS))
         self._register_inline_push(task_id, params, agent=agent)
 
         if not agent.get("local", True):
@@ -2070,7 +1512,7 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
         """
         with self._context_sessions_lock:
             restored = _load_context_sessions()
-            merged = _merge_context_sessions(self._context_sessions, restored)
+            merged = _merge_context_sessions(self._context_sessions, restored, _MAX_CONTEXT_PEERS)
             self._context_sessions.clear()
             self._context_sessions.update(merged)
         return len(restored)
@@ -2087,7 +1529,7 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
         if not disk:
             return 0
         with self._fanout_children_lock:
-            merged = _merge_fanout_children(self._fanout_children, disk)
+            merged = _merge_fanout_children(self._fanout_children, disk, _MAX_CONTEXT_PEERS)
             self._fanout_children.clear()
             self._fanout_children.update(merged)
         return len(disk)

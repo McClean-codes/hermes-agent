@@ -19,6 +19,7 @@ import pytest
 
 from plugins.platforms.a2a import adapter as adapter_mod
 from plugins.platforms.a2a import protocol
+from plugins.platforms.a2a import a2a_persistence
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -33,7 +34,7 @@ class TestContextPeerPersistenceMode:
         """The final persisted file must end up with mode 0o600."""
         peers_file = tmp_path / "a2a_context_peers.json"
         monkeypatch.setattr(
-            adapter_mod,
+            a2a_persistence,
             "_context_peers_path",
             lambda: peers_file,
         )
@@ -50,7 +51,7 @@ class TestContextPeerPersistenceMode:
         """The file must contain valid JSON after persist."""
         peers_file = tmp_path / "a2a_context_peers.json"
         monkeypatch.setattr(
-            adapter_mod,
+            a2a_persistence,
             "_context_peers_path",
             lambda: peers_file,
         )
@@ -62,7 +63,7 @@ class TestContextPeerPersistenceMode:
         """Persisting an empty dict still produces a valid file with 0o600."""
         peers_file = tmp_path / "a2a_context_peers.json"
         monkeypatch.setattr(
-            adapter_mod,
+            a2a_persistence,
             "_context_peers_path",
             lambda: peers_file,
         )
