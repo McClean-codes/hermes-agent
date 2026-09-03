@@ -179,15 +179,32 @@ def test_prepare_task_registers_refined_peer(monkeypatch, tmp_path):
     )
     adapter = _bare_adapter()
     loop = asyncio.new_event_loop()
-    thread = threading.Thread(target=loop.run_forever, daemon=True)
-    thread.start()
+    adapter._loop = loop
     try:
-        adapter._loop = loop
-
         async def fake_handle_message(event):
             pass  # do not resolve — the registration happens before dispatch
 
-        adapter._message_handler = fake_handle_message
+        adapter._message_handler = fake_handle_message  # type: ignore
+        # Mock dispatch to run synchronously without needing a running loop thread
+        from concurrent.futures import Future as CFuture
+
+        def fake_run(coro, target_loop):
+            try:
+                asyncio.run(coro)
+            except RuntimeError:
+                new_loop = asyncio.new_event_loop()
+                try:
+                    new_loop.run_until_complete(coro)
+                finally:
+                    try:
+                        new_loop.close()
+                    except Exception:
+                        pass
+            fut = CFuture()
+            fut.set_result(None)
+            return fut
+
+        monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", fake_run)
         params = {
             "message": protocol.text_message(
                 protocol.ROLE_USER, "roundtrip test", context_id="ctx-roundtrip-1",
@@ -203,8 +220,10 @@ def test_prepare_task_registers_refined_peer(monkeypatch, tmp_path):
         peers_file = tmp_path / "a2a_context_peers.json"
         assert json.loads(peers_file.read_text())["ctx-roundtrip-1"] == "peer-a"
     finally:
-        loop.call_soon_threadsafe(loop.stop)
-        thread.join(timeout=5)
+        try:
+            loop.close()
+        except Exception:
+            pass
         adapter._unregister_adapter()
 
 
@@ -229,7 +248,7 @@ def test_push_out_of_band_hits_refined_peer_url(monkeypatch, tmp_path):
     def fake_post(url, body, headers, timeout, **kw):
         posted["url"] = url
         posted["body"] = body
-        return {"jsonrpc": "2.0", "id": body["id"], "result": {}}
+        return {"jsonrpc": "2.0", "id": body["id"], "result": {"task": protocol.build_task("t-valid", "ctx-roundtrip-1", protocol.STATE_COMPLETED, "ok")}}
 
     monkeypatch.setattr(tools, "_http_post_json", fake_post)
 

@@ -509,3 +509,15 @@ def _safe_context_slug(value: str, max_len: int = 96) -> str:
     """Sanitize attacker-provided context ids before using in session titles."""
     slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(value or "")).strip("-._")
     return (slug or "ctx")[:max_len]
+
+def _try_persist_task_ledger(tasks, ledger_path, label: str = "") -> bool:
+    """Try to persist task ledger; log error and return False on failure (durable write failed)."""
+    try:
+        tasks.persist(ledger_path)
+        return True
+    except Exception:
+        try:
+            logger.error("A2A: failed to persist task ledger at %s", label or "unknown", exc_info=True)
+        except Exception:
+            pass
+        return False
