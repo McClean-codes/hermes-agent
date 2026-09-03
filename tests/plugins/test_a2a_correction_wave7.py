@@ -184,23 +184,21 @@ def test_failed_write_does_not_dispatch(monkeypatch, tmp_path):
         return fut
     monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", fake_run)
 
-    # Make persist raise on first call (WORKING), succeed on second (FAILED)
-    orig_persist = adapter.tasks.persist
+    # Make publish_durable fail on first call (WORKING), succeed on second
+    orig_publish = adapter.tasks.publish_durable
     call_count = {"n": 0}
-    def failing_persist(path):
+    def failing_publish(path, tid, cand):
         call_count["n"] += 1
         if call_count["n"] == 1:
-            raise OSError("disk full")
-        return orig_persist(path)
-    monkeypatch.setattr(adapter.tasks, "persist", failing_persist)
+            return protocol.DurablePublishOutcome(published=False, newly_published=False, record=None, durable_state="ABSENT", error="disk full")
+        return orig_publish(path, tid, cand)
+    monkeypatch.setattr(adapter.tasks, "publish_durable", failing_publish)
 
     try:
         params = {"message": {"parts": [{"text": "hello"}], "contextId": "ctx-fail-write"}}
-        terminal, pending = adapter._prepare_task(params, "peer-test", agent={"local": True, "slug": "", "tenant": ""})
-        # Should have failed closed: terminal FAILED, no pending, no dispatch
-        assert terminal is not None
-        assert terminal["status"]["state"] == protocol.STATE_FAILED
-        assert pending is None
+        import pytest as _pytest
+        with _pytest.raises(protocol.DurablePublishError):
+            terminal, pending = adapter._prepare_task(params, "peer-test", agent={"local": True, "slug": "", "tenant": ""})
         time.sleep(0.2)
         assert dispatched == [], "handler must not have been dispatched when persist failed"
     finally:
@@ -453,19 +451,19 @@ def test_failed_write_witness_persistence_error_explicit(monkeypatch, tmp_path, 
     adapter.handle_message = lambda e: None  # type: ignore
     adapter.tasks = protocol.TaskStore()
 
-    # Force persist to raise
-    def raising_persist(path):
-        raise OSError("read-only")
-    monkeypatch.setattr(adapter.tasks, "persist", raising_persist)
+    # Force publish_durable to fail
+    def raising_publish(path, tid, cand):
+        return protocol.DurablePublishOutcome(published=False, newly_published=False, record=None, durable_state="ABSENT", error="read-only")
+    monkeypatch.setattr(adapter.tasks, "publish_durable", raising_publish)
 
     try:
         params = {"message": {"parts": [{"text": "hello"}], "contextId": "ctx-fail-log"}}
+        import pytest as _pytest2
         with caplog.at_level("ERROR"):
-            terminal, pending = adapter._prepare_task(params, "peer", agent={"local": True, "slug": "", "tenant": ""})
-        # Should be failed terminal due to fail-closed
-        assert terminal is not None and terminal["status"]["state"] == protocol.STATE_FAILED
+            with _pytest2.raises(protocol.DurablePublishError):
+                terminal, pending = adapter._prepare_task(params, "peer", agent={"local": True, "slug": "", "tenant": ""})
         # Verify error log was emitted (not debug)
-        assert any("failed to persist" in rec.message.lower() for rec in caplog.records)
+        assert any("failed to durably publish" in rec.message.lower() for rec in caplog.records)
     finally:
         try:
             if not loop.is_closed():
@@ -598,17 +596,19 @@ def test_push_out_of_band_valid_completion_is_success(monkeypatch, tmp_path):
 
 
 def test_try_push_reply_propagates_failure(monkeypatch, tmp_path):
-    """_try_push_reply must return False when underlying push fails."""
+    """_try_push_reply must propagate PushOutcome failure without collapsing to success."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     adapter = _bare_adapter()
     pending = {"task_id": "t1", "context_id": "ctx-try", "peer": "peer-a", "pushed": False}
-    # Mock push to return False (malformed result)
-    monkeypatch.setattr(adapter, "_push_out_of_band", lambda cid, text, want_reply=False: False)
-    assert adapter._try_push_reply(pending, protocol.STATE_COMPLETED, "hello") is False
-    # Success should be True
-    monkeypatch.setattr(adapter, "_push_out_of_band", lambda cid, text, want_reply=False: True)
+    # Mock push to return PushOutcome failure (malformed result)
+    monkeypatch.setattr(adapter, "_push_out_of_band", lambda cid, text, want_reply=False: protocol.PushOutcome(success=False, category="transport", error="push returned False"))
+    result = adapter._try_push_reply(pending, protocol.STATE_COMPLETED, "hello")
+    assert isinstance(result, protocol.PushOutcome) and not result.success
+    # Success should be truthy PushOutcome
+    monkeypatch.setattr(adapter, "_push_out_of_band", lambda cid, text, want_reply=False: protocol.PushOutcome(success=True, category="transport", error=""))
     pending2 = {"task_id": "t2", "context_id": "ctx-try2", "peer": "peer-a"}
-    assert adapter._try_push_reply(pending2, protocol.STATE_COMPLETED, "hello") is True
+    result2 = adapter._try_push_reply(pending2, protocol.STATE_COMPLETED, "hello")
+    assert isinstance(result2, protocol.PushOutcome) and result2.success
     adapter._unregister_adapter()
 
 
@@ -642,7 +642,7 @@ def test_send_task_malformed_result_raises(monkeypatch, tmp_path):
     def fake_post_malformed(url, body, headers, timeout, allowed_origins=()):
         return {"jsonrpc": "2.0", "id": body["id"], "result": {}}
     monkeypatch.setattr(tools, "_http_post_json", fake_post_malformed)
-    with pytest.raises(ValueError, match="malformed"):
+    with pytest.raises((ValueError, protocol.A2AResultValidationError), match="(malformed|invalid.*result|v1_payload_count)"):
         tools._send_task("peer-a", {"url": "http://127.0.0.1:8801", "auth": {}, "timeout": 5}, "hello", "ctx-malformed")
 
     # Valid should not raise

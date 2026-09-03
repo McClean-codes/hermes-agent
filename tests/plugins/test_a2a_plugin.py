@@ -503,7 +503,7 @@ class TestClientTools:
             ctx = body["params"]["message"].get("contextId", "c1")
             return protocol.jsonrpc_result(
                 body["id"],
-                protocol.build_task("t", ctx, protocol.STATE_COMPLETED, "here is the answer"),
+                protocol.send_message_response(protocol.build_task("t", ctx, protocol.STATE_COMPLETED, "here is the answer")),
             )
 
         monkeypatch.setattr(tools, "_http_post_json", fake_post)
@@ -529,7 +529,7 @@ class TestClientTools:
         def fake_post(url, body, headers, timeout, **kw):
             return protocol.jsonrpc_result(
                 body["id"],
-                protocol.build_task("t", "ctx-q", protocol.STATE_INPUT_REQUIRED, "Which repo?"),
+                protocol.send_message_response(protocol.build_task("t", "ctx-q", protocol.STATE_INPUT_REQUIRED, "Which repo?")),
             )
 
         monkeypatch.setattr(tools, "_http_post_json", fake_post)
@@ -596,7 +596,7 @@ class TestRegistryDispatchConvention:
             captured["sent"] = True
             return protocol.jsonrpc_result(
                 body["id"],
-                protocol.build_task("t", "c1", protocol.STATE_COMPLETED, "PONG"))
+                protocol.send_message_response(protocol.build_task("t", "c1", protocol.STATE_COMPLETED, "PONG")))
 
         monkeypatch.setattr(tools, "_http_post_json", fake_post)
         out = tools.a2a_call({"agent_name": "peer", "message": "ping"})
@@ -643,17 +643,24 @@ class TestReplyCapture:
             adapter._pop_pending("task-final")
 
     def test_concurrent_same_context_tasks_resolve_fifo(self):
-        """Two in-flight tasks sharing a context must not cross-talk: replies
-        resolve the oldest outstanding task first."""
+        """Two in-flight tasks sharing a context requires exact task authority."""
         adapter = _bare_adapter()
         fut1 = adapter._add_pending("task-1", "ctx-shared")
         fut2 = adapter._add_pending("task-2", "ctx-shared")
 
         async def run():
-            await adapter.send("ctx-shared", "reply one", metadata={"notify": True})
+            # Context-only send with 2 active tasks must be ambiguous, not FIFO
+            result = await adapter.send("ctx-shared", "reply one", metadata={"notify": True})
+            assert not result.success
+            assert "ambiguous" in result.error.lower()
+            assert not fut1.done() and not fut2.done()
+            # Exact task ID resolves the intended task
+            result2 = await adapter.send("ctx-shared", "reply one", metadata={"notify": True}, reply_to="task-1")
+            assert result2.success
             assert fut1.done() and not fut2.done()
             assert fut1.result(timeout=0)[1] == "reply one"
-            await adapter.send("ctx-shared", "reply two", metadata={"notify": True})
+            result3 = await adapter.send("ctx-shared", "reply two", metadata={"notify": True}, reply_to="task-2")
+            assert result3.success
             assert fut2.result(timeout=0)[1] == "reply two"
 
         try:
@@ -725,7 +732,7 @@ class TestOutOfBandReply:
             captured["body"] = body
             return protocol.jsonrpc_result(
                 body["id"],
-                protocol.build_task("t2", "ctx-x", protocol.STATE_COMPLETED, "ok"),
+                protocol.send_message_response(protocol.build_task("t2", "ctx-x", protocol.STATE_COMPLETED, "ok")),
             )
 
         monkeypatch.setattr(tools, "_http_post_json", fake_post)
@@ -799,8 +806,27 @@ class TestOutOfBandReply:
         def fake_prepare(params, peer, agent=None):
             prepared["params"] = params
             prepared["peer"] = peer
-            return None, {"task_id": "push-task-1", "context_id": "ctx-loop", "peer": peer,
-                          "created_iso": "2026-01-01T00:00:00Z", "started": __import__('time').time()}
+            pending = {"task_id": "push-task-1", "context_id": "ctx-loop", "peer": peer,
+                       "created_iso": "2026-01-01T00:00:00Z", "started": __import__('time').time()}
+            # Seed TaskStore so _finalize_task's durable publish finds the record
+            # (Edison §5.3 requires existing non-terminal for _finalize_task).
+            try:
+                adapter.tasks._tasks["push-task-1"] = {
+                    "task_id": "push-task-1",
+                    "context_id": "ctx-loop",
+                    "peer": peer,
+                    "agent_slug": "",
+                    "tenant": "",
+                    "state": protocol.STATE_WORKING,
+                    "reply": "",
+                    "created_at": pending["started"],
+                    "created_iso": pending["created_iso"],
+                    "push_url": "",
+                    "push_config_id": "",
+                }
+            except Exception:
+                pass
+            return None, pending
 
         monkeypatch.setattr(adapter, "_prepare_task", fake_prepare)
         monkeypatch.setattr(tools, "_load_config", lambda: {"a2a_agents": {}})
@@ -905,7 +931,7 @@ class TestContextOriginWake:
         def fake_post(url, body, headers, timeout, **kw):
             return protocol.jsonrpc_result(
                 body["id"],
-                protocol.build_task("t", "ctx-origin-1", protocol.STATE_COMPLETED, "done"),
+                protocol.send_message_response(protocol.build_task("t", "ctx-origin-1", protocol.STATE_COMPLETED, "done")),
             )
 
         monkeypatch.setattr(tools, "_http_post_json", fake_post)
@@ -1287,7 +1313,7 @@ class TestDeadClientReplyPush:
             captured["body"] = body
             return protocol.jsonrpc_result(
                 body["id"],
-                protocol.build_task("t2", "ctx-dead", protocol.STATE_COMPLETED, "ok"),
+                protocol.send_message_response(protocol.build_task("t2", "ctx-dead", protocol.STATE_COMPLETED, "ok")),
             )
 
         monkeypatch.setattr(tools, "_http_post_json", fake_post)
@@ -1475,7 +1501,7 @@ class TestDeadClientReplyPush:
         )
         task = protocol.build_task("t-1", "ctx-dead", protocol.STATE_COMPLETED, "legacy reply")
         adapter._push_reply_after_client_gone(
-            "req-1", protocol.jsonrpc_result("req-1", task),
+            "req-1", protocol.jsonrpc_result("req-1", protocol.send_message_response(task)),
         )
         assert pushed == [("ctx-dead", "legacy reply")]
 
@@ -1489,7 +1515,7 @@ class TestDeadClientReplyPush:
         )
         task = protocol.build_task("t-1", "ctx-dead", protocol.STATE_FAILED, "[agent did not reply in time]")
         adapter._push_reply_after_client_gone(
-            "req-1", protocol.jsonrpc_result("req-1", task),
+            "req-1", protocol.jsonrpc_result("req-1", protocol.send_message_response(task)),
         )
         assert pushed == []
 
@@ -1525,7 +1551,7 @@ class TestDeadClientReplyPush:
         def fake_rpc(req_id, params, peer, agent=None, v1_response=False, client_alive=None):
             rpc_seen["client_alive"] = client_alive
             task = protocol.build_task("t-1", "ctx-dead", protocol.STATE_COMPLETED, "late reply")
-            return protocol.jsonrpc_result(req_id, task)
+            return protocol.jsonrpc_result(req_id, protocol.send_message_response(task))
 
         monkeypatch.setattr(adapter, "_rpc_message_send", fake_rpc)
         monkeypatch.setattr(

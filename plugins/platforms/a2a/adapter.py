@@ -143,11 +143,7 @@ from .a2a_persistence import (
 )
 
 def _method_info(method: str) -> tuple[str, bool]:
-    """Return (canonical_operation, is_v1_method).
-
-    Canonical operation names are lowercase internal labels. v1 methods use the
-    PascalCase names from A2A v1.0 §5.3/§9.4; legacy aliases remain accepted.
-    """
+    """Return (canonical_operation, is_v1_method)."""
     mapping = {
         "SendMessage": ("send", True),
         "message/send": ("send", False),
@@ -186,11 +182,7 @@ class _A2AServer(ThreadingHTTPServer):
 
 
 class A2ARequestHandler(BaseHTTPRequestHandler):
-    """HTTP handler for the A2A JSON-RPC surface.
-
-    Module-level (not a closure) so request routing is unit-testable; all
-    state lives on ``self.server.adapter``.
-    """
+    """HTTP handler for the A2A JSON-RPC surface."""
 
     @property
     def adapter(self) -> "A2AAdapter":
@@ -215,13 +207,7 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
         self.wfile.flush()
 
     def _request_public_url(self) -> str:
-        """Derive the routable URL for this request.
-
-        Priority: A2A_PUBLIC_URL env > X-Forwarded-Host / Host header (with
-        scheme from X-Forwarded-Proto) > empty. Empty means "caller has no
-        info, fall back to bind host". See gfdsa's k8s bind-host bug report
-        (PR #41711).
-        """
+        """Derive the routable URL for this request."""
         explicit = os.getenv("A2A_PUBLIC_URL", "").strip()
         if explicit:
             return explicit
@@ -261,20 +247,7 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
         self._json(404, {"error": "not found"})
 
     def _a2a_client_alive(self) -> bool:
-        """Best-effort liveness probe for the client behind this request.
-
-        Used while a blocking message/send waits for the agent's reply: the
-        peer's ``a2a_call`` client times out (120s) and closes the connection
-        long before the reply is ready when processing takes minutes. A stale
-        pending task whose client is gone must be dropped so the reply takes
-        the out-of-band push path instead of being written into a dead socket
-        (otherwise a reply is consumed by a dead waiter and vanishes —
-        the peer's session never wakes). Mirrors the SSE path's keepalive
-        disconnect detection for the plain POST path.
-
-        Non-destructive: ``select`` + ``MSG_PEEK``, never consumes data.
-        Returns True when liveness cannot be determined (assume alive).
-        """
+        """Best-effort liveness probe for the client behind this request."""
         sock = getattr(self, "connection", None)
         if sock is None:
             return True
@@ -296,33 +269,7 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
             return False
 
     def _handle_send(self, req_id, params, identity, agent, is_v1):
-        """Route a message/send with dead-client protection.
-
-        The peer's ``a2a_call`` may time out (120s) while the agent is still
-        working (processing routinely runs minutes). The reply then has no
-        live connection to ride: ``_rpc_message_send`` resolves the stale
-        pending task and the response write hits a closed socket. Catch that
-        and push the completed reply out-of-band on the same contextId so the
-        caller's session still receives it (and wakes).
-
-        Spec layering for this protection:
-        - the liveness probe pops the stale waiter while the reply is pending
-          (fast path);
-        - patience (sender.timeout + margin) is the deterministic backstop
-          for clients that stay connected but will discard;
-        - a broad ``OSError`` catch on the write closes the probe-race window
-          for clients that RST the connection instead of reading.
-
-        There is deliberately NO post-write liveness probe (deviation from
-        the literal spec, verified against live traffic): a client that reads the
-        response and closes cleanly (urllib sends ``Connection: close`` and
-        closes right after reading) is indistinguishable from a client that
-        closed without reading — both surface as EOF to MSG_PEEK — so a
-        post-write probe double-delivers every clean exchange and sets up a
-        self-perpetuating push ping-pong between two gateways (each rescue
-        push's response triggers the peer's rescue push, until the anti-loop
-        cuts the context).
-        """
+        """Route a message/send with dead-client protection."""
         result = self.adapter._rpc_message_send(
             req_id, params, identity, agent=agent, v1_response=is_v1,
             client_alive=self._a2a_client_alive,
@@ -544,21 +491,7 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
 
     @classmethod
     def _register_context_peer(cls, context_id: str, peer: str) -> None:
-        """Record ``context_id`` → ``peer`` on every live local A2A adapter.
-
-        Called by the outbound client tools before an A2A call so a context
-        that was born on ANY platform (discord, telegram, CLI/ACP,
-        api_server) is known to the local gateway. Without this, an
-        out-of-band completion push for that context finds no peer in
-        ``_context_peers`` and is dropped: no A2A inbound ever reached its
-        gateway, so the push had nowhere to go.
-
-        The peer identity is the *local* handle for the remote agent (the
-        ``a2a_agents`` config key / URL), which is exactly what
-        ``_push_out_of_band`` needs to resolve the callback target. Inbound
-        A2A tasks keep recording the authenticated identity as before; this
-        is an additive path for outbound-originated contexts.
-        """
+        """Record ``context_id`` → ``peer`` on every live local A2A adapter."""
         if not context_id or not peer:
             return
         with _ADAPTERS_GUARD:
@@ -592,21 +525,7 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
 
     @classmethod
     def _register_context_session(cls, context_id: str, origin: dict) -> None:
-        """Record ``context_id`` → the LOCAL session that created it.
-
-        Called by the outbound client tools before an A2A call (the same
-        moment they register the context→peer mapping), so a later out-of-band
-        push on this context can WAKE that originating session — the session
-        that called a2a_call gets a fresh turn when the peer pushes back,
-        the same way a task-completion watcher wakes a task creator.
-
-        ``origin`` carries the session identity captured from the session
-        ContextVars at call time: platform, chat_id, chat_type, thread_id,
-        user_id, profile, and the raw durable session_id (for the non-push
-        adapter wake path). Best-effort: registration must never fail the
-        call, and is bounded like the peer map (drop the oldest entry past
-        _MAX_CONTEXT_PEERS).
-        """
+        """Record ``context_id`` → the LOCAL session that created it."""
         if not context_id or not isinstance(origin, dict) or not origin.get("platform"):
             return
         with _ADAPTERS_GUARD:
@@ -635,19 +554,7 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
 
     @classmethod
     def _own_sender(cls) -> dict:
-        """Return this process's A2A AgentName identity for outbound messages.
-
-        Reads the first live local adapter so the outbound client tools
-        (which run in the same gateway process) can stamp ``sender`` on
-        every message they send — the receiving gateway uses it to learn
-        our real endpoint (host + port) for out-of-band pushes. When no
-        adapter is live (CLI/helper/one-shot processes) the identity is
-        derived from config/env (``_sender_from_config``), so the sender
-        block is ALWAYS stamped — the receiver can refine the loopback
-        identity to a routable peer instead of leaving ``ip:127.0.0.1``
-        (helper-sent messages without a sender had their replies
-        silently dropped).
-        """
+        """Return this process's A2A AgentName identity for outbound messages."""
         with _ADAPTERS_GUARD:
             refs = list(_ADAPTERS.values())
         for ref in refs:
@@ -658,13 +565,7 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
 
     @classmethod
     def _sender_from_config(cls) -> dict:
-        """Sender identity for processes with no live adapter (CLI/helpers).
-
-        Derives ``{agentId, name, url}`` from A2A_AGENT_NAME / A2A_PUBLIC_URL
-        / A2A_PORT (env first, then the HERMES_HOME config's
-        ``platforms.a2a.port``), so every outbound wire message stamps a
-        routable sender the receiving gateway can refine to.
-        """
+        """Sender identity for processes with no live adapter (CLI/helpers)."""
         name = os.getenv("A2A_AGENT_NAME", "").strip() or _default_agent_name()
         port = _DEFAULT_PORT
         try:
@@ -694,23 +595,7 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
         }
 
     def _refine_peer_identity(self, peer: str, params: dict, context_id: str) -> str:
-        """Resolve a port-less ``ip:`` identity to a routable peer.
-
-        Localhost-only mode authenticates every inbound caller as
-        ``ip:<addr>`` — the caller's listening port is not part of the
-        identity, so when several gateways share one host every peer (and
-        this gateway itself) looks identical and an out-of-band push has
-        nowhere real to go (the completion was pushed to the receiving
-        gateway's OWN loopback endpoint instead of the calling gateway).
-
-        The A2A v1.0 ``sender`` AgentName on the inbound message carries the
-        peer's real endpoint.  Sender identity lives in the standard
-        ``metadata`` field (``a2a.sender``), not a non-standard top-level
-        key.  Prefer a configured ``a2a_agents`` key match
-        (agentId/name), then a validated sender URL; otherwise return the
-        authenticated identity unchanged (bearer-authenticated peers keep
-        their token identity — they are already resolvable).
-        """
+        """Resolve a port-less ``ip:`` identity to a routable peer."""
         if not peer.startswith("ip:"):
             return peer
         sender = protocol.extract_sender(params)
@@ -764,18 +649,7 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
 
     @classmethod
     def _origin_delivery_target(cls, context_id: str, platform_name: str) -> dict:
-        """Delivery target of the local session that started this A2A context.
-
-        When an A2A context was born in a real gateway session (e.g. a
-        Discord thread), confirmations the agent emits for that context must
-        return to the origin session's chat/thread — not the platform home
-        channel (deliveries return to whichever
-        session started the A2A exchange; home only when no origin exists).
-        Returns ``{"chat_id": ..., "thread_id": ..., "chat_type": ...}`` or
-        ``{}`` when the origin is unknown, unrecorded, or on another platform.
-        Checks the live in-memory map first, then the persisted write-through
-        (a gateway restart wipes memory; the disk copy survives).
-        """
+        """Delivery target of the local session that started this A2A context."""
         origin: dict = {}
         with _ADAPTERS_GUARD:
             refs = list(_ADAPTERS.values())
@@ -812,17 +686,7 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
 
     @property
     def authorization_is_upstream(self) -> bool:
-        """A2A authenticates every inbound request via bearer token (or
-        localhost-only binding) in ``do_POST`` before dispatch — the identity
-        is already authorized upstream. Without this override, the gateway's
-        per-platform user allow-list (``{PLATFORM}_ALLOWED_USERS``) rejects
-        A2A peers because their identity is a token-derived name or pod IP,
-        not a platform account the operator configures in an env allow-list.
-
-        This is authorization delegated to the A2A bearer-token transport,
-        not a fail-open: every request is 401'd if the credential is wrong.
-        Reported by kuangmi-bit (PR #41711 comment, Jun 27).
-        """
+        """A2A authenticates every inbound request via bearer token (or"""
         return True
 
     # ── Fan-out children registration ────────────────────────────────────
@@ -832,19 +696,7 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
         cls, parent_context_id: str, peer_children: Dict[str, str],
         origin: Optional[dict] = None,
     ) -> None:
-        """Record a fan-out operation: parent → {peer: child_context_id}.
-
-        Called by ``a2a_orchestrate`` after each child context is created.
-        Persists so the mapping survives restarts.
-        ``origin`` is the originating session dict — each child context
-        is registered with the same origin so a late callback wakes the
-        original session.
-
-        The parent map is bounded by ``_MAX_CONTEXT_PEERS``: when at
-        capacity the oldest parent entry is evicted (deterministic,
-        insertion-order based) so a long-running gateway cannot grow
-        this map without limit.
-        """
+        """Record a fan-out operation: parent → {peer: child_context_id}."""
         if not parent_context_id or not peer_children:
             return
         new_entry = {parent_context_id: dict(peer_children)}
@@ -884,16 +736,7 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
 
     @classmethod
     def _reject_child_reuse(cls, child_context_id: str, requesting_peer: str) -> str:
-        """Check if a child context is already claimed by a different peer.
-
-        Returns "" if the child is unclaimed or belongs to
-        ``requesting_peer``; returns the claiming peer's name if
-        a different peer already owns it (conflict).
-
-        Iterates the parent→peer→children map directly — no reverse
-        map needed since the fan-out children map is small and the
-        linear scan is negligible.
-        """
+        """Check if a child context is already claimed by a different peer."""
         if not child_context_id:
             return ""
         with _ADAPTERS_GUARD:
@@ -1086,12 +929,7 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
             return {}
 
     def _load_served_agents(self, extra: dict) -> dict[str, dict]:
-        """Load served-agent routing config.
-
-        Preferred config location is ``platforms.a2a.extra.agents``. A top-level
-        ``a2a_served_agents`` fallback is accepted for scripts/tests. Root/default
-        always maps to the live gateway session for backward compatibility.
-        """
+        """Load served-agent routing config."""
         raw = extra.get("agents") or extra.get("served_agents")
         if raw is None:
             cfg = self._load_global_a2a_config()
@@ -1220,13 +1058,7 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
         )
 
     def _advertised_skills(self, agent: Optional[dict] = None) -> list[dict]:
-        """Dynamic Agent Card skills from the live tool registry.
-
-        The card reflects what the agent can actually do right now. An
-        explicit ``advertised_toolsets`` config (or A2A_ADVERTISED_TOOLSETS)
-        restricts what we advertise; without a registry we fall back to that
-        static list.
-        """
+        """Dynamic Agent Card skills from the live tool registry."""
         try:
             from tools.registry import registry as tool_registry
             names = tool_registry.get_registered_toolset_names()
@@ -1308,12 +1140,7 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
     # ── Inbound task handling ─────────────────────────────────────────────
 
     def _find_existing_nonterminal_task(self, context_id: str) -> Optional[dict]:
-        """Find an existing non-terminal task for ``context_id`` in the task store.
-
-        Used by ``send()`` to finalize the original task record on late
-        agent completion after a client disconnect, instead of creating a
-        duplicate task.  Returns the task record dict or None.
-        """
+        """Find an existing non-terminal task for ``context_id`` in the task store."""
         recs, _ = self.tasks.list(context_id=context_id)
         for rec in recs:
             if rec["state"] not in protocol.TERMINAL_STATES:
@@ -1321,12 +1148,7 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
         return None
 
     def _prepare_task(self, params: dict, peer: str, agent: Optional[dict] = None) -> tuple[Optional[dict], Optional[dict]]:
-        """Validate, register, and dispatch an inbound message.
-
-        Returns (terminal_task, None) when the task ends immediately
-        (rejected / not ready), else (None, pending) where pending carries
-        the future the caller must wait on. Runs on an HTTP worker thread.
-        """
+        """Validate, register, and dispatch an inbound message."""
         agent = agent or self._agents[""]
         text = protocol.extract_text(params)
         context_id = protocol.extract_context_id(params) or protocol.new_context_id()
@@ -1642,13 +1464,7 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
         }
 
     def _restore_persisted_context_sessions(self) -> int:
-        """Merge persisted context→origin-session registrations into memory.
-
-        Called from ``connect()`` (and directly in tests): a gateway restart
-        wipes the in-memory map, and the disk copy is the only thing that
-        lets a push arriving right after the restart still wake its
-        originating session. Returns the number of restored entries.
-        """
+        """Merge persisted context→origin-session registrations into memory."""
         with self._context_sessions_lock:
             restored = _load_context_sessions()
             merged = _merge_context_sessions(self._context_sessions, restored, _MAX_CONTEXT_PEERS)
@@ -1657,13 +1473,7 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
         return len(restored)
 
     def _restore_persisted_fanout_children(self) -> int:
-        """Merge persisted fan-out parent→children map into memory.
-
-        Called from ``connect()``: the in-memory map is wiped on restart,
-        and the disk copy lets callers still resume child branches.
-        Uses bounded merge so restart recovery also enforces the cap.
-        Returns the number of restored parent entries.
-        """
+        """Merge persisted fan-out parent→children map into memory."""
         disk = _load_fanout_children()
         if not disk:
             return 0
@@ -1674,23 +1484,7 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
         return len(disk)
 
     async def _wake_origin_session(self, context_id: str, text: str) -> None:
-        """Wake the local session that created this A2A context (if any).
-
-        The inbound message has been dispatched into the a2a session (its
-        normal path, protocol continuity preserved). When the context was
-        born in a REAL gateway session — a discord session called
-        a2a_call, and a task notifier / workflow engine pushed a completion
-        back on the same contextId — that originating session must ALSO get
-        a fresh agent turn so the agent can ACT on the push (deliver
-        artifacts, dispatch follow-ups), the same self-post mechanism the
-        task watcher uses to wake a task creator. Visibility without a
-        turn is what this fixes: the push used to land only in the
-        conversation store, invisible unless manually polled.
-
-        Runs on the gateway loop (scheduled from the HTTP worker thread via
-        run_coroutine_threadsafe). Best-effort by design: a failed wake must
-        never fail or slow the inbound task itself.
-        """
+        """Wake the local session that created this A2A context (if any)."""
         with self._context_sessions_lock:
             origin = dict(self._context_sessions.get(context_id) or {})
         if not origin:
@@ -1813,13 +1607,7 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
             logger.debug("A2A: could not title forwarded session", exc_info=True)
 
     def _forward_to_profile(self, agent: dict, peer: str, context_id: str, framed_text: str, task_id: str) -> tuple[str, str]:
-        """Forward a routed A2A task to another local Hermes profile.
-
-        First contact creates a normal ``source=a2a`` CLI session, records its
-        session id, and titles it deterministically. Later turns resume by the
-        concrete session id, not by a non-existent name. The public CLI boundary
-        is preserved while giving A2A contexts stable multi-turn continuity.
-        """
+        """Forward a routed A2A task to another local Hermes profile."""
         profile = str(agent.get("profile") or agent.get("slug") or "").strip()
         slug = str(agent.get("slug") or profile or "agent")
         safe_ctx = _safe_context_slug(context_id)
@@ -1871,17 +1659,7 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
 
 
     def _patience_for(self, params: dict, peer: str) -> float:
-        """Client patience for a blocking message/send.
-
-        Priority: the message's stamped ``sender.timeout`` (the client's
-        own advertised read timeout) → the configured
-        ``a2a_agents[peer].timeout`` → 120s default.
-
-        A peer-supplied timeout is capped at ``_ORPHAN_TIMEOUT -
-        _PATIENCE_MARGIN`` (270s) so the patience deadline never exceeds
-        the orphan watchdog horizon.  Non-finite, zero, negative, and
-        over-ceiling values are clamped or rejected consistently.
-        """
+        """Client patience for a blocking message/send."""
         _TIMEOUT_CEILING = _ORPHAN_TIMEOUT - _PATIENCE_MARGIN  # 270s
         sender = protocol.extract_sender(params)
         if isinstance(sender, dict):
@@ -1903,17 +1681,7 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
         return 120.0
 
     def _mark_out_of_band(self, pending: dict, reason: str, pop_waiter: bool) -> None:
-        """Record that a pending task's client is gone.
-
-        ``reason`` is the audit marker (``[client patience exceeded]`` or
-        ``[client disconnected]``). ``pop_waiter=True`` (probe-death) removes
-        the task from the per-context waiter queue so the late reply takes
-        the no-waiter push path in ``send()`` and the HTTP thread is freed.
-        ``pop_waiter=False`` (patience exceeded — the socket may still look
-        alive) keeps the waiter so the reply resolves normally; the handler
-        then pushes it directly and skips the socket write. First mark wins:
-        a later probe-death must not change the strategy mid-wait.
-        """
+        """Record that a pending task's client is gone."""
         with self._pending_lock:
             if pending.get("out_of_band_only"):
                 return
@@ -1937,10 +1705,7 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
         )
 
     def _try_push_reply(self, pending: dict, state: str, reply: str):
-        """Push a completed reply out-of-band, dedupe-guarded.
-
-        Returns PushOutcome or bool. Propagates structured failure without collapsing to success.
-        """
+        """Push a completed reply out-of-band, dedupe-guarded."""
         if state not in (protocol.STATE_COMPLETED, protocol.STATE_INPUT_REQUIRED) or not reply:
             return protocol.PushOutcome(success=False, category="routing", error="no reply to push")
         with self._pending_lock:
@@ -1973,11 +1738,7 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
             return protocol.PushOutcome(success=False, category="transport", error=str(exc))
 
     def _is_duplicate_inbound(self, context_id: str, message_id: str) -> bool:
-        """Windowed (contextId, messageId) dedupe.
-
-        Bounded map; expired entries are pruned when the cap is hit. Returns
-        True when the same wire message was seen within the window.
-        """
+        """Windowed (contextId, messageId) dedupe."""
         key = (context_id, message_id)
         now = time.time()
         with self._inbound_seen_lock:
@@ -1994,28 +1755,7 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
             return False
 
     def _await_reply(self, pending: dict, keepalive=None, patience: Optional[float] = None) -> tuple[str, str, bool, bool]:
-        """Block until the task's future resolves (or times out).
-
-        ``keepalive`` is an optional zero-arg callable invoked every
-        _SSE_KEEPALIVE seconds while waiting (used by the SSE paths); if it
-        raises, the client is gone (probe-death): the waiter is popped and
-        the loop returns immediately with ``out_of_band_only=True`` so the
-        late reply takes the push path.
-
-        ``patience`` (POST message/send only) is the client's advertised
-        read timeout. When elapsed > patience + _PATIENCE_MARGIN
-        the client has given up — or will discard — even if the socket
-        still looks alive (the alive-but-will-discard client is invisible
-        to any probe; its reply is silently consumed). The task is marked
-        out_of_band_only and the loop KEEPS waiting for the reply so it can
-        be pushed directly instead of written into the dead socket.
-
-        Returns (state, reply, out_of_band_only, defer_finalization).
-        ``defer_finalization`` is True when the client disconnected but the
-        agent may still complete the task later — the caller must NOT call
-        ``_finalize_task`` and must leave the task record non-terminal so
-        the late agent reply can finalize the original task record.
-        """
+        """Block until the task's future resolves (or times out)."""
         fut: Future = pending["future"]
         deadline = pending["started"] + _reply_timeout()
         patience_deadline = (
@@ -2073,18 +1813,7 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ):
-        """Fulfil the pending reply Future for this context.
-
-        ``chat_id`` is the A2A context id we set as the source chat_id; the
-        oldest outstanding task for that context receives the reply (the
-        gateway session processes messages in order).
-
-        The gateway marks final user-visible replies with ``metadata['notify']``
-        (see ``_mark_notify_metadata`` in gateway.platforms.base — this is the
-        base adapter's documented reply marker, not an incidental field).
-        Progress, status, and editable preview sends intentionally lack the
-        marker; those must not satisfy the JSON-RPC caller.
-        """
+        """Fulfil the pending reply Future for this context."""
         message_id = str(int(time.time() * 1000))
         # Task-authority: prefer the specific task via thread_id (ContextVar) to avoid cross-talk
         task_id_via_thread = ""
@@ -2204,8 +1933,13 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
                 if _ctx == chat_id and not _fut.done():
                     _active_candidates.append(_tid)
         # Also check TaskStore non-terminal tasks not already in pending
+        # SUBMITTED is pre-dispatch (create without durable WORKING publish) and
+        # does not represent an active dispatched task eligible for late
+        # completion via context fallback — exclude it to avoid spurious
+        # ambiguity when a stale SUBMITTED record coexists with a pending
+        # WORKING task (e.g. test harness helper that seeds SUBMITTED).
         for _tid, _rec in list(self.tasks._tasks.items()):
-            if _rec.get("context_id") == chat_id and _rec.get("state") not in protocol.TERMINAL_STATES:
+            if _rec.get("context_id") == chat_id and _rec.get("state") not in protocol.TERMINAL_STATES and _rec.get("state") != protocol.STATE_SUBMITTED:
                 if _tid not in _active_candidates:
                     _active_candidates.append(_tid)
         if len(_active_candidates) == 0:
@@ -2340,30 +2074,7 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
         return SendResult(success=True, message_id=message_id)
 
     def _push_out_of_band(self, context_id: str, text: str, want_reply: bool = False) -> bool:
-        """POST a new message/send to the peer that owns ``context_id``.
-
-        Runs on a worker thread (blocking urllib). Resolves the peer from
-        ``a2a_agents`` config by the identity recorded on the inbound task;
-        unknown peers are a no-op (nothing to push to). The outbound message
-        reuses the SAME contextId so the caller's Hermes routes it into the
-        session that originally made the request.
-
-        ``want_reply=True`` for session-reply pushes (``adapter.send()``
-        without ``metadata["a2a_push"]``, and the dead-client rescues) —
-        the round-trip path: the peer answers inside the push's HTTP response
-        (a verdict arriving this way was previously
-        discarded), so a non-empty reply is re-dispatched into the LOCAL
-        gateway as an inbound message on the same contextId (loopback
-        in-process path, origin-session wake). Never raises into the push
-        caller. ``want_reply=False`` for notifier pushes —
-        fire-and-forget, unchanged.
-
-        Reply-path pushes never fall back to this gateway's own endpoint:
-        an unresolvable reply peer is a LOUD failure (audit
-        ``push_dropped`` + warning), not a self-ping-pong or a silent drop.
-        The own-gateway loopback fallback is reserved for ``a2a_push``
-        notifications.
-        """
+        """POST a new message/send to the peer that owns ``context_id``."""
         with self._context_peers_lock:
             peer = self._context_peers.get(context_id, "")
         if not peer:
@@ -2528,14 +2239,7 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
         return _push_outcome
 
     def _drop_unresolvable_reply(self, context_id: str, peer: str) -> None:
-        """Loud failure for a reply push with no resolvable external target.
-
-        An unmarked session reply whose peer is an unresolvable
-        loopback identity must never be silently dropped
-        and must never self-loop into this gateway's own session
-        (unbounded self-ping-pong). Audit ``push_dropped`` + warn; the
-        caller surfaces success=False.
-        """
+        """Loud failure for a reply push with no resolvable external target."""
         security.audit(
             "push_dropped", peer, "", "peer identity not resolvable",
             context_id=context_id,
@@ -2547,12 +2251,7 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
         )
 
     def _push_reply_after_client_gone(self, req_id: Any, result: Optional[dict], is_v1: bool = True) -> None:
-        """Deliver a completed reply whose HTTP client disconnected first.
-
-        Safety net for the blocking message/send path. Validates via strict parser
-        before extracting, using the originating request dialect (is_v1) to select
-        envelope mode. Returns/logs failed PushOutcome without success audit.
-        """
+        """Deliver a completed reply whose HTTP client disconnected first."""
         try:
             inner = (result or {}).get("result")
             # Validate before extracting (section 4.7) — use originating dialect
@@ -2607,21 +2306,7 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
 
     def _push_loopback_in_process(self, context_id: str, peer: str, text: str,
                                   want_reply: bool = False) -> None:
-        """Deliver an out-of-band push to this gateway's own session in-process.
-
-        Reuses the exact inbound path an HTTP message/send would take
-        (``_prepare_task`` → event dispatch into the owning session) but
-        without the synchronous wait for the agent's reply — the HTTP
-        worker blocks on that wait, which is what made the loopback push
-        time out on the client side (the handler answers only after the
-        session processes the message).
-
-        When ``want_reply`` is False (notifier fire-and-forget), the
-        created task is immediately completed to prevent TaskStore entries
-        from lingering in ``TASK_STATE_WORKING``.  When True (session-reply
-        push), the pending task stays open for the session's ``send()``
-        path to resolve — same as an HTTP inbound task.
-        """
+        """Deliver an out-of-band push to this gateway's own session in-process."""
         params = {
             "message": protocol.text_message(
                 protocol.ROLE_USER, text, context_id=context_id, sender=self._sender_identity()
