@@ -164,6 +164,12 @@ def test_write_ahead_persistence_before_dispatch(monkeypatch, tmp_path):
     # Setup handler that records dispatch time vs ledger state
     loop = asyncio.new_event_loop()
     adapter._loop = loop
+    # Ensure fixture policy loop does not leak if we replace it
+    _prev_policy_loop = None
+    try:
+        _prev_policy_loop = asyncio.get_event_loop_policy().get_event_loop()
+    except RuntimeError:
+        _prev_policy_loop = None
     ledger_before = []
     ledger_after = []
 
@@ -216,44 +222,63 @@ def test_write_ahead_persistence_before_dispatch(monkeypatch, tmp_path):
     # We need to run it in a way that handler is called, but we can check ledger before handler completes
     # For this test, we will call _prepare_task and then immediately check ledger
     import time
-    terminal, pending = adapter._prepare_task(params, "peer-test", agent={"local": True, "slug": "", "tenant": ""})
-    # If terminal is not None, task was rejected; else pending should exist
-    if pending is not None:
-        # Ledger should have WORKING
-        import json
-        assert ledger.exists(), "ledger not persisted before dispatch"
-        data = json.loads(ledger.read_text())
-        found = [r for r in data.values() if r["context_id"] == "ctx-wa-1"]
-        assert len(found) == 1
-        assert found[0]["state"] == protocol.STATE_WORKING
-        # Now test cancel persistence
-        task_id = pending["task_id"]
-        # Simulate cancel via task_routing mixin
-        # Directly call tasks.complete and persist as _rpc_tasks_cancel does
-        adapter.tasks.complete(task_id, protocol.STATE_CANCELED, "")
-        # Our fix should persist after cancel - simulate what the fixed code does
-        adapter.tasks.persist(ledger)
-        # Now check ledger after cancel
-        data2 = json.loads(ledger.read_text())
-        rec2 = [r for r in data2.values() if r["task_id"] == task_id][0]
-        assert rec2["state"] == protocol.STATE_CANCELED
-        # Also test restore
-        new_store = protocol.TaskStore()
-        new_store.restore(ledger)
-        rec_restored = new_store.get(task_id)
-        assert rec_restored is not None
-        assert rec_restored["state"] == protocol.STATE_CANCELED
-    else:
-        pytest.fail("prepare_task returned terminal, expected pending")
-
     try:
-        loop.close()
-    except Exception:
-        pass
-    try:
-        adapter._unregister_adapter()
-    except Exception:
-        pass
+        terminal, pending = adapter._prepare_task(params, "peer-test", agent={"local": True, "slug": "", "tenant": ""})
+        # If terminal is not None, task was rejected; else pending should exist
+        if pending is not None:
+            # Ledger should have WORKING
+            import json
+            assert ledger.exists(), "ledger not persisted before dispatch"
+            data = json.loads(ledger.read_text())
+            found = [r for r in data.values() if r["context_id"] == "ctx-wa-1"]
+            assert len(found) == 1
+            assert found[0]["state"] == protocol.STATE_WORKING
+            # Now test cancel persistence
+            task_id = pending["task_id"]
+            # Simulate cancel via task_routing mixin
+            # Directly call tasks.complete and persist as _rpc_tasks_cancel does
+            adapter.tasks.complete(task_id, protocol.STATE_CANCELED, "")
+            # Our fix should persist after cancel - simulate what the fixed code does
+            adapter.tasks.persist(ledger)
+            # Now check ledger after cancel
+            data2 = json.loads(ledger.read_text())
+            rec2 = [r for r in data2.values() if r["task_id"] == task_id][0]
+            assert rec2["state"] == protocol.STATE_CANCELED
+            # Also test restore
+            new_store = protocol.TaskStore()
+            new_store.restore(ledger)
+            rec_restored = new_store.get(task_id)
+            assert rec_restored is not None
+            assert rec_restored["state"] == protocol.STATE_CANCELED
+        else:
+            pytest.fail("prepare_task returned terminal, expected pending")
+    finally:
+        try:
+            if not loop.is_closed():
+                loop.close()
+        except Exception:
+            pass
+        try:
+            adapter._unregister_adapter()
+        except Exception:
+            pass
+        # Reset policy loop if we replaced it
+        try:
+            pol = asyncio.get_event_loop_policy()
+            cur = None
+            try:
+                cur = pol.get_event_loop()
+            except RuntimeError:
+                cur = None
+            if cur is loop:
+                pol.set_event_loop(None)
+            elif cur is not None and cur.is_closed():
+                pol.set_event_loop(None)
+        except Exception:
+            try:
+                asyncio.set_event_loop(None)
+            except Exception:
+                pass
 
 
 def test_truthful_out_of_band_results(monkeypatch, tmp_path):

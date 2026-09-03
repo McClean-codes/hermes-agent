@@ -221,10 +221,30 @@ def test_prepare_task_registers_refined_peer(monkeypatch, tmp_path):
         assert json.loads(peers_file.read_text())["ctx-roundtrip-1"] == "peer-a"
     finally:
         try:
-            loop.close()
+            if not loop.is_closed():
+                loop.close()
         except Exception:
             pass
-        adapter._unregister_adapter()
+        try:
+            adapter._unregister_adapter()
+        except Exception:
+            pass
+        try:
+            pol = asyncio.get_event_loop_policy()
+            cur = None
+            try:
+                cur = pol.get_event_loop()
+            except RuntimeError:
+                cur = None
+            if cur is loop:
+                pol.set_event_loop(None)
+            elif cur is not None and cur.is_closed():
+                pol.set_event_loop(None)
+        except Exception:
+            try:
+                asyncio.set_event_loop(None)
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------

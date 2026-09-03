@@ -104,23 +104,44 @@ def test_write_ahead_ledger_present_at_handler_dispatch(monkeypatch, tmp_path):
 
     monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", fake_run)
 
-    params = {"message": {"parts": [{"text": "hello"}], "contextId": "ctx-wa-dispatch"}}
-    terminal, pending = adapter._prepare_task(params, "peer-test", agent={"local": True, "slug": "", "tenant": ""})
-    assert terminal is None, "should be pending, not terminal"
-    assert pending is not None
-    # Handler should have run synchronously
-    assert dispatched.is_set()
-    assert "ledger-WORKING-at-dispatch" in handler_observed, f"observed {handler_observed}"
-    # Lexically the final ledger should still be WORKING (not yet completed)
-    data = json.loads(ledger.read_text())
-    recs = [r for r in data.values() if r["context_id"] == "ctx-wa-dispatch"]
-    assert len(recs) == 1 and recs[0]["state"] == protocol.STATE_WORKING
-
     try:
-        loop.close()
-    except Exception:
-        pass
-    adapter._unregister_adapter()
+        params = {"message": {"parts": [{"text": "hello"}], "contextId": "ctx-wa-dispatch"}}
+        terminal, pending = adapter._prepare_task(params, "peer-test", agent={"local": True, "slug": "", "tenant": ""})
+        assert terminal is None, "should be pending, not terminal"
+        assert pending is not None
+        # Handler should have run synchronously
+        assert dispatched.is_set()
+        assert "ledger-WORKING-at-dispatch" in handler_observed, f"observed {handler_observed}"
+        # Lexically the final ledger should still be WORKING (not yet completed)
+        data = json.loads(ledger.read_text())
+        recs = [r for r in data.values() if r["context_id"] == "ctx-wa-dispatch"]
+        assert len(recs) == 1 and recs[0]["state"] == protocol.STATE_WORKING
+    finally:
+        try:
+            if not loop.is_closed():
+                loop.close()
+        except Exception:
+            pass
+        try:
+            adapter._unregister_adapter()
+        except Exception:
+            pass
+        try:
+            pol = asyncio.get_event_loop_policy()
+            cur = None
+            try:
+                cur = pol.get_event_loop()
+            except RuntimeError:
+                cur = None
+            if cur is loop:
+                pol.set_event_loop(None)
+            elif cur is not None and cur.is_closed():
+                pol.set_event_loop(None)
+        except Exception:
+            try:
+                asyncio.set_event_loop(None)
+            except Exception:
+                pass
 
 
 def test_failed_write_does_not_dispatch(monkeypatch, tmp_path):
@@ -173,20 +194,41 @@ def test_failed_write_does_not_dispatch(monkeypatch, tmp_path):
         return orig_persist(path)
     monkeypatch.setattr(adapter.tasks, "persist", failing_persist)
 
-    params = {"message": {"parts": [{"text": "hello"}], "contextId": "ctx-fail-write"}}
-    terminal, pending = adapter._prepare_task(params, "peer-test", agent={"local": True, "slug": "", "tenant": ""})
-    # Should have failed closed: terminal FAILED, no pending, no dispatch
-    assert terminal is not None
-    assert terminal["status"]["state"] == protocol.STATE_FAILED
-    assert pending is None
-    time.sleep(0.2)
-    assert dispatched == [], "handler must not have been dispatched when persist failed"
-
     try:
-        loop.close()
-    except Exception:
-        pass
-    adapter._unregister_adapter()
+        params = {"message": {"parts": [{"text": "hello"}], "contextId": "ctx-fail-write"}}
+        terminal, pending = adapter._prepare_task(params, "peer-test", agent={"local": True, "slug": "", "tenant": ""})
+        # Should have failed closed: terminal FAILED, no pending, no dispatch
+        assert terminal is not None
+        assert terminal["status"]["state"] == protocol.STATE_FAILED
+        assert pending is None
+        time.sleep(0.2)
+        assert dispatched == [], "handler must not have been dispatched when persist failed"
+    finally:
+        try:
+            if not loop.is_closed():
+                loop.close()
+        except Exception:
+            pass
+        try:
+            adapter._unregister_adapter()
+        except Exception:
+            pass
+        try:
+            pol = asyncio.get_event_loop_policy()
+            cur = None
+            try:
+                cur = pol.get_event_loop()
+            except RuntimeError:
+                cur = None
+            if cur is loop:
+                pol.set_event_loop(None)
+            elif cur is not None and cur.is_closed():
+                pol.set_event_loop(None)
+        except Exception:
+            try:
+                asyncio.set_event_loop(None)
+            except Exception:
+                pass
 
 
 # ── Terminal persistence ────────────────────────────────────────────────
@@ -314,20 +356,41 @@ def test_immediate_reject_persists(monkeypatch, tmp_path):
     adapter.handle_message = lambda e: None  # type: ignore
     adapter.tasks = protocol.TaskStore()
 
-    # Empty text should create REJECTED and persist
-    params_empty = {"message": {"parts": [{"text": ""}], "contextId": "ctx-reject"}}
-    terminal, pending = adapter._prepare_task(params_empty, "peer", agent={"local": True, "slug": "", "tenant": ""})
-    assert terminal is not None and terminal["status"]["state"] == protocol.STATE_REJECTED
-    assert pending is None
-    data = json.loads(ledger.read_text())
-    recs = [r for r in data.values() if r["context_id"] == "ctx-reject"]
-    assert len(recs) == 1 and recs[0]["state"] == protocol.STATE_REJECTED
-
     try:
-        loop.close()
-    except Exception:
-        pass
-    adapter._unregister_adapter()
+        # Empty text should create REJECTED and persist
+        params_empty = {"message": {"parts": [{"text": ""}], "contextId": "ctx-reject"}}
+        terminal, pending = adapter._prepare_task(params_empty, "peer", agent={"local": True, "slug": "", "tenant": ""})
+        assert terminal is not None and terminal["status"]["state"] == protocol.STATE_REJECTED
+        assert pending is None
+        data = json.loads(ledger.read_text())
+        recs = [r for r in data.values() if r["context_id"] == "ctx-reject"]
+        assert len(recs) == 1 and recs[0]["state"] == protocol.STATE_REJECTED
+    finally:
+        try:
+            if not loop.is_closed():
+                loop.close()
+        except Exception:
+            pass
+        try:
+            adapter._unregister_adapter()
+        except Exception:
+            pass
+        try:
+            pol = asyncio.get_event_loop_policy()
+            cur = None
+            try:
+                cur = pol.get_event_loop()
+            except RuntimeError:
+                cur = None
+            if cur is loop:
+                pol.set_event_loop(None)
+            elif cur is not None and cur.is_closed():
+                pol.set_event_loop(None)
+        except Exception:
+            try:
+                asyncio.set_event_loop(None)
+            except Exception:
+                pass
 
 
 # ── Restart boundary witness ────────────────────────────────────────────
@@ -395,19 +458,40 @@ def test_failed_write_witness_persistence_error_explicit(monkeypatch, tmp_path, 
         raise OSError("read-only")
     monkeypatch.setattr(adapter.tasks, "persist", raising_persist)
 
-    params = {"message": {"parts": [{"text": "hello"}], "contextId": "ctx-fail-log"}}
-    with caplog.at_level("ERROR"):
-        terminal, pending = adapter._prepare_task(params, "peer", agent={"local": True, "slug": "", "tenant": ""})
-    # Should be failed terminal due to fail-closed
-    assert terminal is not None and terminal["status"]["state"] == protocol.STATE_FAILED
-    # Verify error log was emitted (not debug)
-    assert any("failed to persist" in rec.message.lower() for rec in caplog.records)
-
     try:
-        loop.close()
-    except Exception:
-        pass
-    adapter._unregister_adapter()
+        params = {"message": {"parts": [{"text": "hello"}], "contextId": "ctx-fail-log"}}
+        with caplog.at_level("ERROR"):
+            terminal, pending = adapter._prepare_task(params, "peer", agent={"local": True, "slug": "", "tenant": ""})
+        # Should be failed terminal due to fail-closed
+        assert terminal is not None and terminal["status"]["state"] == protocol.STATE_FAILED
+        # Verify error log was emitted (not debug)
+        assert any("failed to persist" in rec.message.lower() for rec in caplog.records)
+    finally:
+        try:
+            if not loop.is_closed():
+                loop.close()
+        except Exception:
+            pass
+        try:
+            adapter._unregister_adapter()
+        except Exception:
+            pass
+        try:
+            pol = asyncio.get_event_loop_policy()
+            cur = None
+            try:
+                cur = pol.get_event_loop()
+            except RuntimeError:
+                cur = None
+            if cur is loop:
+                pol.set_event_loop(None)
+            elif cur is not None and cur.is_closed():
+                pol.set_event_loop(None)
+        except Exception:
+            try:
+                asyncio.set_event_loop(None)
+            except Exception:
+                pass
 
 
 # ── Malformed result validation ───────────────────────────────────────
