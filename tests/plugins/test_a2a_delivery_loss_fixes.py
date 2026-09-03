@@ -97,10 +97,45 @@ def _live_adapter(monkeypatch, handler):
 
 def _stop_adapter(adapter, loop, thread):
     try:
-        asyncio.run_coroutine_threadsafe(adapter.disconnect(), loop).result(timeout=10)
+        try:
+            asyncio.run_coroutine_threadsafe(adapter.disconnect(), loop).result(timeout=10)
+        except Exception:
+            pass
     finally:
-        loop.call_soon_threadsafe(loop.stop)
+        try:
+            loop.call_soon_threadsafe(loop.stop)
+        except Exception:
+            pass
         thread.join(timeout=5)
+        # Close the loop and clear policy to avoid ResourceWarning under -W error.
+        try:
+            # Cancel any remaining tasks
+            try:
+                pending = asyncio.all_tasks(loop)  # type: ignore[arg-type]
+            except RuntimeError:
+                pending = set()
+            for t in list(pending):
+                t.cancel()
+            if pending:
+                try:
+                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            if not loop.is_closed():
+                loop.close()
+        except Exception:
+            pass
+        try:
+            if asyncio.get_event_loop_policy().get_event_loop() is loop:
+                asyncio.set_event_loop(None)
+        except Exception:
+            try:
+                asyncio.set_event_loop(None)
+            except Exception:
+                pass
 
 
 # ═════════════════════════════════════════════════════════════════════════════
