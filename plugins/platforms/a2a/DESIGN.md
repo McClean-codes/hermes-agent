@@ -117,10 +117,19 @@ Peers resolved from `config.yaml` → `a2a_agents`, or a direct URL.
 - **Audit log:** append-only `~/.hermes/a2a_audit.jsonl` for every exchange.
 
 ## State placement
-Task store, turn tracker, and rate limiter are **adapter-instance** objects
-(classes in `protocol.py`). The metrics counter bag stays a module singleton
-because it is intentionally shared between the inbound adapter and the
-outbound client tools (`/metrics` and `a2a_list` report both directions).
+Task store, turn tracker, rate limiter, and **windowed duplicate suppression**
+(`_inbound_seen` map, 60 s window, 1,024 entries, process-local) are
+**adapter-instance** objects (classes / maps in `protocol.py` / `adapter.py`).
+The metrics counter bag stays a module singleton because it is intentionally
+shared between the inbound adapter and the outbound client tools
+(`/metrics` and `a2a_list` report both directions).
+
+**Windowed duplicate suppression** is bounded admission control, not durable
+idempotency or replay protection: the key is process-local
+`(contextId, messageId)`, entries expire after 60 s, the map is capped at
+1,024, it is not persisted, restart forgets it, and a duplicate gets a new
+`REJECTED` Task rather than the first request's Task/result. It does not
+cause request replay, result replay, or exactly-once execution.
 
 ## Persistence (survives compaction)
 A2A conversations are written to `~/.hermes/a2a_conversations/<context>.jsonl`,
@@ -151,6 +160,52 @@ them (#11025 requirement). The `a2a_history` tool recalls them by context id.
 - **DID / Ed25519 identity, OAuth2 scopes, x402 micropayments** (#14559
   bindu) — heavy, niche; revisit if there's real demand.
 
+## Edison re-baseline (2026-09-03) — supersession notes
+
+This re-baseline supersedes the following prior assumptions; the
+terminology below is canonical:
+
+1. `protocol.is_valid_a2a_result` no longer defines validity by
+   meaningful-key presence. The strict parser/schema in this doc's
+   §4 (Task/Message/Part/Artifact rules, exact-one wrapper, explicit
+   `V1_WRAPPED` vs `LEGACY_BARE`) is authoritative.
+
+2. `unwrap_send_message_response` may not select `task` from a
+   both-member wrapper. The oneof contract requires `v1_payload_count`
+   failure; production callers use `parse_send_message_result`.
+
+3. The `TaskStore.complete() then persist()` pattern is replaced by the
+   disk-first durable publication primitive
+   `TaskStore.publish_durable(ledger_path, task_id, candidate_record)`:
+   stage clone → atomically replace ledger → update memory → wake
+   observers → post-commit audit/metrics/callback/push → return success.
+   No `memory terminal → persist → return` path is permitted.
+
+4. `adapter.send()` per-context FIFO does not prevent cross-talk.
+   Exact `task_id` (via `HERMES_SESSION_THREAD_ID` or `reply_to`) plus
+   `contextId`/`peer`/`agent_slug`/`tenant` verification prevents it;
+   context-only selection is valid only when exactly one active task
+   exists in the context. Two concurrent same-context tasks via FIFO is
+   replaced by exact-ID and ambiguity tests.
+
+5. `DESIGN.md` statements that task transitions are merely “idempotent”
+   mean **terminal-state immutability inside one TaskStore**. They do not
+   mean durable request idempotency, exactly-once, or at-least-once
+   delivery.
+
+6. The `DESIGN.md` Part compatibility statement remains valid for
+   tolerant inbound `extract_text` only. It does not loosen successful
+   `v1` result validation.
+
+7. The windowed inbound dedupe map is renamed to **windowed duplicate
+   suppression** and retained under §8 of the decision: 60 s, 1,024
+   entries, process-local `(contextId, messageId)`, bounded admission
+   control, not durable idempotency or replay protection.
+
+8. Prior successful transport probes remain authoritative preservation
+   evidence, but aggregate green counts do not override the hostile
+   predicates in the durability matrix.
+
 ## Files
 ```
 plugins/platforms/a2a/
@@ -158,7 +213,7 @@ plugins/platforms/a2a/
 ├── __init__.py      # register(): platform adapter + client tools
 ├── adapter.py       # inbound A2A v1.0 server (stdlib http.server)
 ├── tools.py         # outbound client tools
-├── protocol.py      # Agent Card, JSON-RPC framing, task store, persistence
+├── protocol.py      # Agent Card, JSON-RPC framing, task store, persistence + strict parser + durable primitive
 ├── security.py      # auth/identity, injection filters, redaction, audit
 ├── DESIGN.md
 └── README.md

@@ -626,7 +626,7 @@ class TestReplyCapture:
                 "⏩ Steered into current run (iteration 1/200).",
                 metadata={"expect_edits": True},
             )
-            assert interim.success is True
+            assert interim.success
             assert fut.done() is False
 
             final = await adapter.send(
@@ -634,7 +634,7 @@ class TestReplyCapture:
                 "FINAL_PROOF_PAYLOAD",
                 metadata={"notify": True},
             )
-            assert final.success is True
+            assert final.success
             assert fut.result(timeout=0) == (protocol.STATE_COMPLETED, "FINAL_PROOF_PAYLOAD")
 
         try:
@@ -735,7 +735,7 @@ class TestOutOfBandReply:
             return res
 
         res = asyncio.run(run())
-        assert res.success is True
+        assert res.success
         assert captured["url"] == "http://localhost:8805"
         msg = captured["body"]["params"]["message"]
         assert msg["contextId"] == "ctx-x"  # same context → same caller session
@@ -761,7 +761,7 @@ class TestOutOfBandReply:
             return await adapter.send("ctx-ghost", "late", metadata={"notify": True})
 
         res = asyncio.run(run())
-        assert res.success is False
+        assert not res.success
         assert "no peer" in (res.error or "").lower()
         assert called == []  # no peer URL resolvable → nothing to push
 
@@ -783,7 +783,7 @@ class TestOutOfBandReply:
             return await adapter.send("ctx-x", "late", metadata={"notify": True})
 
         res = asyncio.run(run())
-        assert res.success is False
+        assert not res.success
         assert res.error
 
     def test_loopback_identity_pushes_in_process(self, monkeypatch):
@@ -829,7 +829,7 @@ class TestOutOfBandReply:
             )
 
         res = asyncio.run(run())
-        assert res.success is True
+        assert res.success
         assert posted == []  # in-process: no HTTP self-call
         assert prepared["params"]["message"]["contextId"] == "ctx-loop"
         assert prepared["peer"] == "ip:127.0.0.1"
@@ -870,7 +870,7 @@ class TestOutOfBandReply:
             return await adapter.send("ctx-x", "late", metadata={"notify": True})
 
         res = asyncio.run(run())
-        assert res.success is False  # timeout still surfaces to the notifier
+        assert not res.success  # timeout still surfaces to the notifier
         assert audited and audited[0][0] == "push"
         assert audited[0][4] == "ctx-x"  # push rows carry the context id
         assert ("ctx-x", "agent", "late") in persisted
@@ -1336,7 +1336,7 @@ class TestDeadClientReplyPush:
             )
 
         res = asyncio.run(run())
-        assert res.success is True
+        assert res.success
         # The original task is now finalized as COMPLETED.
         final_rec = adapter.tasks.get(existing["task_id"])
         assert final_rec is not None
@@ -1432,7 +1432,7 @@ class TestDeadClientReplyPush:
             )
 
         res = asyncio.run(run())
-        assert res.success is True
+        assert res.success
 
         # The original task is now finalized as COMPLETED with the
         # agent's reply — the authoritative completed record.
@@ -1530,7 +1530,7 @@ class TestDeadClientReplyPush:
         monkeypatch.setattr(adapter, "_rpc_message_send", fake_rpc)
         monkeypatch.setattr(
             adapter, "_push_reply_after_client_gone",
-            lambda req_id, result: pushed.append((req_id, result)),
+            lambda req_id, result, is_v1=True, **kw: pushed.append((req_id, result)),
         )
         handler = SimpleNamespace(adapter=adapter)
         handler._a2a_client_alive = lambda: True  # type: ignore
@@ -2318,9 +2318,9 @@ class TestClientTenantAndDiscovery:
         def fake_post(url, body, headers, timeout, **kw):
             posted["url"] = url
             posted["body"] = body
-            return {"jsonrpc": "2.0", "id": body["id"], "result": protocol.build_task(
+            return {"jsonrpc": "2.0", "id": body["id"], "result": {"task": protocol.build_task(
                 "task-1", "ctx-1", protocol.STATE_COMPLETED, "ok"
-            )}
+            )}}
 
         monkeypatch.setattr(tools, "_http_get_json", fake_get)
         monkeypatch.setattr(tools, "_http_post_json", fake_post)

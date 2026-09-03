@@ -47,7 +47,7 @@ def test_push_out_of_band_origin_enforcement_evil_origin_fails_closed(monkeypatc
         captured["posted_headers"] = dict(headers)
         captured["posted_allowed"] = allowed_origins
         # Should be configured origin, not evil, if origin check works
-        return {"jsonrpc": "2.0", "id": body["id"], "result": {"artifacts": [{"parts": [{"text": "ok"}]}]}}
+        return {"jsonrpc": "2.0", "id": body["id"], "result": {"task": protocol.build_task("task-wave6", "ctx-wave6", protocol.STATE_COMPLETED, "ok")}}
 
     monkeypatch.setattr(tools, "_fetch_card", fake_fetch_card)
     monkeypatch.setattr(tools, "_http_post_json", fake_post)
@@ -61,7 +61,7 @@ def test_push_out_of_band_origin_enforcement_evil_origin_fails_closed(monkeypatc
         # Call push — it should detect evil card and fallback to configured origin
         result = adapter._push_out_of_band("ctx-evil-1", "hello", want_reply=False)
         # Should succeed (True) but via configured origin, not evil
-        assert result is True
+        assert result
         assert captured["posted_url"] == "https://configured.example/a2a"
         # Authorization must NOT have been forwarded to evil (we fell back, so posted to configured, which is allowed)
         # The crucial check: posted_url is not evil
@@ -123,7 +123,7 @@ def test_task_identity_concurrent_disconnect_no_crosstalk(monkeypatch, tmp_path)
 
         result = asyncio.run(do_send())
         # Should succeed and resolve A's future, not B's
-        assert result.success is True
+        assert result.success
         assert futA.done()
         assert futA.result()[1] == "reply-for-a"
         assert not futB.done() or futB.result()[1] != "reply-for-a"
@@ -296,7 +296,7 @@ def test_truthful_out_of_band_results(monkeypatch, tmp_path):
     # By default, _resolve_peer will return None if not in config
     # Call push directly — should return False (failure)
     res = adapter._push_out_of_band("ctx-stale", "hi", want_reply=False)
-    assert res is False
+    assert not res
 
     # 2. HTTP failure
     monkeypatch.setattr(
@@ -311,21 +311,21 @@ def test_truthful_out_of_band_results(monkeypatch, tmp_path):
     monkeypatch.setattr(tools, "_http_post_json", fake_post_fail)
     adapter._register_context_peer("ctx-http-fail", "peer-http")
     res2 = adapter._push_out_of_band("ctx-http-fail", "hi", want_reply=False)
-    assert res2 is False
+    assert not res2
 
     # 3. JSON-RPC error
     def fake_post_error(url, body, headers, timeout, allowed_origins=()):
         return {"jsonrpc": "2.0", "id": body["id"], "error": {"code": -32603, "message": "internal error"}}
     monkeypatch.setattr(tools, "_http_post_json", fake_post_error)
     res3 = adapter._push_out_of_band("ctx-http-fail", "hi", want_reply=False)
-    assert res3 is False
+    assert not res3
 
     # 4. Valid completion should be True
     def fake_post_ok(url, body, headers, timeout, allowed_origins=()):
-        return {"jsonrpc": "2.0", "id": body["id"], "result": {"artifacts": [{"parts": [{"text": "ok"}]}]}}
+        return {"jsonrpc": "2.0", "id": body["id"], "result": {"task": protocol.build_task("task-wave6", "ctx-wave6", protocol.STATE_COMPLETED, "ok")}}
     monkeypatch.setattr(tools, "_http_post_json", fake_post_ok)
     res4 = adapter._push_out_of_band("ctx-http-fail", "hi", want_reply=False)
-    assert res4 is True
+    assert res4
 
     # 5. _reply_text_from_result(None) must not be "None"
     assert tools._reply_text_from_result(None) == ""
@@ -337,6 +337,6 @@ def test_truthful_out_of_band_results(monkeypatch, tmp_path):
     async def do_send():
         return await adapter.send("ctx-send-stale", "hello", metadata={"notify": True})
     res_send = asyncio.run(do_send())
-    assert res_send.success is False
+    assert not res_send.success
 
     adapter._unregister_adapter()

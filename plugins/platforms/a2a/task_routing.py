@@ -92,10 +92,17 @@ class TaskRPCHandler:
             return protocol.jsonrpc_result(
                 req_id, {"error": {"code": -32000, "message": "client disconnected, task pending"}}
             )
-        state, reply = self._finalize_task(pending, state, reply)
+        try:
+            state, reply = self._finalize_task(pending, state, reply)
+        except protocol.DurablePublishError as dpe:
+            logger.error("A2A: durable publish failed for task %s: %s", dpe.task_id, dpe)
+            return protocol.durable_persistence_error(req_id, dpe.task_id, dpe.context_id, dpe.attempted_state, dpe.durable_state, dpe.dispatched)
         if out_of_band_only:
             if state in (protocol.STATE_COMPLETED, protocol.STATE_INPUT_REQUIRED) and reply:
-                if self._try_push_reply(pending, state, reply):
+                # _try_push_reply now returns PushOutcome; handle structured result
+                _push_res = self._try_push_reply(pending, state, reply)
+                # _try_push_reply returns bool or PushOutcome; treat truthy as success
+                if _push_res is True or (hasattr(_push_res, 'success') and _push_res.success):
                     return None
         task = protocol.build_task(
             pending["task_id"], pending["context_id"], state, reply,
@@ -259,20 +266,24 @@ class TaskRPCHandler:
             return protocol.jsonrpc_error(
                 req_id, protocol.ERR_TASK_NOT_CANCELABLE,
                 f"task {task_id} already {rec['state']}")
-        self.tasks.complete(task_id, protocol.STATE_CANCELED, "")
+        _candidate = dict(rec)
+        _candidate["state"] = protocol.STATE_CANCELED
+        _candidate["reply"] = ""
+        _candidate["completed_at"] = __import__("time").time()
         try:
-            from .a2a_persistence import _try_persist_task_ledger, _task_ledger_path
-            ok = _try_persist_task_ledger(self.tasks, _task_ledger_path(), f"CANCELED {task_id}")
+            from .a2a_persistence import _task_ledger_path
+            _outcome = self.tasks.publish_durable(_task_ledger_path(), task_id, _candidate)
         except Exception:
             logger.error("A2A: failed to persist task ledger at CANCELED for task %s", task_id, exc_info=True)
-            ok = False
-        if not ok:
-            logger.error("A2A: failed to persist CANCELED state for task %s — returning indeterminate failure", task_id)
+            _outcome = None
+        if _outcome is None or not _outcome.published:
+            logger.error("A2A: failed to persist CANCELED state for task %s — returning persistence failure", task_id)
             self._turns.reset(rec["context_id"])
-            # Fail-closed: do not claim durable cancellation when disk write failed.
-            return protocol.jsonrpc_error(req_id, -32000, f"task {task_id} cancellation persistence failed — state indeterminate")
+            _durable = _outcome.durable_state if _outcome else rec["state"]
+            return protocol.durable_persistence_error(req_id, task_id, rec["context_id"], protocol.STATE_CANCELED, _durable, True)
         self._turns.reset(rec["context_id"])
-        self._resolve_task(task_id, protocol.STATE_CANCELED, "")
+        if _outcome.newly_published:
+            self._resolve_task(task_id, protocol.STATE_CANCELED, "")
         rec = self.tasks.get(task_id, *self._scope_for_agent(agent)) or rec
         return protocol.jsonrpc_result(req_id, protocol.TaskStore.to_task(rec))
 
@@ -358,39 +369,33 @@ class TaskRPCHandler:
                 state = protocol.STATE_INPUT_REQUIRED
                 reply = stripped[len(protocol.INPUT_REQUIRED_MARKER):].strip()
 
-        protocol.persist_message(context_id, "agent", reply, task_id)
-        security.audit(audit_direction, peer, task_id, reply, context_id=context_id)
-
-        if state in (protocol.STATE_COMPLETED, protocol.STATE_INPUT_REQUIRED):
-            protocol.metrics.outbound_total += 1
-            protocol.metrics.tasks_completed += 1
-            protocol.metrics.record_latency(time.time() - pending["started"])
-        else:
-            protocol.metrics.tasks_failed += 1
-
-        self.tasks.complete(task_id, state, reply)
-        # Persist the task ledger so GetTask/ListTasks/SubscribeToTask survive a gateway restart.
-        # Fail-closed: if durable write fails, caller must not receive a successful terminal result.
-        from .a2a_persistence import _try_persist_task_ledger, _task_ledger_path
-        ok = _try_persist_task_ledger(self.tasks, _task_ledger_path(), f"terminal {state} {task_id}")
-        if not ok:
-            logger.error("A2A: failed to persist terminal %s for task %s — returning indeterminate failure", state, task_id)
-            # Force memory to FAILED indeterminate so GetTask does not claim durable success.
-            # Complete is terminal-idempotent, so we must mutate directly when already terminal.
-            try:
-                with self.tasks._lock:
-                    rec = self.tasks._tasks.get(task_id)
-                    if rec is not None:
-                        rec["state"] = protocol.STATE_FAILED
-                        rec["reply"] = "[terminal persistence failed — state indeterminate]"
-                        rec["completed_at"] = rec.get("completed_at") or __import__("time").time()
-                # Best-effort second attempt to persist the failure state (may also fail)
-                _try_persist_task_ledger(self.tasks, _task_ledger_path(), f"FAILED after terminal persist fail {task_id}")
-            except Exception:
-                pass
-            protocol.metrics.tasks_failed += 1
-            return protocol.STATE_FAILED, "[terminal persistence failed — state indeterminate]"
-        self._send_push_notification(task_id, context_id, reply, state)
+        # Retrieve existing durable record to build candidate
+        _existing = self.tasks.get(task_id)
+        if _existing is None:
+            logger.error("A2A: _finalize_task called for unknown task %s", task_id)
+            return protocol.STATE_FAILED, "[unknown task]"
+        _candidate = dict(_existing)
+        _candidate["state"] = state
+        _candidate["reply"] = reply
+        _candidate["completed_at"] = time.time()
+        from .a2a_persistence import _task_ledger_path
+        _outcome = self.tasks.publish_durable(_task_ledger_path(), task_id, _candidate)
+        if not _outcome.published:
+            logger.error("A2A: failed to durably publish terminal %s for task %s: %s", state, task_id, _outcome.error)
+            # Terminal-write failure leaves last durable state (normally WORKING) visible, no success side effects
+            # Do not invent INDETERMINATE; keep WORKING visible
+            raise protocol.DurablePublishError(task_id, context_id, state, _outcome.durable_state, True)
+        # Post-commit ordering: only on newly_published do audit/metrics/push
+        if _outcome.newly_published:
+            protocol.persist_message(context_id, "agent", reply, task_id)
+            security.audit(audit_direction, peer, task_id, reply, context_id=context_id)
+            if state in (protocol.STATE_COMPLETED, protocol.STATE_INPUT_REQUIRED):
+                protocol.metrics.outbound_total += 1
+                protocol.metrics.tasks_completed += 1
+                protocol.metrics.record_latency(time.time() - pending["started"])
+            else:
+                protocol.metrics.tasks_failed += 1
+            self._send_push_notification(task_id, context_id, reply, state)
         return state, reply
 
 
@@ -410,35 +415,49 @@ class TaskRPCHandler:
         if not task_id:
             return
         if outcome == ProcessingOutcome.FAILURE:
-            self._resolve_task(task_id, protocol.STATE_FAILED, "[agent processing failed]")
-            # Deferred failure: if TaskStore still non-terminal (HTTP waiter
-            # disconnected, no one will call _finalize_task), terminalize now.
+            # Deferred failure: durable-publish FAILED before resolving watchers (section 5.7)
             rec = self.tasks.get(task_id)
             if rec and rec["state"] not in protocol.TERMINAL_STATES:
-                self.tasks.complete(task_id, protocol.STATE_FAILED, "[agent processing failed]")
-                from .a2a_persistence import _try_persist_task_ledger, _task_ledger_path
-                ok = _try_persist_task_ledger(self.tasks, _task_ledger_path(), f"FAILED on_processing_complete {task_id}")
-                if not ok:
-                    logger.error("A2A: failed to persist FAILED state for task %s after disconnect — state indeterminate", task_id)
-                protocol.metrics.tasks_failed += 1
-                try:
-                    self._send_push_notification(task_id, rec["context_id"], "[agent processing failed]", protocol.STATE_FAILED)
-                except Exception:
-                    pass
+                _candidate = dict(rec)
+                _candidate["state"] = protocol.STATE_FAILED
+                _candidate["reply"] = "[agent processing failed]"
+                _candidate["completed_at"] = __import__("time").time()
+                from .a2a_persistence import _task_ledger_path
+                _outcome = self.tasks.publish_durable(_task_ledger_path(), task_id, _candidate)
+                if not _outcome.published:
+                    logger.error("A2A: failed to durably publish FAILED for task %s: %s", task_id, _outcome.error)
+                    # Keep last durable state (WORKING), no success watcher, no push
+                    return
+                if _outcome.newly_published:
+                    self._resolve_task(task_id, protocol.STATE_FAILED, "[agent processing failed]")
+                    protocol.metrics.tasks_failed += 1
+                    try:
+                        self._send_push_notification(task_id, rec["context_id"], "[agent processing failed]", protocol.STATE_FAILED)
+                    except Exception:
+                        pass
+            else:
+                self._resolve_task(task_id, protocol.STATE_FAILED, "[agent processing failed]")
         elif outcome == ProcessingOutcome.CANCELLED:
-            self._resolve_task(task_id, protocol.STATE_CANCELED, "")
             rec = self.tasks.get(task_id)
             if rec and rec["state"] not in protocol.TERMINAL_STATES:
-                self.tasks.complete(task_id, protocol.STATE_CANCELED, "")
-                from .a2a_persistence import _try_persist_task_ledger, _task_ledger_path
-                ok = _try_persist_task_ledger(self.tasks, _task_ledger_path(), f"CANCELED on_processing_complete {task_id}")
-                if not ok:
-                    logger.error("A2A: failed to persist CANCELED state for task %s after disconnect — state indeterminate", task_id)
-                protocol.metrics.tasks_failed += 1
-                try:
-                    self._send_push_notification(task_id, rec["context_id"], "", protocol.STATE_CANCELED)
-                except Exception:
-                    pass
+                _candidate = dict(rec)
+                _candidate["state"] = protocol.STATE_CANCELED
+                _candidate["reply"] = ""
+                _candidate["completed_at"] = __import__("time").time()
+                from .a2a_persistence import _task_ledger_path
+                _outcome = self.tasks.publish_durable(_task_ledger_path(), task_id, _candidate)
+                if not _outcome.published:
+                    logger.error("A2A: failed to durably publish CANCELED for task %s: %s", task_id, _outcome.error)
+                    return
+                if _outcome.newly_published:
+                    self._resolve_task(task_id, protocol.STATE_CANCELED, "")
+                    protocol.metrics.tasks_failed += 1
+                    try:
+                        self._send_push_notification(task_id, rec["context_id"], "", protocol.STATE_CANCELED)
+                    except Exception:
+                        pass
+            else:
+                self._resolve_task(task_id, protocol.STATE_CANCELED, "")
         else:
             self._resolve_task(task_id, protocol.STATE_COMPLETED, "")
 

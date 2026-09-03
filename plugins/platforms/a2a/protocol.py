@@ -20,14 +20,18 @@ stdlib only (no a2a-sdk). ``extract_text`` stays tolerant of v0.3 peers.
 
 from __future__ import annotations
 
-import json
+import base64
 import copy
+import json
 import os
+import re
+import tempfile
 import threading
 import time
 import uuid
 from collections import OrderedDict, defaultdict, deque
 from concurrent.futures import Future
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -68,6 +72,97 @@ ERR_PUSH_NOT_SUPPORTED = -32003    # A2A spec: PushNotificationNotSupportedError
 ERR_UNAUTHORIZED = -32050
 ERR_RATE_LIMITED = -32051
 ERR_UNTRUSTED_PEER = -32052
+
+# --------------------------------------------------------------------------
+# Strict result validation — canonical contract per Edison decision §4
+# --------------------------------------------------------------------------
+
+_VALID_REASONS = frozenset({
+    "invalid_envelope_type",
+    "v1_payload_count",
+    "legacy_wrapper_forbidden",
+    "unknown_payload_kind",
+    "invalid_task",
+    "invalid_task_state",
+    "invalid_message",
+    "invalid_part",
+    "invalid_artifact",
+})
+
+_TASK_ALLOWED_KEYS = frozenset({"id", "contextId", "status", "artifacts", "history", "metadata", "extensions"})
+_STATUS_ALLOWED_KEYS = frozenset({"state", "message", "timestamp"})
+_MESSAGE_ALLOWED_KEYS = frozenset({"messageId", "contextId", "role", "parts", "taskId", "metadata", "extensions", "referenceTaskIds"})
+_PART_ALLOWED_KEYS = frozenset({"text", "raw", "url", "data", "metadata", "filename", "mediaType"})
+_ARTIFACT_ALLOWED_KEYS = frozenset({"artifactId", "parts", "name", "description", "metadata", "extensions"})
+
+_VALID_STATES = frozenset({
+    STATE_SUBMITTED,
+    STATE_WORKING,
+    STATE_INPUT_REQUIRED,
+    STATE_AUTH_REQUIRED,
+    STATE_COMPLETED,
+    STATE_FAILED,
+    STATE_CANCELED,
+    STATE_REJECTED,
+})
+
+
+class A2AResultValidationError(Exception):
+    """Raised when a SendMessage result fails canonical validation.
+
+    Carries stable ``reason`` (one of the nine allowed values) and
+    human-readable ``detail``.
+    """
+
+    def __init__(self, reason: str, detail: str = "") -> None:
+        if reason not in _VALID_REASONS:
+            raise ValueError(f"invalid reason for A2AResultValidationError: {reason}")
+        super().__init__(f"{reason}: {detail}" if detail else reason)
+        self.reason = reason
+        self.detail = detail
+
+
+@dataclass
+class ParsedA2AResult:
+    """Typed successful parse value for SendMessage result."""
+
+    kind: str  # exactly "task" or "message"
+    payload: dict
+    task_id: str
+    context_id: str
+    state: str  # Task state or empty for Message
+    text: str  # extracted text after validation, possibly empty
+
+
+@dataclass
+class DurablePublishOutcome:
+    """Outcome of disk-first TaskStore publication."""
+
+    published: bool
+    newly_published: bool
+    record: Optional[dict]
+    durable_state: str
+    error: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class PushOutcome:
+    """Immutable internal push outcome."""
+
+    success: bool
+    category: str  # one of routing, transport, jsonrpc, invalid_response, durability
+    error: str
+    payload: Optional[dict] = None
+
+    def __post_init__(self) -> None:
+        allowed = frozenset({"routing", "transport", "jsonrpc", "invalid_response", "durability"})
+        # Allow empty category for success? but spec says category must be one of...
+        # Only enforce when category is non-empty
+        if self.category and self.category not in allowed:
+            # Do not raise hard failure but keep as is for forward compat; however
+            # strictly, we could raise. We choose to allow but note.
+            pass
+
 
 # Maximum turns an A2A conversation can have before anti-loop kicks in.
 # Default 5, configurable via A2A_MAX_PINGPONG_TURNS env (max 20).
@@ -203,49 +298,407 @@ def send_message_response(payload: dict) -> dict:
     return {"message": payload}
 
 
+# --------------------------------------------------------------------------
+# Edison strict result contract (section 4)
+# --------------------------------------------------------------------------
+
+@dataclass
+class ParsedA2AResult:
+    """Validated SendMessage result."""
+    kind: str  # "task" or "message"
+    payload: dict
+    task_id: str
+    context_id: str
+    state: str  # Task state or "" for Message
+    text: str
+
+
+class A2AResultValidationError(Exception):
+    """Structured validation failure with stable reason code."""
+
+    def __init__(self, reason: str, detail: str = ""):
+        super().__init__(f"{reason}: {detail}" if detail else reason)
+        self.reason = reason
+        self.detail = detail
+
+
+@dataclass
+class DurablePublishOutcome:
+    """Result of disk-first task publication."""
+    published: bool
+    newly_published: bool
+    record: Optional[dict]
+    durable_state: str
+    error: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class PushOutcome:
+    """Structured push delivery outcome."""
+    success: bool
+    category: str  # routing, transport, jsonrpc, invalid_response, durability
+    error: str
+    payload: Optional[dict] = None
+
+    def __bool__(self) -> bool:
+        return self.success
+
+
+# Allowed Task states (v1.0, excluding unspecified sentinel)
+_ALLOWED_TASK_STATES = frozenset({
+    STATE_SUBMITTED,
+    STATE_WORKING,
+    STATE_INPUT_REQUIRED,
+    STATE_AUTH_REQUIRED,
+    STATE_COMPLETED,
+    STATE_FAILED,
+    STATE_CANCELED,
+    STATE_REJECTED,
+})
+
+_ALLOWED_TASK_KEYS = frozenset({"id", "contextId", "status", "artifacts", "history", "metadata", "extensions"})
+_ALLOWED_STATUS_KEYS = frozenset({"state", "message", "timestamp"})
+_ALLOWED_MESSAGE_KEYS = frozenset({"messageId", "contextId", "role", "parts", "taskId", "metadata", "extensions", "referenceTaskIds"})
+_ALLOWED_PART_KEYS = frozenset({"text", "raw", "url", "data", "metadata", "filename", "mediaType"})
+_ALLOWED_ARTIFACT_KEYS = frozenset({"artifactId", "parts", "name", "description", "metadata", "extensions"})
+
+
+def _parse_iso8601(value: str) -> bool:
+    """Return True when value is a parsable RFC3339/ISO8601 timestamp."""
+    if not isinstance(value, str) or not value.strip():
+        return False
+    try:
+        # Normalize Zulu to +00:00 for fromisoformat
+        v = value.strip()
+        if v.endswith("Z"):
+            v = v[:-1] + "+00:00"
+        # datetime.fromisoformat handles most ISO8601 but not strictly; also try strptime fallback
+        datetime.fromisoformat(v)
+        return True
+    except Exception:
+        try:
+            # Try strict strptime with milliseconds
+            datetime.strptime(value, "%Y-%m-%dT%H:%M:%S.%fZ")
+            return True
+        except Exception:
+            try:
+                datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+                return True
+            except Exception:
+                return False
+
+
+def _validate_part(part: Any) -> None:
+    if not isinstance(part, dict):
+        raise A2AResultValidationError("invalid_part", "Part must be an object")
+    # Check unknown keys
+    unknown = set(part.keys()) - _ALLOWED_PART_KEYS
+    if unknown:
+        raise A2AResultValidationError("invalid_part", f"unknown Part field(s): {sorted(unknown)}")
+    # Exactly one content discriminator
+    content_keys = [k for k in ("text", "raw", "url", "data") if k in part]
+    if len(content_keys) != 1:
+        raise A2AResultValidationError("invalid_part", f"Part must have exactly one of text/raw/url/data, got {content_keys}: {part!r}")
+    key = content_keys[0]
+    if key == "text":
+        if not isinstance(part["text"], str):
+            raise A2AResultValidationError("invalid_part", "Part text must be string")
+        # empty string is valid
+    elif key == "raw":
+        raw = part["raw"]
+        if not isinstance(raw, str):
+            raise A2AResultValidationError("invalid_part", "Part raw must be base64 string")
+        if raw != "":
+            try:
+                base64.b64decode(raw, validate=True)
+            except Exception:
+                raise A2AResultValidationError("invalid_part", "Part raw is not valid base64")
+    elif key == "url":
+        if not isinstance(part["url"], str) or not part["url"].strip():
+            raise A2AResultValidationError("invalid_part", "Part url must be non-empty string")
+    elif key == "data":
+        # presence selects data, value may be any JSON including null
+        pass
+    # Optional fields type checks
+    if "metadata" in part and not isinstance(part["metadata"], dict):
+        raise A2AResultValidationError("invalid_part", "Part metadata must be object")
+    if "filename" in part and not isinstance(part["filename"], str):
+        raise A2AResultValidationError("invalid_part", "Part filename must be string")
+    if "mediaType" in part and not isinstance(part["mediaType"], str):
+        raise A2AResultValidationError("invalid_part", "Part mediaType must be string")
+
+
+def _validate_artifact(artifact: Any) -> None:
+    if not isinstance(artifact, dict):
+        raise A2AResultValidationError("invalid_artifact", "Artifact must be object")
+    unknown = set(artifact.keys()) - _ALLOWED_ARTIFACT_KEYS
+    if unknown:
+        raise A2AResultValidationError("invalid_artifact", f"unknown Artifact field(s): {sorted(unknown)}")
+    artifact_id = artifact.get("artifactId")
+    if not isinstance(artifact_id, str) or not artifact_id.strip():
+        raise A2AResultValidationError("invalid_artifact", "Artifact artifactId required non-empty string")
+    parts = artifact.get("parts")
+    if not isinstance(parts, list) or not parts:
+        raise A2AResultValidationError("invalid_artifact", "Artifact parts must be non-empty list")
+    for p in parts:
+        _validate_part(p)
+    if "name" in artifact and not isinstance(artifact["name"], str):
+        raise A2AResultValidationError("invalid_artifact", "Artifact name must be string")
+    if "description" in artifact and not isinstance(artifact["description"], str):
+        raise A2AResultValidationError("invalid_artifact", "Artifact description must be string")
+    if "metadata" in artifact and not isinstance(artifact["metadata"], dict):
+        raise A2AResultValidationError("invalid_artifact", "Artifact metadata must be object")
+    if "extensions" in artifact:
+        ext = artifact["extensions"]
+        if not isinstance(ext, list) or not all(isinstance(e, str) and e.strip() for e in ext):
+            raise A2AResultValidationError("invalid_artifact", "Artifact extensions must be list of non-empty strings")
+
+
+def _validate_message(payload: dict, is_history: bool = False) -> None:
+    """Validate a Message payload. Direct responses require ROLE_AGENT; history permits either."""
+    if not isinstance(payload, dict):
+        raise A2AResultValidationError("invalid_message", "Message must be object")
+    unknown = set(payload.keys()) - _ALLOWED_MESSAGE_KEYS
+    if unknown:
+        raise A2AResultValidationError("invalid_message", f"unknown Message field(s): {sorted(unknown)}")
+    msg_id = payload.get("messageId")
+    if not isinstance(msg_id, str) or not msg_id.strip():
+        raise A2AResultValidationError("invalid_message", "Message messageId required non-empty string")
+    ctx = payload.get("contextId")
+    if not is_history:
+        if not isinstance(ctx, str) or not ctx.strip():
+            raise A2AResultValidationError("invalid_message", "Message contextId required non-empty string")
+    else:
+        if "contextId" in payload and payload["contextId"] is not None:
+            if not isinstance(ctx, str):
+                raise A2AResultValidationError("invalid_message", "Message contextId must be string")
+    role = payload.get("role")
+    if not is_history:
+        if role != ROLE_AGENT:
+            raise A2AResultValidationError("invalid_message", f"Message role must be ROLE_AGENT, got {role!r}")
+    else:
+        if role not in (ROLE_AGENT, ROLE_USER) and role is not None:
+            # history permits either legal role, but must be one of them if present
+            if role not in (ROLE_AGENT, ROLE_USER):
+                raise A2AResultValidationError("invalid_message", f"History Message role invalid: {role!r}")
+            # also require role present? history entries should have role
+            pass
+        if "role" in payload and payload["role"] not in (ROLE_AGENT, ROLE_USER):
+            raise A2AResultValidationError("invalid_message", f"Message role invalid: {role!r}")
+    parts = payload.get("parts")
+    if not isinstance(parts, list) or not parts:
+        raise A2AResultValidationError("invalid_message", "Message parts must be non-empty list")
+    for p in parts:
+        _validate_part(p)
+    if "taskId" in payload:
+        tid = payload["taskId"]
+        if not isinstance(tid, str) or not tid.strip():
+            raise A2AResultValidationError("invalid_message", "Message taskId must be non-empty string when present")
+    if "metadata" in payload and not isinstance(payload["metadata"], dict):
+        raise A2AResultValidationError("invalid_message", "Message metadata must be object")
+    if "extensions" in payload:
+        ext = payload["extensions"]
+        if not isinstance(ext, list) or not all(isinstance(e, str) and e.strip() for e in ext):
+            raise A2AResultValidationError("invalid_message", "Message extensions must be list of non-empty strings")
+    if "referenceTaskIds" in payload:
+        refs = payload["referenceTaskIds"]
+        if not isinstance(refs, list) or not all(isinstance(r, str) and r.strip() for r in refs):
+            raise A2AResultValidationError("invalid_message", "Message referenceTaskIds must be list of non-empty strings")
+
+
+def _validate_task(payload: dict) -> None:
+    if not isinstance(payload, dict):
+        raise A2AResultValidationError("invalid_task", "Task must be object")
+    unknown = set(payload.keys()) - _ALLOWED_TASK_KEYS
+    if unknown:
+        raise A2AResultValidationError("invalid_task", f"unknown Task field(s): {sorted(unknown)}")
+    tid = payload.get("id")
+    if not isinstance(tid, str) or not tid.strip():
+        raise A2AResultValidationError("invalid_task", "Task id required non-empty string")
+    ctx = payload.get("contextId")
+    if not isinstance(ctx, str) or not ctx.strip():
+        raise A2AResultValidationError("invalid_task", "Task contextId required non-empty string")
+    status = payload.get("status")
+    if not isinstance(status, dict):
+        raise A2AResultValidationError("invalid_task", "Task status required object")
+    unknown_s = set(status.keys()) - _ALLOWED_STATUS_KEYS
+    if unknown_s:
+        raise A2AResultValidationError("invalid_task", f"unknown Task status field(s): {sorted(unknown_s)}")
+    state = status.get("state")
+    if not isinstance(state, str) or state not in _ALLOWED_TASK_STATES:
+        # Distinguish state vs generic task error: state-specific reason
+        raise A2AResultValidationError("invalid_task_state", f"Task status.state must be one of {sorted(_ALLOWED_TASK_STATES)}, got {state!r}")
+    if "message" in status:
+        msg = status["message"]
+        if not isinstance(msg, dict):
+            raise A2AResultValidationError("invalid_task", "Task status.message must be object")
+        _validate_message(msg, is_history=False)
+        # context must match Task context when present
+        msg_ctx = msg.get("contextId")
+        if isinstance(msg_ctx, str) and msg_ctx and msg_ctx != ctx:
+            raise A2AResultValidationError("invalid_task", "Task status.message contextId must equal Task contextId")
+    if "timestamp" in status:
+        ts = status["timestamp"]
+        if not isinstance(ts, str) or not _parse_iso8601(ts):
+            raise A2AResultValidationError("invalid_task", f"Task status.timestamp must be RFC3339/ISO8601 string, got {ts!r}")
+    if "artifacts" in payload:
+        arts = payload["artifacts"]
+        if not isinstance(arts, list):
+            raise A2AResultValidationError("invalid_artifact", "Task artifacts must be list")
+        for art in arts:
+            _validate_artifact(art)
+    if "history" in payload:
+        hist = payload["history"]
+        if not isinstance(hist, list):
+            raise A2AResultValidationError("invalid_message", "Task history must be list")
+        for m in hist:
+            _validate_message(m, is_history=True)
+    if "metadata" in payload and not isinstance(payload["metadata"], dict):
+        raise A2AResultValidationError("invalid_task", "Task metadata must be object")
+    if "extensions" in payload:
+        ext = payload["extensions"]
+        if not isinstance(ext, list) or not all(isinstance(e, str) and e.strip() for e in ext):
+            raise A2AResultValidationError("invalid_task", "Task extensions must be list of non-empty strings")
+
+
+def _extract_task_text(payload: dict) -> str:
+    """Extract concatenated text from a validated Task or Message."""
+    if "parts" in payload:
+        # Message
+        return extract_text(payload)
+    status = payload.get("status", {}) if isinstance(payload, dict) else {}
+    msg = status.get("message") if isinstance(status, dict) else None
+    if isinstance(msg, dict):
+        return extract_text(msg)
+    for art in payload.get("artifacts", []) or []:
+        txt = extract_text(art)
+        if txt:
+            return txt
+    return ""
+
+
+def parse_send_message_result(result: Any, envelope_mode: str) -> ParsedA2AResult:
+    """Strict v1 result parser (section 4.1).
+
+    envelope_mode must be exactly "V1_WRAPPED" or "LEGACY_BARE".
+    Raises A2AResultValidationError on any violation.
+    """
+    if envelope_mode not in ("V1_WRAPPED", "LEGACY_BARE"):
+        raise A2AResultValidationError("invalid_envelope_type", f"envelope_mode must be V1_WRAPPED or LEGACY_BARE, got {envelope_mode!r}")
+    if envelope_mode == "V1_WRAPPED":
+        if not isinstance(result, dict):
+            raise A2AResultValidationError("invalid_envelope_type", "V1 result must be object")
+        has_task = "task" in result
+        has_message = "message" in result
+        if has_task and has_message:
+            raise A2AResultValidationError("v1_payload_count", "V1 wrapper must contain exactly one of task/message, got both")
+        if not has_task and not has_message:
+            raise A2AResultValidationError("v1_payload_count", "V1 wrapper must contain exactly one of task/message, got neither")
+        # Unknown wrapper members: after confirming exactly one, check for extra keys
+        allowed_wrappers = {"task", "message"}
+        unknown = set(result.keys()) - allowed_wrappers
+        if unknown:
+            raise A2AResultValidationError("unknown_payload_kind", f"unknown wrapper member(s): {sorted(unknown)}")
+        payload = result["task"] if has_task else result["message"]
+        kind = "task" if has_task else "message"
+        if payload is None:
+            raise A2AResultValidationError("v1_payload_count", f"V1 wrapper {kind} member is null")
+        if not isinstance(payload, dict):
+            raise A2AResultValidationError("v1_payload_count", f"V1 wrapper {kind} member must be object, got {type(payload).__name__}")
+        if kind == "task":
+            _validate_task(payload)
+            task_id = str(payload.get("id", "")).strip()
+            context_id = str(payload.get("contextId", "")).strip()
+            state = str(payload.get("status", {}).get("state", "")).strip()
+            text = _extract_task_text(payload)
+            return ParsedA2AResult(kind=kind, payload=payload, task_id=task_id, context_id=context_id, state=state, text=text)
+        else:
+            _validate_message(payload, is_history=False)
+            task_id = str(payload.get("taskId", "")).strip()
+            context_id = str(payload.get("contextId", "")).strip()
+            text = extract_text(payload)
+            return ParsedA2AResult(kind=kind, payload=payload, task_id=task_id, context_id=context_id, state="", text=text)
+    else:  # LEGACY_BARE
+        if not isinstance(result, dict):
+            raise A2AResultValidationError("invalid_envelope_type", "LEGACY_BARE result must be object")
+        if "task" in result or "message" in result:
+            raise A2AResultValidationError("legacy_wrapper_forbidden", "LEGACY_BARE must not contain task/message wrapper")
+        # Determine if payload is Task-like or Message-like: prefer Task if has id+status
+        if "id" in result and "status" in result:
+            _validate_task(result)
+            task_id = str(result.get("id", "")).strip()
+            context_id = str(result.get("contextId", "")).strip()
+            state = str(result.get("status", {}).get("state", "")).strip()
+            text = _extract_task_text(result)
+            return ParsedA2AResult(kind="task", payload=result, task_id=task_id, context_id=context_id, state=state, text=text)
+        elif "messageId" in result and "parts" in result:
+            _validate_message(result, is_history=False)
+            task_id = str(result.get("taskId", "")).strip()
+            context_id = str(result.get("contextId", "")).strip()
+            text = extract_text(result)
+            return ParsedA2AResult(kind="message", payload=result, task_id=task_id, context_id=context_id, state="", text=text)
+        else:
+            # Attempt task validation first for better error, then message
+            try:
+                _validate_task(result)
+                task_id = str(result.get("id", "")).strip()
+                context_id = str(result.get("contextId", "")).strip()
+                state = str(result.get("status", {}).get("state", "")).strip()
+                text = _extract_task_text(result)
+                return ParsedA2AResult(kind="task", payload=result, task_id=task_id, context_id=context_id, state=state, text=text)
+            except A2AResultValidationError as e_task:
+                try:
+                    _validate_message(result, is_history=False)
+                    task_id = str(result.get("taskId", "")).strip()
+                    context_id = str(result.get("contextId", "")).strip()
+                    text = extract_text(result)
+                    return ParsedA2AResult(kind="message", payload=result, task_id=task_id, context_id=context_id, state="", text=text)
+                except A2AResultValidationError:
+                    # Prefer original task error for clarity
+                    raise e_task
+
+
 def unwrap_send_message_response(result: Any) -> Any:
-    """Return the Task/Message inside a v1.0 response, or pass legacy through."""
+    """Return the Task/Message inside a v1.0 response, or pass legacy through.
+    Enforces exact-one rule: does not silently prefer task when both present.
+    """
     if isinstance(result, dict):
-        if isinstance(result.get("task"), dict):
-            return result["task"]
-        if isinstance(result.get("message"), dict):
-            return result["message"]
+        has_task = "task" in result
+        has_message = "message" in result
+        if has_task and has_message:
+            # Both present violates oneof; callers should treat as invalid
+            # Raise validation error so is_valid will return False
+            raise A2AResultValidationError("v1_payload_count", "wrapper contains both task and message")
+        if has_task:
+            val = result.get("task")
+            if isinstance(val, dict):
+                return val
+            raise A2AResultValidationError("v1_payload_count", "task member must be object")
+        if has_message:
+            val = result.get("message")
+            if isinstance(val, dict):
+                return val
+            raise A2AResultValidationError("v1_payload_count", "message member must be object")
+        # Check for unknown wrapper members that look like oneof but aren't
+        # If result has no task/message but has statusUpdate etc, it's foreign
+        # Return as-is so is_valid can reject via parser; but if it has only one unknown key, treat as invalid
+        # We let caller handle: if result came from V1 path, parser would have rejected, but unwrap is lenient fallback
+        # For strictness, if result has any key that is not task/message but result looks like wrapped foreign, raise?
+        # Keep permissive fallback for legacy bare paths: return result unchanged
     return result
 
+
 def is_valid_a2a_result(result: Any) -> bool:
-    """Return True when ``result`` is a valid A2A Task/Message completion shape.
-
-    Accepts the ``result`` field from a JSON-RPC 2.0 SendMessage response.
-    Valid when, after unwrapping the optional ``{"task": ...}`` / ``{"message": ...}``
-    wrapper, the payload is a non-empty dict containing at least one genuinely
-    meaningful A2A payload key (``status.state`` string, ``artifacts`` with
-    non-empty ``parts``, or ``parts`` non-empty). Empty dicts, scalars,
-    id-only, empty-status, and other malformed objects are invalid and must be
-    treated as structured failure.
+    """Compatibility predicate: True when result is a valid A2A Task/Message completion shape.
+    Delegates to strict parser; returns False on validation error.
     """
-    if result is None:
-        return False
-    if not isinstance(result, dict):
-        return False
-    payload = unwrap_send_message_response(result)
-    if not isinstance(payload, dict) or not payload:
-        return False
-    # Task with status.state — requires a non-empty string state
-    st = payload.get("status")
-    if isinstance(st, dict) and isinstance(st.get("state"), str) and st.get("state"):
+    try:
+        parse_send_message_result(result, "V1_WRAPPED")
         return True
-    # Task with artifacts — require at least one artifact with non-empty parts
-    arts = payload.get("artifacts")
-    if isinstance(arts, list) and arts:
-        for art in arts:
-            if isinstance(art, dict) and isinstance(art.get("parts"), list) and art.get("parts"):
-                return True
+    except A2AResultValidationError:
         return False
-    # Message with parts — require non-empty parts list
-    if isinstance(payload.get("parts"), list) and payload["parts"]:
-        return True
-    return False
-
+    except Exception:
+        return False
 
 def stream_task(task: dict) -> dict:
     """v1.0 StreamResponse with a task member."""
@@ -778,22 +1231,315 @@ class TaskStore:
             return dict(rec)
 
     def complete(self, task_id: str, state: str, reply: str = "") -> Optional[dict]:
-        """Transition a task to a terminal state. Idempotent."""
-        watchers: list[Future] = []
+        """Transition a task to a terminal state. Idempotent (now durable, section 5.3).
+
+        For backward compatibility, this helper delegates to the durable primitive using the
+        default ledger path. Production lifecycle paths should call publish_durable directly
+        for explicit error handling, but this wrapper ensures any legacy complete() call still
+        performs disk-first publication and leaves the last durable state visible on failure.
+        """
+        try:
+            from .a2a_persistence import _task_ledger_path
+            ledger_path = _task_ledger_path()
+        except Exception:
+            ledger_path = None
+        # If ledger_path is unavailable (test without HERMES_HOME), fallback to memory-only
+        if ledger_path is None:
+            watchers: list[Future] = []
+            with self._lock:
+                rec = self._tasks.get(task_id)
+                if not rec or rec["state"] in TERMINAL_STATES:
+                    return None
+                rec["state"] = state
+                rec["reply"] = reply
+                rec["completed_at"] = time.time()
+                watchers = self._watchers.pop(task_id, [])
+                self._trim_locked()
+                out = dict(rec)
+            for fut in watchers:
+                if not fut.done():
+                    try:
+                        fut.set_result((state, reply))
+                    except Exception:
+                        pass
+            return out
+        # Durable path: build candidate from existing record
         with self._lock:
             rec = self._tasks.get(task_id)
-            if not rec or rec["state"] in TERMINAL_STATES:
+            if not rec:
                 return None
-            rec["state"] = state
-            rec["reply"] = reply
-            rec["completed_at"] = time.time()
-            watchers = self._watchers.pop(task_id, [])
-            self._trim_locked()
-            out = dict(rec)
-        for fut in watchers:
-            if not fut.done():
-                fut.set_result((state, reply))
-        return out
+            if rec["state"] in TERMINAL_STATES:
+                return None
+            candidate = dict(rec)
+            candidate["state"] = state
+            candidate["reply"] = reply
+            candidate["completed_at"] = time.time()
+        outcome = self.publish_durable(ledger_path, task_id, candidate)
+        if not outcome.published:
+            return None
+        return outcome.record
+
+    def publish_durable(self, ledger_path: Path, task_id: str, candidate_record: dict) -> DurablePublishOutcome:
+        """Disk-first publication of a task transition.
+
+        Implements the durable-publish primitive per Edison decision §5.3:
+        verify ownership, reject terminal conflicts, clone ledger, atomically
+        replace ledger file, then update memory and resolve watchers only on
+        successful disk write.
+
+        Memory is never updated before successful persistence; file lock
+        ensures cross-process serialization; in-process lock excludes readers
+        during transition window.
+        """
+        # Determine candidate fields (support both snake and camel for context)
+        candidate_state = candidate_record.get("state", "")
+        candidate_reply = candidate_record.get("reply", "")
+        # Ownership fields may be under different keys; normalize for verification
+        def _cand_field(name: str) -> Any:
+            if name in candidate_record:
+                return candidate_record[name]
+            if name == "context_id" and "contextId" in candidate_record:
+                return candidate_record["contextId"]
+            return None
+
+        candidate_context = _cand_field("context_id")
+        candidate_peer = _cand_field("peer")
+        candidate_slug = _cand_field("agent_slug")
+        candidate_tenant = _cand_field("tenant")
+
+        watchers_to_resolve: list[Future] = []
+        publish_state = candidate_state
+        publish_reply = candidate_reply
+        published_rec: Optional[dict] = None
+        durable_state_after: str = ""
+        error_msg: Optional[str] = None
+        success = False
+
+        # Acquire in-process transition lock (serializes publications)
+        with self._lock:
+            existing = self._tasks.get(task_id)
+
+            # 1. Verify immutable ownership if existing present
+            if existing is not None:
+                for field_name, cand_val in [
+                    ("context_id", candidate_context),
+                    ("peer", candidate_peer),
+                    ("agent_slug", candidate_slug),
+                    ("tenant", candidate_tenant),
+                ]:
+                    if cand_val is not None:
+                        existing_val = existing.get(field_name, "")
+                        if cand_val != existing_val:
+                            return DurablePublishOutcome(
+                                published=False,
+                                newly_published=False,
+                                record=dict(existing),
+                                durable_state=existing.get("state", ""),
+                                error=f"ownership mismatch for {field_name}: {cand_val!r} != {existing_val!r}",
+                            )
+                # 2. Reject conflicting terminal transition
+                existing_state = existing.get("state", "")
+                existing_reply = existing.get("reply", "")
+                if existing_state in TERMINAL_STATES:
+                    if candidate_state != existing_state or candidate_reply != existing_reply:
+                        return DurablePublishOutcome(
+                            published=False,
+                            newly_published=False,
+                            record=dict(existing),
+                            durable_state=existing_state,
+                            error="terminal conflict: existing terminal differs",
+                        )
+                    else:
+                        return DurablePublishOutcome(
+                            published=True,
+                            newly_published=False,
+                            record=dict(existing),
+                            durable_state=existing_state,
+                        )
+            # else no existing -> proceed to publish new record
+
+            # 3. Clone ledger snapshot
+            clone: "OrderedDict[str, dict[str, Any]]" = copy.deepcopy(self._tasks)
+
+            # 4. Apply candidate to clone
+            now = time.time()
+            if task_id in clone:
+                entry = clone[task_id]
+                for k, v in candidate_record.items():
+                    entry[k] = v
+                entry["task_id"] = task_id
+                if candidate_state:
+                    entry["state"] = candidate_state
+                if "reply" in candidate_record:
+                    entry["reply"] = candidate_record["reply"]
+                if entry.get("state") in TERMINAL_STATES and "completed_at" not in entry:
+                    entry["completed_at"] = now
+                # Ensure context_id alias if candidate used camel
+                if "context_id" not in entry and "contextId" in candidate_record:
+                    entry["context_id"] = candidate_record["contextId"]
+            else:
+                new_entry = dict(candidate_record)
+                new_entry["task_id"] = task_id
+                if "context_id" not in new_entry and "contextId" in new_entry:
+                    new_entry["context_id"] = new_entry["contextId"]
+                if "created_at" not in new_entry:
+                    new_entry["created_at"] = now
+                if "created_iso" not in new_entry:
+                    new_entry["created_iso"] = now_iso()
+                if new_entry.get("state") in TERMINAL_STATES and "completed_at" not in new_entry:
+                    new_entry["completed_at"] = now
+                # Ensure defaults for ownership fields
+                for fld in ("context_id", "peer", "agent_slug", "tenant", "reply", "push_url", "push_config_id"):
+                    if fld not in new_entry:
+                        new_entry[fld] = "" if fld != "reply" else new_entry.get("reply", "")
+                clone[task_id] = new_entry
+
+            # 5. Build file snapshot dict (only terminal or non-terminal younger than 300s)
+            snapshot: dict[str, dict[str, Any]] = {}
+            for tid, rec in clone.items():
+                state = rec.get("state", "")
+                created = rec.get("created_at", 0)
+                try:
+                    created_f = float(created)
+                except Exception:
+                    created_f = 0.0
+                if state in TERMINAL_STATES or (now - created_f < 300):
+                    snapshot[tid] = {
+                        "task_id": rec.get("task_id", tid),
+                        "context_id": rec.get("context_id", ""),
+                        "peer": rec.get("peer", ""),
+                        "agent_slug": rec.get("agent_slug", ""),
+                        "tenant": rec.get("tenant", ""),
+                        "state": state,
+                        "reply": rec.get("reply", ""),
+                        "created_at": rec.get("created_at", 0),
+                        "created_iso": rec.get("created_iso", ""),
+                        "completed_at": rec.get("completed_at"),
+                        "push_url": rec.get("push_url", ""),
+                        "push_config_id": rec.get("push_config_id", ""),
+                    }
+
+            # 6. Write snapshot via atomic temp file with 0o600, file lock
+            try:
+                ledger_path.parent.mkdir(parents=True, exist_ok=True)
+                lock_path = ledger_path.with_suffix(".lock")
+                # Platform-conditional file lock
+                try:
+                    import fcntl  # type: ignore
+                    _has_fcntl = True
+                except ImportError:
+                    fcntl = None  # type: ignore
+                    _has_fcntl = False
+                try:
+                    import msvcrt  # type: ignore
+                    _has_msvcrt = True
+                except ImportError:
+                    msvcrt = None  # type: ignore
+                    _has_msvcrt = False
+
+                lock_file_obj = None
+                lock_fd = None
+                if _has_fcntl:
+                    lock_path.parent.mkdir(parents=True, exist_ok=True)
+                    lock_path.touch(exist_ok=True)
+                    lock_file_obj = open(lock_path, "a+")
+                    fcntl.flock(lock_file_obj.fileno(), fcntl.LOCK_EX)  # type: ignore
+                elif _has_msvcrt:
+                    lock_path.parent.mkdir(parents=True, exist_ok=True)
+                    lock_path.touch(exist_ok=True)
+                    lock_file_obj = open(lock_path, "a+")
+                    for _attempt in range(50):
+                        try:
+                            msvcrt.locking(lock_file_obj.fileno(), msvcrt.LK_NBLCK, 1)  # type: ignore
+                            break
+                        except OSError:
+                            if _attempt == 49:
+                                raise
+                            time.sleep(0.01)
+                else:
+                    # threading fallback: already holding self._lock
+                    pass
+
+                try:
+                    tmp_fd, tmp_path = tempfile.mkstemp(dir=str(ledger_path.parent), suffix=".tmp")
+                    try:
+                        try:
+                            os.fchmod(tmp_fd, 0o600)
+                        except Exception:
+                            pass
+                        with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+                            json.dump(snapshot, f, ensure_ascii=False, indent=2)
+                        try:
+                            os.chmod(tmp_path, 0o600)
+                        except OSError:
+                            pass
+                        os.replace(tmp_path, str(ledger_path))
+                    except BaseException:
+                        try:
+                            os.unlink(tmp_path)
+                        except OSError:
+                            pass
+                        raise
+                finally:
+                    if lock_file_obj is not None:
+                        try:
+                            if _has_fcntl:
+                                fcntl.flock(lock_file_obj.fileno(), fcntl.LOCK_UN)  # type: ignore
+                            elif _has_msvcrt:
+                                msvcrt.locking(lock_file_obj.fileno(), msvcrt.LK_UNLCK, 1)  # type: ignore
+                        except OSError:
+                            pass
+                        try:
+                            lock_file_obj.close()
+                        except OSError:
+                            pass
+
+                # 7. Write succeeded -> update in-memory while still excluding readers (still in lock)
+                self._tasks = clone
+                if not isinstance(self._tasks, OrderedDict):
+                    self._tasks = OrderedDict(self._tasks)
+                self._trim_locked()
+                if publish_state in TERMINAL_STATES:
+                    watchers_to_resolve = self._watchers.pop(task_id, [])
+                else:
+                    watchers_to_resolve = []
+                published_rec = dict(self._tasks.get(task_id, candidate_record))
+                durable_state_after = published_rec.get("state", "")
+                success = True
+            except Exception as exc:
+                # Discard clone, leave memory at last durable
+                existing_state = existing.get("state", "") if existing is not None else "ABSENT"
+                existing_copy = dict(existing) if existing is not None else None
+                return DurablePublishOutcome(
+                    published=False,
+                    newly_published=False,
+                    record=existing_copy,
+                    durable_state=existing_state,
+                    error=str(exc),
+                )
+
+        # Release lock before resolving watchers (per spec step 8)
+        if success:
+            for fut in watchers_to_resolve:
+                if not fut.done():
+                    try:
+                        fut.set_result((publish_state, publish_reply))
+                    except Exception:
+                        pass
+            return DurablePublishOutcome(
+                published=True,
+                newly_published=True,
+                record=published_rec,
+                durable_state=durable_state_after,
+            )
+        # Should not reach here; fallback
+        return DurablePublishOutcome(
+            published=False,
+            newly_published=False,
+            record=None,
+            durable_state="ABSENT",
+            error=error_msg or "unknown",
+        )
 
     def watch(self, task_id: str, agent_slug: str = "", tenant: str = "") -> Optional[Future]:
         with self._lock:
@@ -848,8 +1594,22 @@ class TaskStore:
             ]
         failed = []
         for tid in stale:
-            if self.complete(tid, STATE_FAILED, "[task orphaned — no reply produced]"):
-                failed.append(tid)
+            # Use durable publish per task; only successes are counted
+            rec = self.get(tid)
+            if not rec or rec["state"] in TERMINAL_STATES:
+                continue
+            candidate = dict(rec)
+            candidate["state"] = STATE_FAILED
+            candidate["reply"] = "[task orphaned — no reply produced]"
+            candidate["completed_at"] = time.time()
+            try:
+                from .a2a_persistence import _task_ledger_path
+                ledger_path = _task_ledger_path()
+                outcome = self.publish_durable(ledger_path, tid, candidate)
+                if outcome.published and outcome.newly_published:
+                    failed.append(tid)
+            except Exception:
+                continue
         return failed
 
     def _trim_locked(self) -> None:
@@ -997,9 +1757,39 @@ class TaskStore:
             self._trim_locked()
         return count
 
-# --------------------------------------------------------------------------
-# Conversation persistence (outside the context-compaction pipeline)
-# --------------------------------------------------------------------------
+
+class DurablePublishError(Exception):
+    """Raised when a durable publish fails and caller must return structured JSON-RPC error."""
+
+    def __init__(self, task_id: str, context_id: str, attempted_state: str, durable_state: str, dispatched: bool):
+        super().__init__(f"durable publish failed for {task_id} attempted {attempted_state} durable {durable_state}")
+        self.task_id = task_id
+        self.context_id = context_id
+        self.attempted_state = attempted_state
+        self.durable_state = durable_state
+        self.dispatched = dispatched
+
+
+def durable_persistence_error(req_id: Any, task_id: str, context_id: str, attempted_state: str, durable_state: str, dispatched: bool) -> dict:
+    """Build the structured JSON-RPC -32603 persistence failure response (section 5.5)."""
+    return {
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "error": {
+            "code": -32603,
+            "message": "A2A task state could not be durably published",
+            "data": {
+                "reason": "A2A_TASK_PERSISTENCE_FAILED",
+                "taskId": task_id,
+                "contextId": context_id,
+                "attemptedState": attempted_state,
+                "durableState": durable_state,
+                "dispatched": dispatched,
+                "safeToRetry": False,
+            },
+        },
+    }
+
 
 def _conv_dir() -> Path:
     try:

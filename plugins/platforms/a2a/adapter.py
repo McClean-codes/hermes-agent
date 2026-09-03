@@ -344,13 +344,13 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
         # delivery ID / application ACK protocol would close this gap but
         # is explicitly future work (see design decision 4).
         if not self._a2a_client_alive():
-            self.adapter._push_reply_after_client_gone(req_id, result)
+            self.adapter._push_reply_after_client_gone(req_id, result, is_v1=is_v1)
             self.close_connection = True
             return
         try:
             self._json(200, result)
         except OSError:
-            self.adapter._push_reply_after_client_gone(req_id, result)
+            self.adapter._push_reply_after_client_gone(req_id, result, is_v1=is_v1)
 
     def do_POST(self):  # noqa: N802
         adapter = self.adapter
@@ -1347,13 +1347,32 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
         msg_for_id = params.get("message") if isinstance(params, dict) else None
         message_id = str((msg_for_id.get("messageId") or "") if isinstance(msg_for_id, dict) else "").strip()
         if context_id and message_id and self._is_duplicate_inbound(context_id, message_id):
-            rec = self.tasks.create(task_id, context_id, peer, *self._scope_for_agent(agent))
-            self.tasks.complete(task_id, protocol.STATE_REJECTED, "")
-            _try_persist_task_ledger(self.tasks, _task_ledger_path(), f"REJECTED dedupe {task_id}")
+            # Durable immediate rejection via disk-first primitive (section 5.7)
+            agent_slug, tenant = self._scope_for_agent(agent)
+            _now = time.time()
+            _now_iso = protocol.now_iso()
+            _candidate = {
+                "task_id": task_id,
+                "context_id": context_id,
+                "peer": peer,
+                "agent_slug": agent_slug,
+                "tenant": tenant,
+                "state": protocol.STATE_REJECTED,
+                "reply": "",
+                "created_at": _now,
+                "created_iso": _now_iso,
+                "push_url": "",
+                "push_config_id": "",
+            }
+            _outcome = self.tasks.publish_durable(_task_ledger_path(), task_id, _candidate)
+            if not _outcome.published:
+                logger.error("A2A: failed to durably publish REJECTED dedupe for task %s: %s", task_id, _outcome.error)
+                raise protocol.DurablePublishError(task_id, context_id, protocol.STATE_REJECTED, _outcome.durable_state, False)
             logger.warning(
                 "A2A: duplicate inbound message %s on context %s within the dedupe window; rejecting",
                 message_id, context_id,
             )
+            rec = _outcome.record or _candidate
             return protocol.build_task(
                 task_id, context_id, protocol.STATE_REJECTED,
                 "Duplicate message.", created_at=rec["created_iso"],
@@ -1365,9 +1384,27 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
             protocol.metrics.anti_loop_triggers += 1
             logger.warning("A2A: anti-loop triggered for context %s (turn %d > %d)",
                            context_id, turn, protocol.max_pingpong_turns())
-            rec = self.tasks.create(task_id, context_id, peer, *self._scope_for_agent(agent))
-            self.tasks.complete(task_id, protocol.STATE_REJECTED, "")
-            _try_persist_task_ledger(self.tasks, _task_ledger_path(), f"REJECTED anti-loop {task_id}")
+            agent_slug, tenant = self._scope_for_agent(agent)
+            _now = time.time()
+            _now_iso = protocol.now_iso()
+            _candidate = {
+                "task_id": task_id,
+                "context_id": context_id,
+                "peer": peer,
+                "agent_slug": agent_slug,
+                "tenant": tenant,
+                "state": protocol.STATE_REJECTED,
+                "reply": "",
+                "created_at": _now,
+                "created_iso": _now_iso,
+                "push_url": "",
+                "push_config_id": "",
+            }
+            _outcome = self.tasks.publish_durable(_task_ledger_path(), task_id, _candidate)
+            if not _outcome.published:
+                logger.error("A2A: failed to durably publish REJECTED anti-loop for task %s: %s", task_id, _outcome.error)
+                raise protocol.DurablePublishError(task_id, context_id, protocol.STATE_REJECTED, _outcome.durable_state, False)
+            rec = _outcome.record or _candidate
             return protocol.build_task(
                 task_id, context_id, protocol.STATE_REJECTED,
                 f"Anti-loop protection: context {context_id} exceeded "
@@ -1377,9 +1414,27 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
             ), None
 
         if not text:
-            rec = self.tasks.create(task_id, context_id, peer, *self._scope_for_agent(agent))
-            self.tasks.complete(task_id, protocol.STATE_REJECTED, "")
-            _try_persist_task_ledger(self.tasks, _task_ledger_path(), f"REJECTED empty {task_id}")
+            agent_slug, tenant = self._scope_for_agent(agent)
+            _now = time.time()
+            _now_iso = protocol.now_iso()
+            _candidate = {
+                "task_id": task_id,
+                "context_id": context_id,
+                "peer": peer,
+                "agent_slug": agent_slug,
+                "tenant": tenant,
+                "state": protocol.STATE_REJECTED,
+                "reply": "",
+                "created_at": _now,
+                "created_iso": _now_iso,
+                "push_url": "",
+                "push_config_id": "",
+            }
+            _outcome = self.tasks.publish_durable(_task_ledger_path(), task_id, _candidate)
+            if not _outcome.published:
+                logger.error("A2A: failed to durably publish REJECTED empty for task %s: %s", task_id, _outcome.error)
+                raise protocol.DurablePublishError(task_id, context_id, protocol.STATE_REJECTED, _outcome.durable_state, False)
+            rec = _outcome.record or _candidate
             return protocol.build_task(
                 task_id, context_id, protocol.STATE_REJECTED,
                 "Empty task — nothing to do.", created_at=rec["created_iso"],
@@ -1390,7 +1445,6 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
         protocol.persist_message(context_id, "user", text, task_id)
         protocol.metrics.inbound_total += 1
 
-        rec = self.tasks.create(task_id, context_id, peer, *self._scope_for_agent(agent))
         # Bind the session identity for this A2A context so session-aware
         # tooling (task auto-subscription, notifier routing) can send
         # notifications back to the peer's context. ContextVars (NOT a
@@ -1431,50 +1485,80 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
                 _persist_context_peers(_merge_context_peers(_load_context_peers(), {context_id: peer}, _MAX_CONTEXT_PEERS))
         self._register_inline_push(task_id, params, agent=agent)
 
-        # Write-ahead: set WORKING and durably persist BEFORE any agent/origin dispatch.
-        # This must happen before both local and routed/non-local dispatch so that a
-        # crash during the forwarded subprocess cannot lose the WORKING record.
-        # If persistence fails, fail closed — do not dispatch.
-        self.tasks.set_state(task_id, protocol.STATE_WORKING)
-        if not _try_persist_task_ledger(self.tasks, _task_ledger_path(), f"WORKING {task_id}"):
-            try: self.tasks.complete(task_id, protocol.STATE_FAILED, "[persist failed at WORKING]")
-            except Exception: pass
-            _try_persist_task_ledger(self.tasks, _task_ledger_path(), f"FAILED after WORKING fail {task_id}")
+        # Write-ahead: durably create WORKING before any dispatch (disk-first, section 5.7).
+        # The task ledger is the authority; memory is updated only after successful disk write.
+        # If the write fails, the task remains ABSENT and dispatch is not invoked.
+        _agent_slug, _tenant = self._scope_for_agent(agent)
+        _now = time.time()
+        _now_iso = protocol.now_iso()
+        _candidate_working = {
+            "task_id": task_id,
+            "context_id": context_id,
+            "peer": peer,
+            "agent_slug": _agent_slug,
+            "tenant": _tenant,
+            "state": protocol.STATE_WORKING,
+            "reply": "",
+            "created_at": _now,
+            "created_iso": _now_iso,
+            "push_url": "",
+            "push_config_id": "",
+        }
+        # If an inline push config was registered, capture it into the candidate
+        # (the config is stored via set_push_config which mutates the record; for WORKING
+        # we need to include it if present in the store after registration — but since the
+        # record is not yet in the store, we keep push_url empty and let the later push_config
+        # handling update via separate durable publish if needed. The store's publish will create the record.)
+        _outcome_working = self.tasks.publish_durable(_task_ledger_path(), task_id, _candidate_working)
+        if not _outcome_working.published:
+            logger.error("A2A: failed to durably publish WORKING for task %s: %s", task_id, _outcome_working.error)
             protocol.metrics.tasks_failed += 1
             if _session_tokens:
                 try: _reset_worker_session_vars()
                 except Exception: pass
-            return protocol.build_task(task_id, context_id, protocol.STATE_FAILED, "Task persistence failed — not dispatched.", created_at=rec["created_iso"]), None
+            # Fail closed: no dispatch, structured persistence error. The caller (task_routing) will map this to -32603.
+            raise protocol.DurablePublishError(task_id, context_id, protocol.STATE_WORKING, _outcome_working.durable_state, False)
+        rec = _outcome_working.record or _candidate_working
 
         if not agent.get("local", True):
             try:
                 reply, state = self._forward_to_profile(agent, peer, context_id, framed, task_id)
-                self.tasks.complete(task_id, state, reply)
-                # Fail-closed terminal persistence for forwarded path: if durable write
-                # fails, caller must not receive a successful terminal result.
-                if not _try_persist_task_ledger(self.tasks, _task_ledger_path(), f"forwarded {state} {task_id}"):
-                    logger.error("A2A: failed to persist forwarded terminal %s for task %s — returning indeterminate failure", state, task_id)
+                # Durable publish for forwarded completion (central commit, section 5.4)
+                _candidate_fwd = dict(rec)
+                _candidate_fwd["state"] = state
+                _candidate_fwd["reply"] = reply
+                _candidate_fwd["completed_at"] = time.time()
+                _outcome_fwd = self.tasks.publish_durable(_task_ledger_path(), task_id, _candidate_fwd)
+                if not _outcome_fwd.published:
+                    logger.error("A2A: failed to durably publish forwarded terminal %s for task %s: %s", state, task_id, _outcome_fwd.error)
                     protocol.metrics.tasks_failed += 1
-                    # Return failure to caller so they know durable state is indeterminate.
-                    # Memory is already terminal; disk remains WORKING — evidence of failure.
-                    return protocol.build_task(task_id, context_id, protocol.STATE_FAILED, "Task terminal persistence failed — state indeterminate.", created_at=rec["created_iso"]), None
-                protocol.persist_message(context_id, "agent", reply, task_id)
-                security.audit("outbound", peer, task_id, reply, context_id=context_id)
-                if state == protocol.STATE_COMPLETED:
-                    protocol.metrics.outbound_total += 1
-                    protocol.metrics.tasks_completed += 1
-                else:
-                    protocol.metrics.tasks_failed += 1
-                self._send_push_notification(task_id, context_id, reply, state)
+                    raise protocol.DurablePublishError(task_id, context_id, state, _outcome_fwd.durable_state, True)
+                # Post-commit side effects only after durable publish (section 5.4)
+                if _outcome_fwd.newly_published:
+                    protocol.persist_message(context_id, "agent", reply, task_id)
+                    security.audit("outbound", peer, task_id, reply, context_id=context_id)
+                    if state == protocol.STATE_COMPLETED:
+                        protocol.metrics.outbound_total += 1
+                        protocol.metrics.tasks_completed += 1
+                    else:
+                        protocol.metrics.tasks_failed += 1
+                    self._send_push_notification(task_id, context_id, reply, state)
                 return protocol.build_task(task_id, context_id, state, reply, created_at=rec["created_iso"]), None
             finally:
                 if _session_tokens:
                     _reset_worker_session_vars()
 
         if self._loop is None or self._message_handler is None:
-            self.tasks.complete(task_id, protocol.STATE_FAILED, "")
-            _try_persist_task_ledger(self.tasks, _task_ledger_path(), f"FAILED gateway-not-ready {task_id}")
-            protocol.metrics.tasks_failed += 1
+            _candidate_gw = dict(rec)
+            _candidate_gw["state"] = protocol.STATE_FAILED
+            _candidate_gw["reply"] = ""
+            _candidate_gw["completed_at"] = time.time()
+            _outcome_gw = self.tasks.publish_durable(_task_ledger_path(), task_id, _candidate_gw)
+            if not _outcome_gw.published:
+                logger.error("A2A: failed to durably publish FAILED gateway-not-ready for task %s: %s", task_id, _outcome_gw.error)
+                raise protocol.DurablePublishError(task_id, context_id, protocol.STATE_FAILED, _outcome_gw.durable_state, True)
+            if _outcome_gw.newly_published:
+                protocol.metrics.tasks_failed += 1
             return protocol.build_task(
                 task_id, context_id, protocol.STATE_FAILED,
                 "Agent gateway not ready to accept A2A tasks.",
@@ -1509,9 +1593,16 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
                 pass
             self._pop_pending(task_id)
             msg = security.redact_outbound(f"Dispatch failed: {e}")
-            self.tasks.complete(task_id, protocol.STATE_FAILED, msg)
-            _try_persist_task_ledger(self.tasks, _task_ledger_path(), f"FAILED dispatch fail {task_id}")
-            protocol.metrics.tasks_failed += 1
+            _candidate_disp = dict(rec)
+            _candidate_disp["state"] = protocol.STATE_FAILED
+            _candidate_disp["reply"] = msg
+            _candidate_disp["completed_at"] = time.time()
+            _outcome_disp = self.tasks.publish_durable(_task_ledger_path(), task_id, _candidate_disp)
+            if not _outcome_disp.published:
+                logger.error("A2A: failed to durably publish FAILED dispatch for task %s: %s", task_id, _outcome_disp.error)
+                raise protocol.DurablePublishError(task_id, context_id, protocol.STATE_FAILED, _outcome_disp.durable_state, True)
+            if _outcome_disp.newly_published:
+                protocol.metrics.tasks_failed += 1
             return protocol.build_task(
                 task_id, context_id, protocol.STATE_FAILED, msg,
                 created_at=rec["created_iso"],
@@ -1845,35 +1936,41 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
             context_id=pending["context_id"],
         )
 
-    def _try_push_reply(self, pending: dict, state: str, reply: str) -> bool:
+    def _try_push_reply(self, pending: dict, state: str, reply: str):
         """Push a completed reply out-of-band, dedupe-guarded.
 
-        Returns True when the reply was pushed (or a concurrent path already
-        pushed it). Never raises into the caller. Propagates structured
-        failure when the underlying push returns False (malformed result,
-        transport error, stale peer).
+        Returns PushOutcome or bool. Propagates structured failure without collapsing to success.
         """
         if state not in (protocol.STATE_COMPLETED, protocol.STATE_INPUT_REQUIRED) or not reply:
-            return False
+            return protocol.PushOutcome(success=False, category="routing", error="no reply to push")
         with self._pending_lock:
             if pending.get("pushed"):
-                return True
+                return protocol.PushOutcome(success=True, category="transport", error="")
             pending["pushed"] = True
         try:
-            ok = self._push_out_of_band(pending["context_id"], reply, want_reply=True)
-            if ok is False:
+            outcome = self._push_out_of_band(pending["context_id"], reply, want_reply=True)
+            # outcome may be PushOutcome or bool (for backward compat)
+            if isinstance(outcome, protocol.PushOutcome):
+                if not outcome.success:
+                    logger.warning(
+                        "A2A: out-of-band push for task %s returned failure %s: %s",
+                        pending.get("task_id"), outcome.category, outcome.error,
+                    )
+                    return outcome
+                return outcome
+            if outcome is False:
                 logger.warning(
                     "A2A: out-of-band push for task %s returned failure (malformed result or transport)",
                     pending.get("task_id"),
                 )
-                return False
+                return protocol.PushOutcome(success=False, category="transport", error="push returned False")
+            return protocol.PushOutcome(success=True, category="transport", error="")
         except Exception as exc:
             logger.warning(
                 "A2A: out-of-band push for task %s failed: %s",
                 pending.get("task_id"), exc,
             )
-            return False
-        return True
+            return protocol.PushOutcome(success=False, category="transport", error=str(exc))
 
     def _is_duplicate_inbound(self, context_id: str, message_id: str) -> bool:
         """Windowed (contextId, messageId) dedupe.
@@ -2015,31 +2112,38 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
                         if not order:
                             self._pending_order.pop(chat_id, None)
                     self._pending.pop(task_id_via_thread, None)
+                    _thread_outcome = None
                     try:
-                        self.tasks.complete(task_id_via_thread, protocol.STATE_COMPLETED, content or "")
-                        ok = _try_persist_task_ledger(self.tasks, _task_ledger_path(), f"COMPLETED send thread_id {task_id_via_thread}")
-                        if not ok:
-                            logger.error(
-                                "A2A: failed to persist COMPLETED state for task %s (send thread_id path) — state indeterminate",
-                                task_id_via_thread,
-                            )
-                            # Fail-closed: force FAILED indeterminate in memory so GetTask does not claim durable success
-                            try:
-                                with self.tasks._lock:
-                                    rec = self.tasks._tasks.get(task_id_via_thread)
-                                    if rec is not None:
-                                        rec["state"] = protocol.STATE_FAILED
-                                        rec["reply"] = "[terminal persistence failed — state indeterminate]"
-                                _try_persist_task_ledger(self.tasks, _task_ledger_path(), f"FAILED after send persist fail {task_id_via_thread}")
-                            except Exception:
-                                pass
+                        # Use durable publish for thread-authority completion (section 5.3)
+                        _rec_thr = self.tasks.get(task_id_via_thread)
+                        if _rec_thr is None:
+                            logger.warning("A2A: thread send for unknown task %s", task_id_via_thread)
+                        else:
+                            _candidate_thr = dict(_rec_thr)
+                            _candidate_thr["state"] = protocol.STATE_COMPLETED
+                            _candidate_thr["reply"] = content or ""
+                            _candidate_thr["completed_at"] = time.time()
+                            _thread_outcome = self.tasks.publish_durable(_task_ledger_path(), task_id_via_thread, _candidate_thr)
+                            if not _thread_outcome.published:
+                                logger.error(
+                                    "A2A: failed to durably publish COMPLETED for thread task %s: %s",
+                                    task_id_via_thread, _thread_outcome.error,
+                                )
                     except Exception:
                         logger.error(
                             "A2A: failed to complete task %s via thread_id path", task_id_via_thread, exc_info=True,
                         )
+                        _thread_outcome = None
+                    # Thread-authority: if publish failed, keep WORKING and return failed SendResult (no success side effects)
+                    if _thread_outcome is not None and not _thread_outcome.published:
+                        return SendResult(success=False, message_id=message_id, error="A2A task state could not be durably published")
                     _resolved_via_thread = True
             if _resolved_via_thread:
-                return SendResult(success=True, message_id=message_id)
+                # Only return success if durable publish succeeded (or was not needed)
+                if _thread_outcome is None or _thread_outcome.published:
+                    return SendResult(success=True, message_id=message_id)
+                else:
+                    return SendResult(success=False, message_id=message_id, error="durability failure")
             # Store path: disconnected task still WORKING in TaskStore — finalize the specific record
             try:
                 rec_thr = self.tasks.get(task_id_via_thread)
@@ -2081,28 +2185,81 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
         if not (metadata or {}).get("notify"):
             logger.debug("A2A: ignoring non-final send for context %s", chat_id)
             return SendResult(success=True, message_id=message_id)
-        if self._resolve_oldest_for_context(chat_id, protocol.STATE_COMPLETED, content or ""):
-            return SendResult(success=True, message_id=message_id)
-        # Task authority fallback: when the client disconnected but the agent
-        # completed (defer_finalization=True), the original task record is
-        # still non-terminal in the task store.  Finalize it here instead of
-        # creating a new task — the original task ID/state is the
-        # authoritative completed record.
-        existing_task = self._find_existing_nonterminal_task(chat_id)
-        if existing_task is not None:
-            task_id = existing_task["task_id"]
-            logger.info(
-                "A2A: late completion for disconnected task %s (context %s) — "
-                "finalizing original task record",
-                task_id, chat_id,
-            )
-            self._finalize_task(
-                {"task_id": task_id, "context_id": chat_id, "peer": existing_task.get("peer", ""),
-                 "started": existing_task.get("created_at", time.time()), "created_iso": existing_task.get("created_iso", "")},
-                protocol.STATE_COMPLETED, content or "",
-                audit_direction="push",
-            )
-            return SendResult(success=True, message_id=message_id)
+        # Exact task authority per section 6.2/6.3: HERMES_SESSION_THREAD_ID and reply_to are sole candidates;
+        # stale values must fail without FIFO fallback. Context-only fallback is allowed only when exactly one
+        # active task exists in the context.
+        # If thread_id was provided but not resolved, fail fast (no FIFO fallback)
+        if task_id_via_thread:
+            # Thread_id was sole candidate and both pending and TaskStore paths failed — stale or mismatched
+            logger.warning("A2A: thread_id %s not found/active for context %s — failing without fallback", task_id_via_thread, chat_id)
+            return SendResult(success=False, message_id=message_id, error="task not found for thread_id")
+        if reply_to and str(reply_to).strip():
+            # reply_to was sole candidate and failed — stale
+            logger.warning("A2A: reply_to %s not found/active for context %s — failing without fallback", reply_to, chat_id)
+            return SendResult(success=False, message_id=message_id, error="task not found for reply_to")
+        # Context-only selection: count active tasks in this context
+        _active_candidates = []
+        with self._pending_lock:
+            for _tid, (_ctx, _fut) in list(self._pending.items()):
+                if _ctx == chat_id and not _fut.done():
+                    _active_candidates.append(_tid)
+        # Also check TaskStore non-terminal tasks not already in pending
+        for _tid, _rec in list(self.tasks._tasks.items()):
+            if _rec.get("context_id") == chat_id and _rec.get("state") not in protocol.TERMINAL_STATES:
+                if _tid not in _active_candidates:
+                    _active_candidates.append(_tid)
+        if len(_active_candidates) == 0:
+            # No active task — will go to out-of-band path below
+            pass
+        elif len(_active_candidates) == 1:
+            _tid = _active_candidates[0]
+            # Try pending first
+            with self._pending_lock:
+                _ent = self._pending.get(_tid)
+                if _ent and _ent[0] == chat_id and not _ent[1].done():
+                    try:
+                        _ent[1].set_result((protocol.STATE_COMPLETED, content or ""))
+                    except Exception:
+                        pass
+                    _order = self._pending_order.get(chat_id)
+                    if _order is not None:
+                        try:
+                            _order.remove(_tid)
+                        except ValueError:
+                            pass
+                        if not _order:
+                            self._pending_order.pop(chat_id, None)
+                    self._pending.pop(_tid, None)
+                    # Durable publish for the resolved pending task
+                    try:
+                        _rec = self.tasks.get(_tid)
+                        if _rec:
+                            _cand = dict(_rec)
+                            _cand["state"] = protocol.STATE_COMPLETED
+                            _cand["reply"] = content or ""
+                            _cand["completed_at"] = time.time()
+                            _out = self.tasks.publish_durable(_task_ledger_path(), _tid, _cand)
+                            if not _out.published:
+                                return SendResult(success=False, message_id=message_id, error="durability failure")
+                    except Exception:
+                        pass
+                    return SendResult(success=True, message_id=message_id)
+            # TaskStore fallback for the single active task
+            try:
+                _rec = self.tasks.get(_tid)
+                if _rec and _rec.get("context_id") == chat_id and _rec.get("state") not in protocol.TERMINAL_STATES:
+                    logger.info("A2A: completing single active task %s for context %s via context-only fallback", _tid, chat_id)
+                    self._finalize_task(
+                        {"task_id": _tid, "context_id": chat_id, "peer": _rec.get("peer", ""), "started": _rec.get("created_at", time.time()), "created_iso": _rec.get("created_iso", "")},
+                        protocol.STATE_COMPLETED, content or "", audit_direction="push",
+                    )
+                    return SendResult(success=True, message_id=message_id)
+            except Exception:
+                pass
+        else:
+            # More than one active task — ambiguous, fail without selecting FIFO
+            logger.warning("A2A: ambiguous task authority for context %s: %d active tasks", chat_id, len(_active_candidates))
+            return SendResult(success=False, message_id=message_id, error="ambiguous task authority for context")
         # No waiter (e.g. a late chunk or out-of-band send) — push the message
         # back to the peer that owns this context as a NEW task, reusing the
         # same contextId so it lands in the caller's session (session
@@ -2308,42 +2465,58 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
         if tenant:
             rpc_body["params"]["tenant"] = tenant
         resp = None
-        success = False
+        _push_outcome: protocol.PushOutcome = protocol.PushOutcome(success=False, category="transport", error="unknown")
         try:
             resp = a2a_tools._http_post_json(rpc_url, rpc_body, headers, timeout, allowed_origins=allowed)
             if isinstance(resp, dict) and "error" in resp:
                 logger.warning("A2A: out-of-band push for context %s got JSON-RPC error: %s", context_id, resp["error"])
-                success = False
+                _push_outcome = protocol.PushOutcome(success=False, category="jsonrpc", error=str(resp["error"]), payload=resp.get("error"))
             elif resp is None or not isinstance(resp, dict):
                 logger.warning("A2A: out-of-band push for context %s got invalid response: %r", context_id, resp)
-                success = False
-            elif not protocol.is_valid_a2a_result(resp.get("result")):
-                logger.warning("A2A: out-of-band push for context %s got malformed/invalid result: %r", context_id, resp.get("result"))
-                success = False
+                _push_outcome = protocol.PushOutcome(success=False, category="transport", error=f"invalid response: {resp!r}")
             else:
-                success = True
+                # Strict V1 parsing for push result
+                try:
+                    _parsed = protocol.parse_send_message_result(resp.get("result"), "V1_WRAPPED")
+                    _push_outcome = protocol.PushOutcome(success=True, category="transport", error="", payload=_parsed.payload)
+                except protocol.A2AResultValidationError as ve:
+                    logger.warning("A2A: out-of-band push for context %s got malformed/invalid result: %r (%s)", context_id, resp.get("result"), ve.reason)
+                    _push_outcome = protocol.PushOutcome(success=False, category="invalid_response", error=f"{ve.reason}: {ve.detail}", payload=None)
         except Exception as exc:
             logger.warning("A2A: out-of-band push for context %s failed: %s", context_id, exc)
-            success = False
+            _push_outcome = protocol.PushOutcome(success=False, category="transport", error=str(exc))
         finally:
             protocol.persist_message(context_id, "agent", text)
             security.audit("push", peer, rpc_body["id"], text, context_id=context_id)
-            if success:
+            if _push_outcome.success:
                 logger.info("A2A: pushed out-of-band reply for context %s to peer %s", context_id, peer)
             else:
-                logger.warning("A2A: out-of-band push for context %s to peer %s failed or got invalid result", context_id, peer)
-        if not success:
-            return False
-        if want_reply and resp is not None:
+                logger.warning("A2A: out-of-band push for context %s to peer %s failed or got invalid result: %s", context_id, peer, _push_outcome.error)
+        if not _push_outcome.success:
+            return _push_outcome
+        if want_reply and resp is not None and _push_outcome.payload is not None:
             # Round-trip: the peer answered inside the push's HTTP
-            # response — a verdict arriving this way was previously
-            # discarded exactly here. Surface
-            # a non-empty reply into the LOCAL gateway as an inbound message
-            # on the same contextId, the exact path a remote push would take
-            # (wrap_inbound framing + origin-session wake). Never raises into
-            # the push caller.
+            # response — surface non-empty reply into LOCAL gateway.
+            # Use validated payload text, not second permissive unwrap.
             try:
-                reply = a2a_tools._reply_text_from_result(resp.get("result"))
+                _validated = _push_outcome.payload
+                if isinstance(_validated, dict) and "parts" in _validated:
+                    reply = protocol.extract_text(_validated)
+                else:
+                    # Task: extract from status.message or artifacts
+                    reply = ""
+                    if isinstance(_validated, dict):
+                        status = _validated.get("status", {}) or {}
+                        msg = status.get("message") if isinstance(status, dict) else None
+                        if isinstance(msg, dict):
+                            reply = protocol.extract_text(msg)
+                        if not reply:
+                            for art in _validated.get("artifacts", []) or []:
+                                reply = protocol.extract_text(art)
+                                if reply:
+                                    break
+                        if not reply:
+                            reply = a2a_tools._reply_text_from_result(_validated)
                 if reply:
                     self._push_loopback_in_process(context_id, peer, reply, want_reply=True)
             except Exception as exc:
@@ -2352,7 +2525,7 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
                     context_id, exc,
                 )
 
-        return True
+        return _push_outcome
 
     def _drop_unresolvable_reply(self, context_id: str, peer: str) -> None:
         """Loud failure for a reply push with no resolvable external target.
@@ -2373,31 +2546,31 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
             context_id, peer,
         )
 
-    def _push_reply_after_client_gone(self, req_id: Any, result: Optional[dict]) -> None:
+    def _push_reply_after_client_gone(self, req_id: Any, result: Optional[dict], is_v1: bool = True) -> None:
         """Deliver a completed reply whose HTTP client disconnected first.
 
-        Safety net for the blocking message/send path: the peer's
-        ``a2a_call`` client can time out (120s) and close the connection
-        while the agent is still working; the reply then resolves the stale
-        pending task and the JSON-RPC response write hits the closed socket
-        (a round-2 drop: a reply was consumed by a dead waiter and
-        written into a dead connection — the caller's session never woke).
-        The liveness probe in ``_rpc_message_send`` pops the stale waiter in
-        the common case; this catches the probe-race window where the client
-        dies between the last probe and the response write. Push the reply
-        out-of-band on the same contextId (the no-waiter path), so the
-        caller's session still receives it.
-
-        Only COMPLETED / INPUT_REQUIRED replies with text are pushed —
-        failed or empty tasks carry nothing worth delivering out-of-band.
+        Safety net for the blocking message/send path. Validates via strict parser
+        before extracting, using the originating request dialect (is_v1) to select
+        envelope mode. Returns/logs failed PushOutcome without success audit.
         """
         try:
             inner = (result or {}).get("result")
-            task = protocol.unwrap_send_message_response(inner)
-            if not isinstance(task, dict):
+            # Validate before extracting (section 4.7) — use originating dialect
+            _mode = "V1_WRAPPED" if is_v1 else "LEGACY_BARE"
+            try:
+                _parsed = protocol.parse_send_message_result(inner, _mode)
+            except protocol.A2AResultValidationError as ve:
+                logger.warning("A2A: rescue found invalid result for req %s: %s (%s)", req_id, ve.reason, ve.detail)
                 return
-            context_id = str(task.get("contextId") or "").strip()
-            state = str((task.get("status") or {}).get("state") or "").strip()
+            # Only COMPLETED / INPUT_REQUIRED with text are pushed
+            if _parsed.kind == "task":
+                context_id = _parsed.context_id
+                state = _parsed.state
+                reply = _parsed.text
+            else:
+                # Message result — not a task terminal for rescue path; treat as not pushable
+                logger.debug("A2A: rescue got message result, not task terminal, skipping")
+                return
             if not context_id or state not in (
                 protocol.STATE_COMPLETED, protocol.STATE_INPUT_REQUIRED,
             ):
@@ -2406,18 +2579,19 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
                     context_id, state,
                 )
                 return
-            reply = protocol.extract_text((task.get("status") or {}).get("message", {}) or {})
             if not reply:
                 return
             # Session-reply rescue: want_reply=True so the peer's
             # answer to this pushed reply re-enters our session from the
             # push's HTTP response instead of being discarded.
             # Propagate push failure — do not silently claim success.
-            ok = self._push_out_of_band(context_id, reply, want_reply=True)
-            if ok is False:
+            outcome = self._push_out_of_band(context_id, reply, want_reply=True)
+            # outcome may be PushOutcome or bool
+            _success = outcome.success if isinstance(outcome, protocol.PushOutcome) else bool(outcome)
+            if not _success:
                 logger.warning(
-                    "A2A: rescue push for context %s failed — reply not delivered (want_reply=True)",
-                    context_id,
+                    "A2A: rescue push for context %s failed — reply not delivered (want_reply=True): %s",
+                    context_id, getattr(outcome, 'error', '') if isinstance(outcome, protocol.PushOutcome) else 'unknown',
                 )
                 return
             logger.info(
