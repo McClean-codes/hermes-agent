@@ -24,6 +24,7 @@ import base64
 import copy
 import json
 import os
+import errno
 import re
 import tempfile
 import threading
@@ -1089,6 +1090,9 @@ class TaskStore:
         self._tasks: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
         self._watchers: dict[str, list[Future]] = {}
         self._lock = threading.Lock()
+        # Amendment C: ledger availability flag for post-replace directory fsync fail-closed.
+        self._ledger_unavailable: bool = False
+        self._ledger_unavailable_reason: str = ""
 
     @staticmethod
     def _in_scope(rec: dict, agent_slug: str = "", tenant: str = "") -> bool:
@@ -1183,6 +1187,8 @@ class TaskStore:
 
     def get(self, task_id: str, agent_slug: str = "", tenant: str = "") -> Optional[dict]:
         with self._lock:
+            if getattr(self, "_ledger_unavailable", False):
+                return None
             rec = self._tasks.get(task_id)
             if not rec or not self._in_scope(rec, agent_slug, tenant):
                 return None
@@ -1240,10 +1246,12 @@ class TaskStore:
     def publish_durable(self, ledger_path: Path, task_id: str, candidate_record: dict) -> DurablePublishOutcome:
         """Disk-first publication of a task transition.
 
-        Implements the durable-publish primitive per Edison decision §5.3:
-        verify ownership, reject terminal conflicts, clone ledger, atomically
-        replace ledger file, then update memory and resolve watchers only on
-        successful disk write.
+        Implements the durable-publish primitive per Edison decision §5.3 and
+        Amendment C/E:
+        verify ownership against disk, reject terminal conflicts/dedupe against
+        disk, clone ledger, atomically replace ledger via temp file with
+        mandatory flush/fsync, directory fsync classification, and same-task
+        terminal authority under per-ledger file lock.
 
         Memory is never updated before successful persistence; file lock
         ensures cross-process serialization; in-process lock excludes readers
@@ -1275,48 +1283,12 @@ class TaskStore:
 
         # Acquire in-process transition lock (serializes publications)
         with self._lock:
-            existing = self._tasks.get(task_id)
+            # Remember existing in-memory for fallback durable_state if needed
+            existing_mem = self._tasks.get(task_id)
+            existing_mem_state = existing_mem.get("state", "") if existing_mem is not None else "ABSENT"
+            existing_mem_copy = dict(existing_mem) if existing_mem is not None else None
 
-            # 1. Verify immutable ownership if existing present
-            if existing is not None:
-                for field_name, cand_val in [
-                    ("context_id", candidate_context),
-                    ("peer", candidate_peer),
-                    ("agent_slug", candidate_slug),
-                    ("tenant", candidate_tenant),
-                ]:
-                    if cand_val is not None:
-                        existing_val = existing.get(field_name, "")
-                        if cand_val != existing_val:
-                            return DurablePublishOutcome(
-                                published=False,
-                                newly_published=False,
-                                record=dict(existing),
-                                durable_state=existing.get("state", ""),
-                                error=f"ownership mismatch for {field_name}: {cand_val!r} != {existing_val!r}",
-                            )
-                # 2. Reject conflicting terminal transition
-                existing_state = existing.get("state", "")
-                existing_reply = existing.get("reply", "")
-                if existing_state in TERMINAL_STATES:
-                    if candidate_state != existing_state or candidate_reply != existing_reply:
-                        return DurablePublishOutcome(
-                            published=False,
-                            newly_published=False,
-                            record=dict(existing),
-                            durable_state=existing_state,
-                            error="terminal conflict: existing terminal differs",
-                        )
-                    else:
-                        return DurablePublishOutcome(
-                            published=True,
-                            newly_published=False,
-                            record=dict(existing),
-                            durable_state=existing_state,
-                        )
-            # else no existing -> proceed to publish new record
-
-            # 3. Clone ledger snapshot
+            # 3. Clone ledger snapshot (pre-disk state) - will be merged after disk load
             clone: "OrderedDict[str, dict[str, Any]]" = copy.deepcopy(self._tasks)
 
             # 4. Apply candidate to clone
@@ -1352,7 +1324,7 @@ class TaskStore:
                         new_entry[fld] = "" if fld != "reply" else new_entry.get("reply", "")
                 clone[task_id] = new_entry
 
-            # 5. Serialized ledger transaction: load → merge → write under per-ledger file lock
+            # 5. Serialized ledger transaction: load → verify → merge → write under per-ledger file lock
             # The complete load/merge/write is serialized by the ledger file lock so
             # concurrent TaskStore instances cannot lose each other's records.
             try:
@@ -1394,15 +1366,87 @@ class TaskStore:
 
                 try:
                     # Load authoritative ledger snapshot under file lock
+                    # Fail closed on unreadable/unparseable existing ledger; never replace with empty snapshot.
                     disk_snapshot: dict[str, Any] = {}
+                    disk_load_failed = False
+                    disk_load_error = ""
                     if ledger_path.exists():
                         try:
                             with open(ledger_path, "r", encoding="utf-8") as lf:
-                                disk_snapshot = json.load(lf)
-                        except Exception:
+                                loaded = json.load(lf)
+                            if not isinstance(loaded, dict):
+                                disk_load_failed = True
+                                disk_load_error = "ledger not a dict"
+                            else:
+                                disk_snapshot = loaded
+                        except Exception as exc:
+                            disk_load_failed = True
+                            disk_load_error = f"unreadable ledger: {exc}"
                             disk_snapshot = {}
-                        if not isinstance(disk_snapshot, dict):
-                            disk_snapshot = {}
+                        if disk_load_failed:
+                            self._ledger_unavailable = True
+                            self._ledger_unavailable_reason = disk_load_error or "unreadable ledger"
+                            return DurablePublishOutcome(
+                                published=False,
+                                newly_published=False,
+                                record=existing_mem_copy,
+                                durable_state=existing_mem_state,
+                                error=disk_load_error,
+                            )
+                    # If we previously marked unavailable but now load succeeded (readable), clear flag.
+                    if self._ledger_unavailable:
+                        self._ledger_unavailable = False
+                        self._ledger_unavailable_reason = ""
+
+                    # Select authoritative disk record for task_id
+                    disk_rec = None
+                    if isinstance(disk_snapshot, dict) and task_id in disk_snapshot:
+                        rec_raw = disk_snapshot[task_id]
+                        if isinstance(rec_raw, dict):
+                            disk_rec = dict(rec_raw)
+
+                    # Verify immutable ownership against disk record, not only self._tasks (Amendment E)
+                    if disk_rec is not None:
+                        for field_name, cand_val in [
+                            ("context_id", candidate_context),
+                            ("peer", candidate_peer),
+                            ("agent_slug", candidate_slug),
+                            ("tenant", candidate_tenant),
+                        ]:
+                            if cand_val is not None:
+                                existing_val = disk_rec.get(field_name, "")
+                                if cand_val != existing_val:
+                                    self._tasks[task_id] = dict(disk_rec)
+                                    return DurablePublishOutcome(
+                                        published=False,
+                                        newly_published=False,
+                                        record=dict(disk_rec),
+                                        durable_state=disk_rec.get("state", ""),
+                                        error=f"ownership mismatch for {field_name}: {cand_val!r} != {existing_val!r}",
+                                    )
+                        disk_state = disk_rec.get("state", "")
+                        disk_reply = disk_rec.get("reply", "")
+                        if disk_state in TERMINAL_STATES:
+                            if candidate_state == disk_state and candidate_reply == disk_reply:
+                                self._tasks[task_id] = dict(disk_rec)
+                                return DurablePublishOutcome(
+                                    published=True,
+                                    newly_published=False,
+                                    record=dict(disk_rec),
+                                    durable_state=disk_state,
+                                )
+                            else:
+                                self._tasks[task_id] = dict(disk_rec)
+                                return DurablePublishOutcome(
+                                    published=False,
+                                    newly_published=False,
+                                    record=dict(disk_rec),
+                                    durable_state=disk_state,
+                                    error="terminal conflict: existing terminal differs",
+                                )
+
+                    # Only a nonterminal authoritative disk record may take a legal candidate transition.
+
                     # Merge: authoritative disk + clone (clone supplies new/updated publishing task)
                     merged: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
                     if isinstance(disk_snapshot, dict):
@@ -1415,11 +1459,10 @@ class TaskStore:
                         elif tid not in merged:
                             merged[tid] = dict(rec)
                         else:
-                            disk_rec = merged[tid]
-                            # Prefer terminal state if clone newly terminal
-                            if disk_rec.get("state") not in TERMINAL_STATES and rec.get("state") in TERMINAL_STATES:
+                            disk_rec_other = merged[tid]
+                            if disk_rec_other.get("state") not in TERMINAL_STATES and rec.get("state") in TERMINAL_STATES:
                                 merged[tid] = dict(rec)
-                    # Build snapshot dict from merged (only terminal or recent non-terminal)
+
                     snapshot: dict[str, dict[str, Any]] = {}
                     for tid, rec in merged.items():
                         state = rec.get("state", "")
@@ -1443,41 +1486,117 @@ class TaskStore:
                                 "push_url": rec.get("push_url", ""),
                                 "push_config_id": rec.get("push_config_id", ""),
                             }
-                    # Write snapshot via atomic temp file with 0o600, flush/fsync, directory fsync
-                    tmp_fd, tmp_path = tempfile.mkstemp(dir=str(ledger_path.parent), suffix=".tmp")
+                    tmp_fd = None
+                    tmp_path = ""
                     try:
+                        tmp_fd, tmp_path = tempfile.mkstemp(dir=str(ledger_path.parent), suffix=".tmp")
                         try:
                             os.fchmod(tmp_fd, 0o600)
                         except Exception:
                             pass
-                        with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
-                            json.dump(snapshot, f, ensure_ascii=False, indent=2)
-                            try:
+                        serialization_error = None
+                        try:
+                            with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+                                tmp_fd = None
+                                json.dump(snapshot, f, ensure_ascii=False, indent=2)
                                 f.flush()
                                 os.fsync(f.fileno())
-                            except Exception:
-                                pass
+                        except Exception as exc:
+                            serialization_error = exc
+                        if serialization_error is not None:
+                            if tmp_path:
+                                try:
+                                    os.unlink(tmp_path)
+                                except OSError:
+                                    pass
+                            if tmp_fd is not None:
+                                try:
+                                    os.close(tmp_fd)
+                                except OSError:
+                                    pass
+                                tmp_fd = None
+                            err_str = f"serialization/flush/fsync failed: {serialization_error}"
+                            return DurablePublishOutcome(
+                                published=False,
+                                newly_published=False,
+                                record=existing_mem_copy if disk_rec is None else dict(disk_rec),
+                                durable_state=disk_rec.get("state", "") if disk_rec is not None else existing_mem_state,
+                                error=err_str,
+                            )
                         try:
                             os.chmod(tmp_path, 0o600)
                         except OSError:
                             pass
-                        os.replace(tmp_path, str(ledger_path))
-                        # Fsync parent directory where supported (honest platform fallback)
+                        try:
+                            os.replace(tmp_path, str(ledger_path))
+                        except Exception as exc:
+                            try:
+                                os.unlink(tmp_path)
+                            except OSError:
+                                pass
+                            err_str = f"atomic replace failed: {exc}"
+                            return DurablePublishOutcome(
+                                published=False,
+                                newly_published=False,
+                                record=existing_mem_copy if disk_rec is None else dict(disk_rec),
+                                durable_state=disk_rec.get("state", "") if disk_rec is not None else existing_mem_state,
+                                error=err_str,
+                            )
+                        dir_fsync_error = None
+                        dir_fsync_unsupported = False
                         try:
                             dir_fd = os.open(str(ledger_path.parent), os.O_DIRECTORY)
                             try:
                                 os.fsync(dir_fd)
                             finally:
                                 os.close(dir_fd)
-                        except Exception:
-                            pass
-                    except BaseException:
-                        try:
-                            os.unlink(tmp_path)
-                        except OSError:
-                            pass
+                        except AttributeError as exc:
+                            dir_fsync_unsupported = True
+                        except NotImplementedError as exc:
+                            dir_fsync_unsupported = True
+                        except OSError as exc:
+                            err_no = getattr(exc, "errno", None)
+                            if err_no in (errno.EINVAL, errno.ENOTSUP, getattr(errno, "EOPNOTSUPP", 95)):
+                                dir_fsync_unsupported = True
+                            else:
+                                dir_fsync_error = exc
+                        except Exception as exc:
+                            dir_fsync_error = exc
+
+                        if dir_fsync_error is not None:
+                            self._ledger_unavailable = True
+                            self._ledger_unavailable_reason = f"directory fsync failed: {dir_fsync_error}"
+                            err_str = f"directory fsync failed: {dir_fsync_error}; safeToRetry=false"
+                            return DurablePublishOutcome(
+                                published=False,
+                                newly_published=False,
+                                record=existing_mem_copy if disk_rec is None else dict(disk_rec),
+                                durable_state=disk_rec.get("state", "") if disk_rec is not None else existing_mem_state,
+                                error=err_str,
+                            )
+                        if dir_fsync_unsupported:
+                            try:
+                                if not getattr(self.__class__, "_dir_fsync_warned", False):
+                                    import logging
+                                    logging.getLogger(__name__).warning(
+                                        "A2A: directory fsync not supported on this platform; using file-fsync + atomic replace only (weaker directory-entry guarantee)"
+                                    )
+                                    self.__class__._dir_fsync_warned = True
+                            except Exception:
+                                pass
+                    except BaseException as exc:
+                        if tmp_path:
+                            try:
+                                os.unlink(tmp_path)
+                            except OSError:
+                                pass
+                        if tmp_fd is not None:
+                            try:
+                                os.close(tmp_fd)
+                            except OSError:
+                                pass
                         raise
-                    # Success: update in-memory to merged state while still holding self._lock
+
                     self._tasks = merged
                     if not isinstance(self._tasks, OrderedDict):
                         self._tasks = OrderedDict(self._tasks)
@@ -1503,9 +1622,8 @@ class TaskStore:
                         except OSError:
                             pass
             except Exception as exc:
-                # Discard clone, leave memory at last durable
-                existing_state = existing.get("state", "") if existing is not None else "ABSENT"
-                existing_copy = dict(existing) if existing is not None else None
+                existing_state = existing_mem.get("state", "") if existing_mem is not None else "ABSENT"
+                existing_copy = dict(existing_mem) if existing_mem is not None else None
                 return DurablePublishOutcome(
                     published=False,
                     newly_published=False,
@@ -1514,7 +1632,6 @@ class TaskStore:
                     error=str(exc),
                 )
 
-        # Release lock before resolving watchers (per spec step 8)
         if success:
             for fut in watchers_to_resolve:
                 if not fut.done():
@@ -1528,7 +1645,6 @@ class TaskStore:
                 record=published_rec,
                 durable_state=durable_state_after,
             )
-        # Should not reach here; fallback
         return DurablePublishOutcome(
             published=False,
             newly_published=False,
@@ -1536,9 +1652,10 @@ class TaskStore:
             durable_state="ABSENT",
             error=error_msg or "unknown",
         )
-
     def watch(self, task_id: str, agent_slug: str = "", tenant: str = "") -> Optional[Future]:
         with self._lock:
+            if getattr(self, "_ledger_unavailable", False):
+                return None
             rec = self._tasks.get(task_id)
             if not rec or not self._in_scope(rec, agent_slug, tenant):
                 return None
@@ -1564,6 +1681,8 @@ class TaskStore:
         Historical API returns ``(records, next_offset)``. v1.0 ListTasks needs
         ``totalSize``, so callers can opt into ``(records, next_offset, total)``.
         """
+        if getattr(self, "_ledger_unavailable", False):
+            return ([], 0) if not with_total else ([], 0, 0)
         page_size = max(1, min(int(page_size or 50), 100))
         with self._lock:
             recs = [dict(r) for r in reversed(self._tasks.values())]
@@ -1737,8 +1856,6 @@ class TaskStore:
         with self._lock:
             for tid, rec in snapshot.items():
                 if tid in self._tasks:
-                    # Already exists (in-memory); update terminal state
-                    # if the disk record is terminal and in-memory is not.
                     existing = self._tasks[tid]
                     if (existing["state"] not in TERMINAL_STATES
                             and rec.get("state") in TERMINAL_STATES):
@@ -1746,7 +1863,6 @@ class TaskStore:
                         existing["reply"] = rec.get("reply", "")
                         existing["completed_at"] = rec.get("completed_at")
                     continue
-                # Restore the record
                 restored = {
                     "task_id": rec.get("task_id", tid),
                     "context_id": rec.get("context_id", ""),
@@ -1764,6 +1880,9 @@ class TaskStore:
                 self._tasks[tid] = restored
                 count += 1
             self._trim_locked()
+            # Fresh reload establishes authority; clear fail-closed flag.
+            self._ledger_unavailable = False
+            self._ledger_unavailable_reason = ""
         return count
 
 

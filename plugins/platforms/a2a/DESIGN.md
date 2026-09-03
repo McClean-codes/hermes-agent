@@ -206,6 +206,112 @@ terminology below is canonical:
    evidence, but aggregate green counts do not override the hostile
    predicates in the durability matrix.
 
+## Amendment ac32ee — durability correction (2026-09-03)
+
+This amendment locks the five residual boundaries that the prior
+Edison artifact left ambiguous. It does not reopen parser, peer
+identity, shutdown, transport trust, or dedupe decisions.
+
+### A. Push result, conversation, and audit ownership
+
+A conversation `persist_message(context_id, "agent", ...)` entry is
+evidence of a validated successful push — not transport bookkeeping.
+
+| Outcome | `PushOutcome` | Conversation `persist_message(..., "agent", ...)` | Audit | Success log/metric |
+|---|---|---|---|---|
+| Valid v1 result | `success=True` | Exactly once | Exactly one success `push` audit | Permitted once |
+| JSON-RPC top-level `error` | `success=False, category="jsonrpc"` | Prohibited | Exactly one `push_failed` with redacted peer code/message | Prohibited |
+| Malformed/foreign result | `success=False, category="invalid_response"` | Prohibited | Exactly one `push_failed` | Prohibited |
+| Transport/timeout/no response | `success=False, category="transport"` | Prohibited | Exactly one `push_failed`; detail says indeterminate | Prohibited |
+| Routing failure | `success=False, category="routing"` | Prohibited | Exactly one `push_dropped` or `push_failed` | Prohibited |
+| Local durable failure | `success=False, category="durability"` | Prohibited | Exactly one `push_failed` durability audit | Prohibited |
+
+Transport uncertainty permits one failure audit only; it does not
+permit a conversation entry, success `push` audit, or success log.
+JSON-RPC error is a stronger operation failure and also forbids a
+conversation entry.
+
+### B. Typed loopback propagation
+
+Production return contracts are exact:
+
+- `_push_loopback_in_process(...) -> PushOutcome`
+- `_push_out_of_band(...) -> PushOutcome`
+- `_try_push_reply(...) -> PushOutcome`
+- `_push_reply_after_client_gone(...) -> PushOutcome`
+- `adapter.send(...) -> SendResult`
+
+No production branch returns `True`/`False`/`None` in place of
+`PushOutcome`; no bool-compatibility branch hides failure.
+
+For fire-and-forget loopback: durable WORKING creation precedes
+local dispatch; durable COMPLETED publication precedes terminal
+conversation/audit/log/watcher/success.  Failed WORKING leaves
+ABSENT; failed COMPLETED leaves memory/disk WORKING, unresolved
+Future/watcher, no terminal side effect, and `category="durability"`
+through every caller. `adapter.send` maps it to
+`SendResult(success=False, error=<category plus detail>)`.  A
+durable terminal task is never rolled back because later network
+delivery fails.
+
+### C. fsync and atomic publication
+
+Under the established lock order, the ledger is written via a
+temporary file that is fully flushed and file-fsynced before
+`os.replace`.  Serialization, flush, temp-file fsync, and replace
+exceptions are publication failures: the temp file is cleaned where
+possible, memory/observers are not updated, and the store returns
+`DurablePublishOutcome(published=False, newly_published=False, ...)`.
+
+Directory fsync is attempted after replace.  An unsupported
+capability (`AttributeError`, `NotImplementedError`, `EINVAL`,
+`ENOTSUP`, `EOPNOTSUPP`) falls back once per process to the weaker
+guarantee (file-fsync + atomic replace) with a single warning;
+it does not claim full directory-entry persistence.  Unexpected I/O
+(`EIO`, `ENOSPC`, permission loss, unclassified `OSError`) fails
+closed: after a post-replace unexpected error the store returns a
+structured durability failure with `safeToRetry=false`, resolves no
+watcher/Future, emits no success side effect, and marks the ledger
+unavailable until a fresh locked reload or restart re-establishes
+authority.  No A2A TaskState `INDETERMINATE` is invented.
+
+### D. Missing authoritative Task record
+
+A pending map/Future is not Task authority.  When
+`_durable_complete_pending(task_id, ...)` cannot read an
+authoritative `TaskStore` record for `task_id` it returns failure,
+`adapter.send` returns `SendResult(success=False)` with
+task-authority/durability detail, the Future remains unresolved, the
+pending and pending-order entries are retained for reconciliation or
+shutdown, no Task is created, no replacement ID is selected, no
+context/FIFO fallback follows an explicit task ID, and no terminal
+conversation/audit/metric/callback/success log is emitted.  Tests
+must create a durable WORKING record before using a pending Future;
+production contains no memory-only success fallback.
+
+### E. Same-task terminal authority across TaskStores
+
+The per-ledger interprocess file lock owns same-task serialization.
+For every `publish_durable`:
+
+1. Acquire the in-process lock, then the per-ledger file lock in the
+   established order, and load the authoritative ledger under that
+   lock; an unreadable/unparseable ledger fails closed and is never
+   replaced with an empty snapshot.
+2. Compare ownership and terminal state against the disk record, not
+   only `self._tasks`.
+3. Existing terminal + identical state/reply: return the disk record
+   with `published=True, newly_published=False`; do not rewrite or
+   repeat side effects.
+4. Existing terminal + conflicting state/reply: return
+   `published=False, newly_published=False` with terminal-conflict
+   error; do not rewrite or resolve observers.
+5. Reconcile the caller cache to the disk record before both
+   terminal returns.
+6. Only a nonterminal authoritative record may take a legal candidate
+   transition; unrelated IDs may merge without stale same-task
+   overwrite.
+
 ## Files
 ```
 plugins/platforms/a2a/

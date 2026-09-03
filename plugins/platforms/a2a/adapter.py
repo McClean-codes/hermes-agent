@@ -1783,8 +1783,8 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
             context_id=pending["context_id"],
         )
 
-    def _try_push_reply(self, pending: dict, state: str, reply: str):
-        """Push a completed reply out-of-band, dedupe-guarded."""
+    def _try_push_reply(self, pending: dict, state: str, reply: str) -> protocol.PushOutcome:
+        """Push a completed reply out-of-band, dedupe-guarded. Returns typed PushOutcome."""
         if state not in (protocol.STATE_COMPLETED, protocol.STATE_INPUT_REQUIRED) or not reply:
             return protocol.PushOutcome(success=False, category="routing", error="no reply to push")
         with self._pending_lock:
@@ -1793,22 +1793,13 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
             pending["pushed"] = True
         try:
             outcome = self._push_out_of_band(pending["context_id"], reply, want_reply=True)
-            # outcome may be PushOutcome or bool (for backward compat)
-            if isinstance(outcome, protocol.PushOutcome):
-                if not outcome.success:
-                    logger.warning(
-                        "A2A: out-of-band push for task %s returned failure %s: %s",
-                        pending.get("task_id"), outcome.category, outcome.error,
-                    )
-                    return outcome
-                return outcome
-            if outcome is False:
+            # Strictly typed: _push_out_of_band now always returns PushOutcome (Amendment B)
+            if not outcome.success:
                 logger.warning(
-                    "A2A: out-of-band push for task %s returned failure (malformed result or transport)",
-                    pending.get("task_id"),
+                    "A2A: out-of-band push for task %s returned failure %s: %s",
+                    pending.get("task_id"), outcome.category, outcome.error,
                 )
-                return protocol.PushOutcome(success=False, category="transport", error="push returned False")
-            return protocol.PushOutcome(success=True, category="transport", error="")
+            return outcome
         except Exception as exc:
             logger.warning(
                 "A2A: out-of-band push for task %s failed: %s",
@@ -1894,31 +1885,11 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
         coherent, leaves last durable state visible, and returns structured
         failure with no successful side effect.
         """
-        # Stage candidate from current durable record
+        # Stage candidate from current durable record — pending map/Future is NOT Task authority (Amendment D)
         rec = self.tasks.get(task_id)
         if rec is None:
-            # Test harness pending without store (e.g. _bare_adapter) — fallback to memory-only for tests
-            # Production pending tasks are always durably created as WORKING before dispatch
-            with self._pending_lock:
-                ent = self._pending.get(task_id)
-                if ent is not None and ent[0] == chat_id and not ent[1].done():
-                    try:
-                        ent[1].set_result((protocol.STATE_COMPLETED, content or ""))
-                    except Exception:
-                        pass
-                    order = self._pending_order.get(chat_id)
-                    if order is not None:
-                        try:
-                            order.remove(task_id)
-                        except ValueError:
-                            pass
-                        if not order:
-                            self._pending_order.pop(chat_id, None)
-                    self._pending.pop(task_id, None)
-                    logger.info("A2A: memory-only complete for pending task %s (no store record, test fallback)", task_id)
-                    return True, ""
-            logger.warning("A2A: durable complete for unknown task %s", task_id)
-            return False, "task not found"
+            logger.warning("A2A: durable complete for unknown task %s — no authoritative TaskStore record (no fallback, Future unresolved)", task_id)
+            return False, "task not found: no authoritative record"
         if rec.get("context_id") != chat_id:
             logger.warning("A2A: context mismatch for task %s: %r != %r", task_id, rec.get("context_id"), chat_id)
             return False, "context mismatch"
@@ -2148,26 +2119,24 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
                 error="no peer registered for context",
             )
         try:
-            # want_reply=True for session-reply pushes (the peer answers
-            # inside the push's HTTP response — the round-trip path); False
-            # for notifier pushes (fire-and-forget, unchanged).
-            ok = await asyncio.to_thread(
+            outcome = await asyncio.to_thread(
                 self._push_out_of_band, chat_id, content or "",
                 not (metadata or {}).get("a2a_push"),
             )
+            # _push_out_of_band now returns typed PushOutcome (Amendment B)
+            if not outcome.success:
+                return SendResult(success=False, message_id=message_id, error=f"{outcome.category}: {outcome.error}")
         except Exception as exc:
             logger.warning("A2A: out-of-band push for context %s failed: %s", chat_id, exc)
             return SendResult(success=False, message_id=message_id, error=str(exc))
-        if not ok:
-            return SendResult(success=False, message_id=message_id, error="out-of-band push failed")
         return SendResult(success=True, message_id=message_id)
-    def _push_out_of_band(self, context_id: str, text: str, want_reply: bool = False) -> bool:
-        """POST a new message/send to the peer that owns ``context_id``."""
+    def _push_out_of_band(self, context_id: str, text: str, want_reply: bool = False) -> protocol.PushOutcome:
+        """POST a new message/send to the peer that owns ``context_id``. Returns typed PushOutcome (Amendment A/B)."""
         with self._context_peers_lock:
             peer = self._context_peers.get(context_id, "")
         if not peer:
             logger.debug("A2A: out-of-band send for %s has no known peer; dropping", context_id)
-            return False
+            return protocol.PushOutcome(success=False, category="routing", error="no peer registered for context")
         from . import tools as a2a_tools
 
         entry = a2a_tools._resolve_peer(peer)
@@ -2184,7 +2153,7 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
             if fallback:
                 if want_reply:
                     self._drop_unresolvable_reply(context_id, peer)
-                    return False
+                    return protocol.PushOutcome(success=False, category="routing", error="peer identity not resolvable for reply")
                 logger.info(
                     "A2A: out-of-band send for %s: identity %r not in a2a_agents; "
                     "falling back to local endpoint %s",
@@ -2199,8 +2168,7 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
                 # failure. Deliver in-process
                 # instead: the exact same code path as an inbound
                 # message/send, minus the connection and the wait.
-                self._push_loopback_in_process(context_id, peer, text, want_reply=False)
-                return True
+                return self._push_loopback_in_process(context_id, peer, text, want_reply=False)
             else:
                 # Stale/unresolvable peer: a registered peer identity that
                 # can't be resolved to a URL.  Loud failure so notifier/cursor
@@ -2214,7 +2182,7 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
                     "not resolvable — delivery dropped",
                     context_id, peer,
                 )
-                return False
+                return protocol.PushOutcome(success=False, category="routing", error="registered peer not resolvable")
         base_url = entry["url"]
         # Own-endpoint guard: if the resolved target is THIS gateway (the
         # context→peer map can be refined to our own URL — an in-process
@@ -2227,14 +2195,13 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
         if _is_own_endpoint(base_url, self.host, self.port):
             if want_reply:
                 self._drop_unresolvable_reply(context_id, peer)
-                return False
+                return protocol.PushOutcome(success=False, category="routing", error="peer identity not resolvable for reply (own endpoint)")
             logger.info(
                 "A2A: out-of-band send for %s: resolved peer %r is this gateway "
                 "(%s); delivering in-process",
                 context_id, peer, base_url,
             )
-            self._push_loopback_in_process(context_id, peer, text, want_reply=False)
-            return True
+            return self._push_loopback_in_process(context_id, peer, text, want_reply=False)
         headers = {**a2a_tools._auth_header(entry.get("auth") or {}), **(entry.get("headers", {}) or {})}
         timeout = int(entry.get("timeout", 120))
         allowed = tuple(a2a_tools._allowed_rpc_origins(entry))
@@ -2285,24 +2252,14 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
             logger.warning("A2A: out-of-band push for context %s failed: %s", context_id, exc)
             _push_outcome = protocol.PushOutcome(success=False, category="transport", error=str(exc))
         finally:
+            # Amendment A: conversation agent entry is evidence of validated successful push only.
+            # All failure categories must NOT persist agent entry, must emit exactly one failure audit, no success metric/log.
             if _push_outcome.success:
                 protocol.persist_message(context_id, "agent", text)
                 security.audit("push", peer, rpc_body["id"], text, context_id=context_id)
                 logger.info("A2A: pushed out-of-band reply for context %s to peer %s", context_id, peer)
-            elif _push_outcome.category == "invalid_response":
-                # Invalid/foreign/malformed result must not create success-direction persist/audit
-                try:
-                    security.audit("push_failed", peer, rpc_body["id"], _push_outcome.error, context_id=context_id)
-                except Exception:
-                    pass
-                logger.warning("A2A: out-of-band push for context %s to peer %s failed or got invalid result: %s", context_id, peer, _push_outcome.error)
             else:
-                # Transport/JSON-RPC failure: still emit bookkeeping (message may have been delivered)
-                # but with distinct failure audit; surfacing failure to notifier is separate.
-                try:
-                    protocol.persist_message(context_id, "agent", text)
-                except Exception:
-                    pass
+                # Failure-only audit with redacted detail; no conversation persist, no success audit/metric/log.
                 try:
                     security.audit("push_failed", peer, rpc_body["id"], _push_outcome.error, context_id=context_id)
                 except Exception:
@@ -2334,7 +2291,10 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
                         if not reply:
                             reply = a2a_tools._reply_text_from_result(_validated)
                 if reply:
-                    self._push_loopback_in_process(context_id, peer, reply, want_reply=True)
+                    # Loopback for reply surfacing must also be typed but fire-and-forget
+                    loop_res = self._push_loopback_in_process(context_id, peer, reply, want_reply=True)
+                    if not loop_res.success:
+                        logger.warning("A2A: surfaced push reply loopback failed for %s: %s", context_id, loop_res.error)
             except Exception as exc:
                 logger.warning(
                     "A2A: could not surface push reply for context %s: %s",
@@ -2342,7 +2302,6 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
                 )
 
         return _push_outcome
-
     def _drop_unresolvable_reply(self, context_id: str, peer: str) -> None:
         """Loud failure for a reply push with no resolvable external target."""
         security.audit(
@@ -2355,26 +2314,23 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
             context_id, peer,
         )
 
-    def _push_reply_after_client_gone(self, req_id: Any, result: Optional[dict], is_v1: bool = True) -> None:
-        """Deliver a completed reply whose HTTP client disconnected first."""
+    def _push_reply_after_client_gone(self, req_id: Any, result: Optional[dict], is_v1: bool = True) -> protocol.PushOutcome:
+        """Deliver a completed reply whose HTTP client disconnected first. Returns typed PushOutcome."""
         try:
             inner = (result or {}).get("result")
-            # Validate before extracting (section 4.7) — use originating dialect
             _mode = "V1_WRAPPED" if is_v1 else "LEGACY_BARE"
             try:
                 _parsed = protocol.parse_send_message_result(inner, _mode)
             except protocol.A2AResultValidationError as ve:
                 logger.warning("A2A: rescue found invalid result for req %s: %s (%s)", req_id, ve.reason, ve.detail)
-                return
-            # Only COMPLETED / INPUT_REQUIRED with text are pushed
+                return protocol.PushOutcome(success=False, category="invalid_response", error=f"{ve.reason}: {ve.detail}")
             if _parsed.kind == "task":
                 context_id = _parsed.context_id
                 state = _parsed.state
                 reply = _parsed.text
             else:
-                # Message result — not a task terminal for rescue path; treat as not pushable
                 logger.debug("A2A: rescue got message result, not task terminal, skipping")
-                return
+                return protocol.PushOutcome(success=False, category="routing", error="message result not pushable via rescue")
             if not context_id or state not in (
                 protocol.STATE_COMPLETED, protocol.STATE_INPUT_REQUIRED,
             ):
@@ -2382,58 +2338,79 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
                     "A2A: not pushing reply after client disconnect for %s (state=%r)",
                     context_id, state,
                 )
-                return
+                return protocol.PushOutcome(success=False, category="routing", error=f"state not pushable: {state!r}")
             if not reply:
-                return
-            # Session-reply rescue: want_reply=True so the peer's
-            # answer to this pushed reply re-enters our session from the
-            # push's HTTP response instead of being discarded.
-            # Propagate push failure — do not silently claim success.
+                return protocol.PushOutcome(success=False, category="routing", error="no reply to push")
             outcome = self._push_out_of_band(context_id, reply, want_reply=True)
-            # outcome may be PushOutcome or bool
-            _success = outcome.success if isinstance(outcome, protocol.PushOutcome) else bool(outcome)
-            if not _success:
+            if not outcome.success:
                 logger.warning(
                     "A2A: rescue push for context %s failed — reply not delivered (want_reply=True): %s",
-                    context_id, getattr(outcome, 'error', '') if isinstance(outcome, protocol.PushOutcome) else 'unknown',
+                    context_id, outcome.error,
                 )
-                return
+                return outcome
             logger.info(
                 "A2A: client disconnected before response write; pushed reply "
                 "for context %s out-of-band",
                 context_id,
             )
+            return outcome
         except Exception as exc:
             logger.warning(
                 "A2A: could not push reply after client disconnect (req %s): %s",
                 req_id, exc,
             )
+            return protocol.PushOutcome(success=False, category="transport", error=str(exc))
 
     def _push_loopback_in_process(self, context_id: str, peer: str, text: str,
-                                  want_reply: bool = False) -> None:
-        """Deliver an out-of-band push to this gateway's own session in-process."""
+                                  want_reply: bool = False) -> protocol.PushOutcome:
+        """Deliver an out-of-band push to this gateway's own session in-process. Returns typed PushOutcome (Amendment B).
+
+        Fire-and-forget loopback durably creates WORKING before dispatch and durably publishes COMPLETED
+        before any terminal side effects. Failed WORKING leaves ABSENT; failed COMPLETED leaves WORKING,
+        unresolved Future/watcher, no terminal side effects, and category durability.
+        """
         params = {
             "message": protocol.text_message(
                 protocol.ROLE_USER, text, context_id=context_id, sender=self._sender_identity()
             ),
         }
-        terminal, pending = self._prepare_task(params, peer)
+        try:
+            terminal, pending = self._prepare_task(params, peer)
+        except protocol.DurablePublishError as dpe:
+            logger.error("A2A: loopback WORKING publish failed for context %s: %s", context_id, dpe)
+            return protocol.PushOutcome(success=False, category="durability", error=f"durability failure: {dpe}")
+        except Exception as exc:
+            logger.error("A2A: loopback _prepare_task exception for context %s: %s", context_id, exc)
+            return protocol.PushOutcome(success=False, category="transport", error=str(exc))
         if terminal is not None:
             state = (terminal.get("status") or {}).get("state", "unknown")
-            raise RuntimeError(
-                f"in-process loopback push for context {context_id} rejected ({state})"
-            )
+            logger.warning("A2A: loopback push for context %s rejected (%s)", context_id, state)
+            return protocol.PushOutcome(success=False, category="routing", error=f"rejected: {state}")
         assert pending is not None  # _prepare_task returns (terminal, None) or (None, pending)
         if want_reply:
             # Session-reply path: the task stays pending for send() to resolve.
-            protocol.persist_message(context_id, "agent", text)
-            security.audit("push", peer, pending["task_id"], text, context_id=context_id)
-            logger.info("A2A: pushed out-of-band reply for context %s to peer %s (want_reply)", context_id, peer)
+            # WORKING already durably created; emit success side effects for the inbound leg.
+            try:
+                protocol.persist_message(context_id, "agent", text)
+                security.audit("push", peer, pending["task_id"], text, context_id=context_id)
+                logger.info("A2A: pushed out-of-band reply for context %s to peer %s (want_reply)", context_id, peer)
+                return protocol.PushOutcome(success=True, category="transport", error="")
+            except Exception as exc:
+                logger.error("A2A: loopback want_reply side effect failed for %s: %s", context_id, exc)
+                return protocol.PushOutcome(success=False, category="durability", error=str(exc))
         else:
             # Fire-and-forget (notifier): complete the task immediately
-            # to prevent it from lingering in TASK_STATE_WORKING.
-            self._finalize_task(pending, protocol.STATE_COMPLETED, text, audit_direction="push")
-            logger.info("A2A: delivered fire-and-forget loopback for context %s (task %s completed)", context_id, pending["task_id"])
+            # Durable COMPLETED publication must precede terminal effects and success (Amendment B).
+            try:
+                self._finalize_task(pending, protocol.STATE_COMPLETED, text, audit_direction="push")
+                logger.info("A2A: delivered fire-and-forget loopback for context %s (task %s completed)", context_id, pending["task_id"])
+                return protocol.PushOutcome(success=True, category="transport", error="")
+            except protocol.DurablePublishError as dpe:
+                logger.error("A2A: loopback COMPLETED publish failed for context %s task %s: %s", context_id, pending.get("task_id", ""), dpe)
+                return protocol.PushOutcome(success=False, category="durability", error=f"durability failure: {dpe}")
+            except Exception as exc:
+                logger.error("A2A: loopback finalize exception for context %s: %s", context_id, exc)
+                return protocol.PushOutcome(success=False, category="transport", error=str(exc))
 
 
     async def on_processing_complete(self, event, outcome):
