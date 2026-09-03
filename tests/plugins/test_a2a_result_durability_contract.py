@@ -27,6 +27,54 @@ def _valid_task(task_id="task-abc", context_id="ctx-1", state=protocol.STATE_COM
 def _valid_message(msg_id="msg-1", context_id="ctx-1", text="hello"):
     return protocol.text_message(protocol.ROLE_AGENT, text, context_id)
 
+
+import contextlib,asyncio as _aio_l,threading as _thr_l
+@contextlib.contextmanager
+def _a2a_managed_loop(adapter,monkeypatch,*,timeout=5):
+ loop=_aio_l.new_event_loop();ready=_thr_l.Event()
+ def _r():_aio_l.set_event_loop(loop);ready.set();loop.run_forever()
+ th=_thr_l.Thread(target=_r,daemon=True);th.start();ready.wait(2)
+ adapter._loop=loop;adapter._message_handler=object()
+ async def _no(e):return None
+ adapter.handle_message=_no;cap=[];real=_aio_l.run_coroutine_threadsafe
+ def _cap(coro,tgt):
+  try:f=real(coro,tgt);cap.append(f);return f
+  except:
+   try:coro.close()
+   except:pass
+   raise
+ monkeypatch.setattr(_aio_l,"run_coroutine_threadsafe",_cap)
+ try:
+  import plugins.platforms.a2a.adapter as _mod;monkeypatch.setattr(_mod.asyncio,"run_coroutine_threadsafe",_cap)
+ except:pass
+ try:
+  yield (loop,th,cap,real)
+  for _f in list(cap):
+   try:_f.result(timeout=timeout)
+   except:pass
+  async def _drain():return None
+  try:real(_drain(),loop).result(timeout=2)
+  except:pass
+  async def _cg():
+   import asyncio as _a2
+   ts=[t for t in _a2.all_tasks(loop) if not t.done()]
+   cur=_a2.current_task(loop);tc=[t for t in ts if t is not cur]
+   for t in tc:t.cancel()
+   if tc:await _a2.gather(*tc,return_exceptions=True)
+   pend=[t for t in _a2.all_tasks(loop) if not t.done()]
+   pend=[t for t in pend if t is not _a2.current_task(loop)]
+   assert not pend,f"pending {pend}"
+  try:real(_cg(),loop).result(timeout=timeout)
+  except Exception as e:raise AssertionError(f"drain {e}") from e
+ finally:
+  try:loop.call_soon_threadsafe(loop.stop)
+  except:pass
+  th.join(timeout=timeout);assert not th.is_alive()
+  try:loop.close()
+  except:pass
+  try:adapter._unregister_adapter()
+  except:pass
+
 # ---------------------------------------------------------------------------
 # 1. Legal Task schema
 # ---------------------------------------------------------------------------
@@ -317,6 +365,9 @@ def test_invalid_push_result_fails_through_every_caller(monkeypatch, tmp_path):
     # Ensure no pending task for this context
     adapter._pending = {}
     adapter._pending_order = {}
+    # Ensure thread_id does not interfere with OOB routing (clear stale session)
+    import gateway.session_context as _sc_send
+    monkeypatch.setattr(_sc_send, "get_session_env", lambda k: "")
     # Need to mock ledger for send's internal _durable paths? send will check for pending/active tasks first; if none, it goes to oob push
     # It will call _push_out_of_band which will return jsonrpc failure; send should map to SendResult success=False with category
     res_send = asyncio.run(adapter.send(ctx_send, "send hello", metadata={"notify": True}))
@@ -1676,6 +1727,9 @@ def test_wave14_loopback_audit_and_jsonrpc_redaction(monkeypatch, tmp_path):
     adapter._pending.clear();adapter._pending_order.clear()
     ctx_send = "ctx-wave14-send"
     adapter._context_peers[ctx_send] = "peer1"
+    # Ensure send takes OOB path, not stale thread_id
+    import gateway.session_context as _sc
+    monkeypatch.setattr(_sc, "get_session_env", lambda k: "")
     send_res = asyncio.run(adapter.send(ctx_send, "send via oob", metadata={"notify": True}))
     assert not send_res.success
     assert "jsonrpc" in send_res.error.lower()
@@ -1940,31 +1994,20 @@ def test_push_out_of_band_loopback_propagates_inner_failure_without_reaudit(monk
             return protocol.DurablePublishOutcome(published=False, newly_published=False, record=adapter.tasks.get(tid), durable_state=protocol.STATE_WORKING, error="injected")
         return orig_pub(path, tid, cand)
     adapter.tasks.publish_durable = fail_completed;adapter._agents={"": {"local": True}}
-    import asyncio as aio,threading
-    loop=aio.new_event_loop();ready=threading.Event()
-    def runner(): aio.set_event_loop(loop);ready.set();loop.run_forever()
-    th=threading.Thread(target=runner,daemon=True);th.start();ready.wait(2);adapter._loop=loop;adapter._message_handler=object()
-    async def no_op(e): return None
-    adapter.handle_message=no_op;persist_calls=[];audit_calls=[];orig_persist,orig_audit=protocol.persist_message,security.audit
-    def t_persist(cid, role, t, task_id=""):
-        persist_calls.append((cid, role, t)); return orig_persist(cid, role, t, task_id)
-    def t_audit(d, p, tid, det, context_id=None):
-        audit_calls.append((d,p,tid,det,context_id)); return orig_audit(d,p,tid,det,context_id=context_id)
-    monkeypatch.setattr(protocol,"persist_message",t_persist);monkeypatch.setattr(security,"audit",t_audit)
-    import plugins.platforms.a2a.adapter as mod;monkeypatch.setattr(mod.security,"audit",t_audit)
-    # OOB fallback is loopback for ip: peer with no a2a_agents entry
-    monkeypatch.setattr(a2a_tools, "_resolve_peer", lambda x: None);ctx = "ctx-oob-loop-fail";adapter._context_peers[ctx] = "ip:127.0.0.1"
-    persist_calls.clear(); audit_calls.clear()
-    out = adapter._push_out_of_band(ctx, "hello-oob-loop", want_reply=False)
-    assert not out.success
-    assert out.category == "durability"
-    # Exactly one inner push_failed, no outer re-audit, WORKING remains
-    assert len([a for a in audit_calls if a[0] == "push_failed"]) == 1
-    assert len([a for a in audit_calls if a[0] == "push"]) == 0
-    assert [c for c in persist_calls if c[1] == "agent"] == []
-    recs = adapter.tasks.list(context_id=ctx)[0]
-    assert recs and recs[0]["state"] == protocol.STATE_WORKING
-    loop.call_soon_threadsafe(loop.stop); th.join(timeout=2); loop.close(); adapter._unregister_adapter()
+    # Use managed loop helper
+    with _a2a_managed_loop(adapter,monkeypatch) as (loop,th,cap,real):
+        persist_calls=[];audit_calls=[];orig_persist,orig_audit=protocol.persist_message,security.audit
+        def t_persist(cid,role,t,task_id=""):persist_calls.append((cid,role,t));return orig_persist(cid,role,t,task_id)
+        def t_audit(d,p,tid,det,context_id=None):audit_calls.append((d,p,tid,det,context_id));return orig_audit(d,p,tid,det,context_id=context_id)
+        monkeypatch.setattr(protocol,"persist_message",t_persist);monkeypatch.setattr(security,"audit",t_audit)
+        import plugins.platforms.a2a.adapter as mod;monkeypatch.setattr(mod.security,"audit",t_audit)
+        monkeypatch.setattr(a2a_tools,"_resolve_peer",lambda x:None);ctx="ctx-oob-loop-fail";adapter._context_peers[ctx]="ip:127.0.0.1"
+        out=adapter._push_out_of_band(ctx,"hello-oob-loop",want_reply=False)
+        assert not out.success and out.category=="durability"
+        assert len([a for a in audit_calls if a[0]=="push_failed"])==1
+        assert len([a for a in audit_calls if a[0]=="push"])==0
+        assert [c for c in persist_calls if c[1]=="agent"]==[]
+        assert adapter.tasks.list(context_id=ctx)[0][0]["state"]==protocol.STATE_WORKING
 
 
 def test_loopback_want_reply_prepare_failure_is_clean(monkeypatch, tmp_path):
@@ -2105,37 +2148,24 @@ def test_loopback_want_reply_latches_success_before_best_effort_side_effects(mon
     from plugins.platforms.a2a.adapter import A2AAdapter
     from plugins.platforms.a2a import protocol, security
     from gateway.config import PlatformConfig
-    adapter = A2AAdapter(PlatformConfig(enabled=True, extra={"port": 0}));persist_calls=[]; audit_calls=[];orig_persist=protocol.persist_message;orig_audit=security.audit
-    # Inject faults after commit: persist raises, audit raises
-    def failing_persist(cid, role, text, task_id=""):
-        if role=="agent":
-            raise OSError("injected agent persist failure")
-        return orig_persist(cid, role, text, task_id)
-    def failing_audit(direction, peer, tid, detail, context_id=None):
-        if direction=="push":
-            raise OSError("injected push audit failure")
-        audit_calls.append((direction, peer, tid, detail, context_id))
-        return orig_audit(direction, peer, tid, detail, context_id=context_id)
-    monkeypatch.setattr(protocol, "persist_message", failing_persist);monkeypatch.setattr(security, "audit", failing_audit)
-    import plugins.platforms.a2a.adapter as mod
-    monkeypatch.setattr(mod.security, "audit", failing_audit)
-    # Also need to patch mod.protocol persist
-    monkeypatch.setattr(mod.protocol, "persist_message", failing_persist);adapter._agents={"": {"local": True}}
-    import asyncio as aio, threading
-    loop = aio.new_event_loop(); ready=threading.Event()
-    def runner():
-        aio.set_event_loop(loop); ready.set(); loop.run_forever()
-    th=threading.Thread(target=runner, daemon=True); th.start(); ready.wait(2);adapter._loop=loop; adapter._message_handler=object()
-    async def no_op(e): return None
-    adapter.handle_message=no_op;out = adapter._push_loopback_in_process("ctx-want-latch", "peer1", "hello latch", want_reply=True)
-    assert out.success and out.category=="transport"
-    # No failure audit should be emitted
-    assert len([a for a in audit_calls if a[0]=="push_failed"])==0
-    assert len([a for a in audit_calls if a[0]=="push_dropped"])==0
-    # Task remains WORKING (commit)
-    recs = adapter.tasks.list(context_id="ctx-want-latch")[0]
-    assert recs and recs[0]["state"]==protocol.STATE_WORKING
-    loop.call_soon_threadsafe(loop.stop); th.join(timeout=2); loop.close(); adapter._unregister_adapter()
+    adapter=A2AAdapter(PlatformConfig(enabled=True,extra={"port":0}));persist_calls=[];audit_calls=[];orig_persist=protocol.persist_message;orig_audit=security.audit
+    def failing_persist(cid,role,text,task_id=""):
+        if role=="agent":raise OSError("injected agent persist failure")
+        return orig_persist(cid,role,text,task_id)
+    def failing_audit(direction,peer,tid,detail,context_id=None):
+        if direction=="push":raise OSError("injected push audit failure")
+        audit_calls.append((direction,peer,tid,detail,context_id));return orig_audit(direction,peer,tid,detail,context_id=context_id)
+    monkeypatch.setattr(protocol,"persist_message",failing_persist);monkeypatch.setattr(security,"audit",failing_audit)
+    import plugins.platforms.a2a.adapter as mod;monkeypatch.setattr(mod.security,"audit",failing_audit);monkeypatch.setattr(mod.protocol,"persist_message",failing_persist);adapter._agents={"": {"local": True}}
+    with _a2a_managed_loop(adapter,monkeypatch) as (loop,th,cap,real):
+        async def no_op(e):return None
+        adapter.handle_message=no_op
+        out=adapter._push_loopback_in_process("ctx-want-latch","peer1","hello latch",want_reply=True)
+        assert out.success and out.category=="transport"
+        assert len([a for a in audit_calls if a[0]=="push_failed"])==0
+        assert len([a for a in audit_calls if a[0]=="push_dropped"])==0
+        recs=adapter.tasks.list(context_id="ctx-want-latch")[0]
+        assert recs and recs[0]["state"]==protocol.STATE_WORKING
 
 
 def test_loopback_fire_and_forget_latches_committed_success_before_postcommit_side_effects(monkeypatch, tmp_path):
@@ -2143,41 +2173,27 @@ def test_loopback_fire_and_forget_latches_committed_success_before_postcommit_si
     from plugins.platforms.a2a.adapter import A2AAdapter
     from plugins.platforms.a2a import protocol, security
     from gateway.config import PlatformConfig
-    adapter = A2AAdapter(PlatformConfig(enabled=True, extra={"port": 0}));ledger = tmp_path / "ledger_faf_latch.json";monkeypatch.setattr("plugins.platforms.a2a.a2a_persistence._task_ledger_path", lambda: ledger);monkeypatch.setattr("plugins.platforms.a2a.adapter._task_ledger_path", lambda: ledger)
-    # Inject faults after COMMIT: persist and audit for push should fail but not downgrade
-    orig_persist,orig_audit=protocol.persist_message,security.audit
-    # Count audits to ensure no failure audit for committed success
-    audit_calls=[]
-    def failing_persist(cid, role, text, task_id=""):
-        if role=="agent":
-            raise OSError("injected persist fail post-commit")
-        return orig_persist(cid, role, text, task_id)
-    def tracking_audit(direction, peer, tid, detail, context_id=None):
-        audit_calls.append((direction, peer, tid, detail, context_id))
-        if direction=="push":
-            raise OSError("injected audit fail post-commit")
-        return orig_audit(direction, peer, tid, detail, context_id=context_id)
-    # Need to patch both protocol and security and also task_routing's audit path
-    monkeypatch.setattr(protocol, "persist_message", failing_persist);monkeypatch.setattr(security, "audit", tracking_audit)
-    import plugins.platforms.a2a.adapter as mod
-    monkeypatch.setattr(mod.security, "audit", tracking_audit);monkeypatch.setattr(mod.protocol, "persist_message", failing_persist)
-    # Also patch task_routing's security audit via its import
-    import plugins.platforms.a2a.task_routing as tr
-    monkeypatch.setattr(tr.security, "audit", tracking_audit);monkeypatch.setattr(tr.protocol, "persist_message", failing_persist);adapter._agents={"": {"local": True}}
-    import asyncio as aio, threading
-    loop = aio.new_event_loop(); ready=threading.Event()
-    def runner():
-        aio.set_event_loop(loop); ready.set(); loop.run_forever()
-    th=threading.Thread(target=runner, daemon=True); th.start(); ready.wait(2);adapter._loop=loop; adapter._message_handler=object()
-    async def no_op(e): return None
-    adapter.handle_message=no_op;out = adapter._push_loopback_in_process("ctx-faf-latch", "peer1", "hello faf latch", want_reply=False)
-    assert out.success and out.category=="transport"
-    # No failure audit for committed operation (only success push attempted but failed best-effort)
-    assert len([a for a in audit_calls if a[0]=="push_failed"])==0
-    assert len([a for a in audit_calls if a[0]=="push_dropped"])==0
-    recs = adapter.tasks.list(context_id="ctx-faf-latch")[0]
-    assert recs and recs[0]["state"]==protocol.STATE_COMPLETED
-    loop.call_soon_threadsafe(loop.stop); th.join(timeout=2); loop.close(); adapter._unregister_adapter()
+    adapter=A2AAdapter(PlatformConfig(enabled=True,extra={"port":0}));ledger=tmp_path / "ledger_faf_latch.json";monkeypatch.setattr("plugins.platforms.a2a.a2a_persistence._task_ledger_path", lambda: ledger);monkeypatch.setattr("plugins.platforms.a2a.adapter._task_ledger_path", lambda: ledger)
+    orig_persist,orig_audit=protocol.persist_message,security.audit;audit_calls=[]
+    def failing_persist(cid,role,text,task_id=""):
+        if role=="agent":raise OSError("injected persist fail post-commit")
+        return orig_persist(cid,role,text,task_id)
+    def tracking_audit(direction,peer,tid,detail,context_id=None):
+        audit_calls.append((direction,peer,tid,detail,context_id))
+        if direction=="push":raise OSError("injected audit fail post-commit")
+        return orig_audit(direction,peer,tid,detail,context_id=context_id)
+    monkeypatch.setattr(protocol,"persist_message",failing_persist);monkeypatch.setattr(security,"audit",tracking_audit)
+    import plugins.platforms.a2a.adapter as mod;monkeypatch.setattr(mod.security,"audit",tracking_audit);monkeypatch.setattr(mod.protocol,"persist_message",failing_persist)
+    import plugins.platforms.a2a.task_routing as tr;monkeypatch.setattr(tr.security,"audit",tracking_audit);monkeypatch.setattr(tr.protocol,"persist_message",failing_persist);adapter._agents={"": {"local": True}}
+    with _a2a_managed_loop(adapter,monkeypatch) as (loop,th,cap,real):
+        async def no_op(e):return None
+        adapter.handle_message=no_op
+        out=adapter._push_loopback_in_process("ctx-faf-latch","peer1","hello faf latch",want_reply=False)
+        assert out.success and out.category=="transport"
+        assert len([a for a in audit_calls if a[0]=="push_failed"])==0
+        assert len([a for a in audit_calls if a[0]=="push_dropped"])==0
+        recs=adapter.tasks.list(context_id="ctx-faf-latch")[0]
+        assert recs and recs[0]["state"]==protocol.STATE_COMPLETED
 
 
 def test_rescue_local_failures_are_audited_once(monkeypatch, tmp_path):

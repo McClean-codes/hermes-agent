@@ -142,95 +142,130 @@ def _method_info(method: str) -> tuple[str, bool]:
     return mapping.get(method, ("", False))
 
 
-def _sanitize_string_for_jsonrpc(value: str, max_len: int = 300) -> str:
-    r = security.redact_outbound(value)
-    return r if len(r) <= max_len else r[:max_len] + "...[truncated]"
-
-def _sanitize_jsonrpc_value(value: Any, depth: int) -> Any:
-    if depth > 4:
-        return "[redacted]"
-    if value is None or isinstance(value, bool):
-        return value
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float):
-        return value if math.isfinite(value) else "[redacted]"
-    if isinstance(value, str):
-        return _sanitize_string_for_jsonrpc(value, 300)
-    if isinstance(value, dict):
-        out: dict[str, Any] = {}
-        for i, (k, v) in enumerate(value.items()):
-            if i >= 16:
-                break
-            sk = _sanitize_string_for_jsonrpc(str(k) if not isinstance(k, str) else k, 64)
-            out[sk] = _sanitize_jsonrpc_value(v, depth + 1)
-        return out
-    if isinstance(value, list):
-        return [_sanitize_jsonrpc_value(x, depth + 1) for x in value[:16]]
-    return "[redacted]"
-
-def _redacted_jsonrpc_detail(raw_error):
-    payload: dict[str, Any] = {}
-    if isinstance(raw_error, dict):
-        rc = raw_error.get("code")
-        if isinstance(rc, int) and not isinstance(rc, bool):
-            payload["code"] = rc
-        rm = raw_error.get("message")
-        if isinstance(rm, str):
-            payload["message"] = _sanitize_string_for_jsonrpc(rm, 300)
-        elif rm is not None:
-            payload["message"] = _sanitize_string_for_jsonrpc(str(rm), 300)
-        if "data" in raw_error:
-            payload["data"] = _sanitize_jsonrpc_value(raw_error["data"], 0)
-    else:
-        payload["message"] = _sanitize_string_for_jsonrpc(str(raw_error), 300)
-    try:
-        if len(json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")) > 2048:
-            tp: dict[str, Any] = {}
-            if "code" in payload:
-                tp["code"] = payload["code"]
-            if "message" in payload:
-                tp["message"] = payload["message"]
-            tp["data"] = "[truncated]"
-            payload = tp
-    except Exception:
-        payload = {"message": _sanitize_string_for_jsonrpc(str(raw_error), 300)}
-    parts: list[str] = []
-    if "code" in payload:
-        parts.append(str(payload["code"]))
-    if "message" in payload and isinstance(payload["message"], str):
-        parts.append(payload["message"])
-    err = ": ".join(parts) if len(parts) == 2 else (parts[0] if parts else "[redacted]")
-    if len(err) > 300:
-        err = err[:300] + "...[truncated]"
-    err = security.redact_outbound(err)
-    if len(err) > 300:
-        err = err[:300] + "...[truncated]"
-    return err, payload
-
-def _audit_safe(direction: str, peer: str, tid: str, detail: str, context_id: str = "") -> None:
-    try:
-        security.audit(direction, peer, tid, detail, context_id=context_id)
-    except Exception:
-        pass
-
-def _audit_loopback_failure(peer: str, context_id: str, error: str, category: str, task_id: str = "") -> None:
-    # Redact as defense-in-depth even for internal errors (no credential expected)
-    safe_error = security.redact_outbound(error)
-    if len(safe_error) > 500:
-        safe_error = safe_error[:500]
-    # Map category to existing audit direction per Amendment A
-    direction = "push_failed"
-    if category == "routing":
-        # Preserve existing push_dropped semantics for routing; probe accepts
-        # either but push_dropped is the established routing failure audit.
-        direction = "push_dropped"
-    try:
-        security.audit(direction, peer, task_id or context_id, safe_error, context_id=context_id)
-    except Exception:
-        pass
-
-
+_DETAIL_MAX_CODEPOINTS=300
+_JSONRPC_KEY_MAX_CODEPOINTS=64
+_JSONRPC_STRING_MAX_CODEPOINTS=300
+_JSONRPC_MAX_DEPTH=4
+_JSONRPC_MAX_WIDTH=16
+_JSONRPC_MAX_BYTES=2048
+_JSONRPC_CODE_MIN=-2147483648
+_JSONRPC_CODE_MAX=2147483647
+_TRUNCATION_MARKER="...[truncated]"
+_REDACTED_MARKER="[redacted]"
+_DATA_TRUNCATED_MARKER="[truncated]"
+def _truncate_codepoints(v,c):
+ m=_TRUNCATION_MARKER;return v if len(v)<=c else (m[:c] if c<len(m) else v[:c-len(m)]+m)
+def _bounded_redacted_detail(v,c=300):
+ try:s=v if isinstance(v,str) else str(v)
+ except:s=_REDACTED_MARKER
+ try:
+  r=security.redact_outbound(s)
+  if not isinstance(r,str):r=_REDACTED_MARKER
+ except:r=_REDACTED_MARKER
+ try:return _truncate_codepoints(r,c)
+ except:return _REDACTED_MARKER[:c] if c<len(_REDACTED_MARKER) else _REDACTED_MARKER
+def _sanitize_string_for_jsonrpc(v,m=300):
+ try:
+  r=security.redact_outbound(v)
+  if not isinstance(r,str):r=_REDACTED_MARKER
+ except:r=_REDACTED_MARKER
+ return _truncate_codepoints(r,m)
+def _sanitize_jsonrpc_value(v,d):
+ try:
+  if d>_JSONRPC_MAX_DEPTH:return _REDACTED_MARKER
+  if v is None or isinstance(v,bool):return v
+  if isinstance(v,int):return v if _JSONRPC_CODE_MIN<=v<=_JSONRPC_CODE_MAX else _REDACTED_MARKER
+  if isinstance(v,float):return v if __import__("math").isfinite(v) else _REDACTED_MARKER
+  if isinstance(v,str):return _sanitize_string_for_jsonrpc(v,_JSONRPC_STRING_MAX_CODEPOINTS)
+  if isinstance(v,dict):
+   out={}
+   try:items=list(v.items())
+   except:return _REDACTED_MARKER
+   c=0
+   for k,val in items:
+    if c>=_JSONRPC_MAX_WIDTH:break
+    c+=1
+    if isinstance(k,str):
+     try:
+      rk=security.redact_outbound(k)
+      if not isinstance(rk,str):rk=_REDACTED_MARKER
+     except:rk=_REDACTED_MARKER
+     sk=_truncate_codepoints(rk,_JSONRPC_KEY_MAX_CODEPOINTS)
+    else:sk=_REDACTED_MARKER
+    if sk in out:continue
+    out[sk]=_sanitize_jsonrpc_value(val,d+1)
+   return out
+  if isinstance(v,list):
+   try:t=v[:_JSONRPC_MAX_WIDTH]
+   except:return _REDACTED_MARKER
+   return [_sanitize_jsonrpc_value(x,d+1) for x in t]
+  return _REDACTED_MARKER
+ except:return _REDACTED_MARKER
+def _redacted_jsonrpc_detail(raw):
+ payload={}
+ try:
+  if isinstance(raw,dict):
+   if "code" in raw:
+    rc=raw.get("code")
+    if isinstance(rc,int) and not isinstance(rc,bool) and _JSONRPC_CODE_MIN<=rc<=_JSONRPC_CODE_MAX:payload["code"]=rc
+   if "message" in raw:
+    rm=raw.get("message")
+    if isinstance(rm,str):payload["message"]=_sanitize_string_for_jsonrpc(rm,_JSONRPC_STRING_MAX_CODEPOINTS)
+    elif rm is not None:payload["message"]=_bounded_redacted_detail(rm,_JSONRPC_STRING_MAX_CODEPOINTS)
+   if "data" in raw:
+    try:payload["data"]=_sanitize_jsonrpc_value(raw["data"],0)
+    except:payload["data"]=_REDACTED_MARKER
+   if not payload:payload["message"]=_REDACTED_MARKER
+  else:
+   payload["message"]=_bounded_redacted_detail(raw,_JSONRPC_STRING_MAX_CODEPOINTS)
+   if not payload.get("message"):payload["message"]=_REDACTED_MARKER
+  if "message" not in payload and "code" not in payload:payload["message"]=_REDACTED_MARKER
+  try:
+   ser=__import__("json").dumps(payload,separators=(",",":"),ensure_ascii=False,allow_nan=False).encode("utf-8")
+   if len(ser)>_JSONRPC_MAX_BYTES:
+    tp={}
+    if "code" in payload:tp["code"]=payload["code"]
+    if "message" in payload:tp["message"]=payload["message"]
+    tp["data"]=_DATA_TRUNCATED_MARKER;payload=tp
+    ser2=__import__("json").dumps(payload,separators=(",",":"),ensure_ascii=False,allow_nan=False).encode("utf-8")
+    if len(ser2)>_JSONRPC_MAX_BYTES:raise ValueError
+  except:payload={"message":_REDACTED_MARKER,"data":_DATA_TRUNCATED_MARKER}
+ except:payload={"message":_REDACTED_MARKER,"data":_DATA_TRUNCATED_MARKER}
+ try:
+  parts=[]
+  if "code" in payload:parts.append(str(payload["code"]))
+  if "message" in payload and isinstance(payload["message"],str):parts.append(payload["message"])
+  err=": ".join(parts) if len(parts)==2 else (parts[0] if parts else _REDACTED_MARKER)
+  try:
+   red=security.redact_outbound(err)
+   if not isinstance(red,str):red=_REDACTED_MARKER
+  except:red=_REDACTED_MARKER
+  err=_truncate_codepoints(red,_DETAIL_MAX_CODEPOINTS)
+ except:err=_REDACTED_MARKER
+ try:
+  fb=__import__("json").dumps(payload,separators=(",",":"),ensure_ascii=False,allow_nan=False).encode("utf-8")
+  if len(fb)>_JSONRPC_MAX_BYTES:payload={"message":_REDACTED_MARKER,"data":_DATA_TRUNCATED_MARKER};err=_REDACTED_MARKER
+ except:payload={"message":_REDACTED_MARKER,"data":_DATA_TRUNCATED_MARKER};err=_REDACTED_MARKER
+ return err,payload
+def _audit_safe(direction,peer,tid,detail,context_id=""):
+ try:
+  sp=_bounded_redacted_detail(peer,128) if peer else "";st=_bounded_redacted_detail(tid,128) if tid else "";sc=_bounded_redacted_detail(context_id,128) if context_id else "";sd=_bounded_redacted_detail(detail,_DETAIL_MAX_CODEPOINTS) if detail else ""
+  security.audit(direction,sp,st,sd,context_id=sc)
+ except Exception as exc:
+  try:b=_bounded_redacted_detail(exc,_DETAIL_MAX_CODEPOINTS);__import__("logging").getLogger(__name__).warning("A2A: audit write failed (%s): %s",_bounded_redacted_detail(direction,64),b)
+  except:pass
+def _failure_outcome(category,detail,*,peer,task_id,context_id,payload=None):
+ allowed={"routing","transport","jsonrpc","invalid_response","durability"}
+ if category not in allowed:category="transport"
+ if category=="jsonrpc":sd=_truncate_codepoints(detail if isinstance(detail,str) else _bounded_redacted_detail(detail,_DETAIL_MAX_CODEPOINTS),_DETAIL_MAX_CODEPOINTS);spayload=payload
+ else:sd=_bounded_redacted_detail(detail,_DETAIL_MAX_CODEPOINTS);spayload=None
+ direction="push_dropped" if category=="routing" else "push_failed"
+ _audit_safe(direction,peer,task_id,sd,context_id=context_id)
+ return __import__("plugins.platforms.a2a.protocol",fromlist=["PushOutcome"]).PushOutcome(success=False,category=category,error=sd,payload=spayload)
+def _send_result_from_outcome(mid,outcome):
+ if outcome.success:return __import__("gateway.platforms.base",fromlist=["SendResult"]).SendResult(success=True,message_id=mid)
+ raw=f"{outcome.category}: {outcome.error}";safe=_bounded_redacted_detail(raw,_DETAIL_MAX_CODEPOINTS)
+ return __import__("gateway.platforms.base",fromlist=["SendResult"]).SendResult(success=False,message_id=mid,error=safe)
 class _A2AServer(ThreadingHTTPServer):
 
     daemon_threads = True
@@ -536,6 +571,7 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
         self._watchdog_stop = threading.Event()
         self._watchdog_thread: Optional[threading.Thread] = None
 
+        self._bounded_redacted_detail=_bounded_redacted_detail
         # Register this adapter so the outbound client tools can map local
         # contexts back to this gateway's peer table (see _register_context_peer).
         with _ADAPTERS_GUARD:
@@ -1809,33 +1845,18 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
         )
 
     def _try_push_reply(self, pending: dict, state: str, reply: str) -> protocol.PushOutcome:
-        if state not in (protocol.STATE_COMPLETED, protocol.STATE_INPUT_REQUIRED) or not reply:
-            _audit_safe("push_dropped", str(pending.get("peer", "")), str(pending.get("task_id", "")), "no reply to push", context_id=str(pending.get("context_id", "")))
-            return protocol.PushOutcome(success=False, category="routing", error="no reply to push")
+        if state not in (protocol.STATE_COMPLETED, protocol.STATE_INPUT_REQUIRED) or not reply:return _failure_outcome("routing","no reply to push",peer=str(pending.get("peer","")),task_id=str(pending.get("task_id","")),context_id=str(pending.get("context_id","")))
         with self._pending_lock:
-            if pending.get("pushed"):
-                return protocol.PushOutcome(success=True, category="transport", error="")
-            pending["pushed"] = True
+            if pending.get("pushed"):return protocol.PushOutcome(success=True,category="transport",error="")
+            pending["pushed"]=True
         try:
-            outcome = self._push_out_of_band(pending["context_id"], reply, want_reply=True)
-            # Strictly typed: _push_out_of_band now always returns PushOutcome (Amendment B)
-            if not outcome.success:
-                logger.warning(
-                    "A2A: out-of-band push for task %s returned failure %s: %s",
-                    pending.get("task_id"), outcome.category, outcome.error,
-                )
-            # Propagate inner outcome without re-audit (owner is inner)
+            outcome=self._push_out_of_band(pending["context_id"],reply,want_reply=True)
+            if not outcome.success:logger.warning("A2A: out-of-band push for task %s returned failure %s: %s",_bounded_redacted_detail(pending.get("task_id"),128),_bounded_redacted_detail(outcome.category,64),_bounded_redacted_detail(outcome.error,_DETAIL_MAX_CODEPOINTS))
             return outcome
         except Exception as exc:
-            logger.warning(
-                "A2A: out-of-band push for task %s failed: %s",
-                pending.get("task_id"), exc,
-            )
-            safe = security.redact_outbound(str(exc))
-            if len(safe) > 500:
-                safe = safe[:500]
-            _audit_safe("push_failed", str(pending.get("peer", "")), str(pending.get("task_id", "")), safe, context_id=str(pending.get("context_id", "")))
-            return protocol.PushOutcome(success=False, category="transport", error=safe)
+            b=_bounded_redacted_detail(exc,_DETAIL_MAX_CODEPOINTS)
+            logger.warning("A2A: out-of-band push for task %s failed: %s",_bounded_redacted_detail(pending.get("task_id"),128),b)
+            return _failure_outcome("transport",b,peer=str(pending.get("peer","")),task_id=str(pending.get("task_id","")),context_id=str(pending.get("context_id","")))
 
     def _is_duplicate_inbound(self, context_id: str, message_id: str) -> bool:
         key = (context_id, message_id)
@@ -2022,10 +2043,18 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
         if not (metadata or {}).get("notify"):
             logger.debug("A2A: ignoring non-final send for context %s", chat_id)
             return SendResult(success=True, message_id=message_id)
-        # Exact task authority per section 6.2/6.3
         if task_id_via_thread:
-            logger.warning("A2A: thread_id %s not found/active for context %s — failing without fallback", task_id_via_thread, chat_id)
-            return SendResult(success=False, message_id=message_id, error="task not found for thread_id")
+            try:_r=self.tasks.get(task_id_via_thread)
+            except:_r=None
+            if _r and _r.get("context_id")!=chat_id:task_id_via_thread=""
+            elif not _r:
+                with self._pending_lock:
+                    _e=self._pending.get(task_id_via_thread);_a=any(_c==chat_id and not _f.done() for _,(_c,_f) in self._pending.items()) or any(_rec.get("context_id")==chat_id and _rec.get("state") not in protocol.TERMINAL_STATES for _rec in self.tasks._tasks.values())
+                    if (_e and _e[0]!=chat_id) or (not _e and not _a):task_id_via_thread=""
+                    else:
+                        logger.warning("A2A: thread_id %s not found/active for context %s — failing without fallback",_bounded_redacted_detail(task_id_via_thread,128),_bounded_redacted_detail(chat_id,128))
+                        return SendResult(success=False,message_id=message_id,error="task not found for thread_id")
+            else:logger.warning("A2A: thread_id %s not found/active for context %s — failing without fallback",_bounded_redacted_detail(task_id_via_thread,128),_bounded_redacted_detail(chat_id,128));return SendResult(success=False,message_id=message_id,error="task not found for thread_id")
         if reply_to and str(reply_to).strip():
             logger.warning("A2A: reply_to %s not found/active for context %s — failing without fallback", reply_to, chat_id)
             return SendResult(success=False, message_id=message_id, error="task not found for reply_to")
@@ -2102,351 +2131,182 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
         # success here would silently advance the Kanban cursor past a
         # lost event (the reviewer's finding: no-peer false success).
         if not (metadata or {}).get("a2a_push"):
-            with self._context_peers_lock:
-                _loop_peer = self._context_peers.get(chat_id, "")
-            if _loop_peer and _loopback_fallback_url(_loop_peer, self.host, self.port):
-                _audit_safe("push_dropped", _loop_peer, message_id, "peer identity not resolvable", context_id=chat_id)
-                logger.warning(
-                    "A2A: dropping out-of-band send for %s: loopback peer %r "
-                    "is unresolvable and the message is an unmarked session "
-                    "reply — no external destination (success=False)",
-                    chat_id, _loop_peer,
-                )
-                return SendResult(
-                    success=False, message_id=message_id,
-                    error="peer identity not resolvable",
-                )
-        # Explicit no-peer failure: the context has no registered peer
-        # and no loopback identity — there is nowhere to push to.
-        with self._context_peers_lock:
-            _push_peer = self._context_peers.get(chat_id, "")
+            with self._context_peers_lock:_loop_peer=self._context_peers.get(chat_id,"")
+            if _loop_peer and _loopback_fallback_url(_loop_peer,self.host,self.port):
+                _o=_failure_outcome("routing","peer identity not resolvable",peer=_loop_peer,task_id=message_id,context_id=chat_id)
+                logger.warning("A2A: dropping out-of-band send for %s: loopback peer %r is unresolvable",_bounded_redacted_detail(chat_id,128),_bounded_redacted_detail(_loop_peer,128))
+                return _send_result_from_outcome(message_id,_o)
+        with self._context_peers_lock:_push_peer=self._context_peers.get(chat_id,"")
         if not _push_peer:
-            _audit_safe("push_dropped", "", message_id, "no peer registered for context", context_id=chat_id)
-            logger.warning(
-                "A2A: out-of-band send for %s has no registered peer; "
-                "reporting failure (success=False)",
-                chat_id,
-            )
-            return SendResult(
-                success=False, message_id=message_id,
-                error="no peer registered for context",
-            )
+            _o2=_failure_outcome("routing","no peer registered for context",peer="",task_id=message_id,context_id=chat_id)
+            logger.warning("A2A: out-of-band send for %s has no registered peer",_bounded_redacted_detail(chat_id,128))
+            return _send_result_from_outcome(message_id,_o2)
         try:
-            outcome = await asyncio.to_thread(
-                self._push_out_of_band, chat_id, content or "",
-                not (metadata or {}).get("a2a_push"),
-            )
-            # _push_out_of_band now returns typed PushOutcome (Amendment B)
-            if not outcome.success:
-                return SendResult(success=False, message_id=message_id, error=f"{outcome.category}: {outcome.error}")
+            outcome=await asyncio.to_thread(self._push_out_of_band,chat_id,content or "",not (metadata or {}).get("a2a_push"))
+            if not outcome.success:return _send_result_from_outcome(message_id,outcome)
         except Exception as exc:
-            logger.warning("A2A: out-of-band push for context %s failed: %s", chat_id, exc)
-            safe = security.redact_outbound(str(exc))
-            if len(safe) > 500:
-                safe = safe[:500]
+            b=_bounded_redacted_detail(exc,_DETAIL_MAX_CODEPOINTS)
+            logger.warning("A2A: out-of-band push for context %s failed: %s",_bounded_redacted_detail(chat_id,128),b)
             try:
-                with self._context_peers_lock:
-                    _audit_peer = self._context_peers.get(chat_id, "")
-            except Exception:
-                _audit_peer = ""
-            _audit_safe("push_failed", _audit_peer, message_id, safe, context_id=chat_id)
-            return SendResult(success=False, message_id=message_id, error=f"transport: {safe}")
-        return SendResult(success=True, message_id=message_id)
+                with self._context_peers_lock:_audit_peer=self._context_peers.get(chat_id,"")
+            except:_audit_peer=""
+            _o3=_failure_outcome("transport",b,peer=_audit_peer,task_id=message_id,context_id=chat_id)
+            return _send_result_from_outcome(message_id,_o3)
+        return SendResult(success=True,message_id=message_id)
     def _push_out_of_band(self, context_id: str, text: str, want_reply: bool = False) -> protocol.PushOutcome:
-        with self._context_peers_lock:
-            peer = self._context_peers.get(context_id, "")
+        with self._context_peers_lock:peer=self._context_peers.get(context_id,"")
         if not peer:
-            logger.debug("A2A: out-of-band send for %s has no known peer; dropping", context_id)
-            _audit_safe("push_dropped", "", context_id, "no peer registered for context", context_id=context_id)
-            return protocol.PushOutcome(success=False, category="routing", error="no peer registered for context")
+            logger.debug("A2A: out-of-band send for %s has no known peer; dropping",_bounded_redacted_detail(context_id,128))
+            return _failure_outcome("routing","no peer registered for context",peer="",task_id="",context_id=context_id)
         from . import tools as a2a_tools
-
-        entry = a2a_tools._resolve_peer(peer)
+        entry=a2a_tools._resolve_peer(peer)
         if not entry or not entry.get("url"):
-            # Localhost-only mode records inbound callers as "ip:<addr>" with
-            # no port, and there is no a2a_agents key for the raw identity.
-            # When the identity is a loopback address, the notifier path
-            # falls back to this gateway's own A2A endpoint — the one local
-            # endpoint guaranteed to route a same-contextId follow-up into
-            # the session that owns the conversation (a registered
-            # loopback "ip:" identity carries no port, so without the
-            # fallback the push dropped).
-            fallback = _loopback_fallback_url(peer, self.host, self.port)
+            fallback=_loopback_fallback_url(peer,self.host,self.port)
             if fallback:
-                if want_reply:
-                    self._drop_unresolvable_reply(context_id, peer)
-                    return protocol.PushOutcome(success=False, category="routing", error="peer identity not resolvable for reply")
-                logger.info(
-                    "A2A: out-of-band send for %s: identity %r not in a2a_agents; "
-                    "falling back to local endpoint %s",
-                    context_id, peer, fallback,
-                )
-                # The fallback URL is THIS gateway's own endpoint (it is
-                # built from self.host/self.port), so an HTTP round-trip
-                # would be a synchronous self-call: the inbound handler only
-                # answers after the agent session processes the message,
-                # which routinely exceeds the client timeout — the audit
-                # row + reply log never ran and the notifier logged a false
-                # failure. Deliver in-process
-                # instead: the exact same code path as an inbound
-                # message/send, minus the connection and the wait.
-                return self._push_loopback_in_process(context_id, peer, text, want_reply=False)
-            else:
-                _audit_safe("push_dropped", peer, context_id, "registered peer not resolvable", context_id=context_id)
-                logger.warning(
-                    "A2A: out-of-band send for %s: peer %r registered but "
-                    "not resolvable — delivery dropped",
-                    context_id, peer,
-                )
-                return protocol.PushOutcome(success=False, category="routing", error="registered peer not resolvable")
-        base_url = entry["url"]
-        # Own-endpoint guard: if the resolved target is THIS gateway (the
-        # context→peer map can be refined to our own URL — an in-process
-        # loopback push stamps our own sender, and the inbound refinement
-        # accepts it), deliver in-process instead of a synchronous HTTP
-        # self-call. The inbound handler only answers after the session
-        # processes the message, which routinely exceeds the client timeout.
-        # Reply pushes (want_reply=True) refuse this fallback — an
-        # unresolvable reply peer fails loudly.
-        if _is_own_endpoint(base_url, self.host, self.port):
-            if want_reply:
-                self._drop_unresolvable_reply(context_id, peer)
-                return protocol.PushOutcome(success=False, category="routing", error="peer identity not resolvable for reply (own endpoint)")
-            logger.info(
-                "A2A: out-of-band send for %s: resolved peer %r is this gateway "
-                "(%s); delivering in-process",
-                context_id, peer, base_url,
-            )
-            return self._push_loopback_in_process(context_id, peer, text, want_reply=False)
-        headers = {**a2a_tools._auth_header(entry.get("auth") or {}), **(entry.get("headers", {}) or {})}
-        timeout = int(entry.get("timeout", 120))
-        allowed = tuple(a2a_tools._allowed_rpc_origins(entry))
-        card = None
+                if want_reply:return self._drop_unresolvable_reply(context_id,peer)
+                logger.info("A2A: out-of-band send for %s: identity %r not in a2a_agents; falling back to local endpoint %s",_bounded_redacted_detail(context_id,128),_bounded_redacted_detail(peer,128),_bounded_redacted_detail(fallback,128))
+                return self._push_loopback_in_process(context_id,peer,text,want_reply=False)
+            else:return _failure_outcome("routing","registered peer not resolvable",peer=peer,task_id="",context_id=context_id)
+        base_url=entry["url"]
+        if _is_own_endpoint(base_url,self.host,self.port):
+            if want_reply:return self._drop_unresolvable_reply(context_id,peer)
+            logger.info("A2A: out-of-band send for %s: resolved peer %r is this gateway (%s); delivering in-process",_bounded_redacted_detail(context_id,128),_bounded_redacted_detail(peer,128),_bounded_redacted_detail(base_url,128))
+            return self._push_loopback_in_process(context_id,peer,text,want_reply=False)
+        headers={**a2a_tools._auth_header(entry.get("auth") or {}),**(entry.get("headers",{}) or {})}
+        timeout=int(entry.get("timeout",120))
+        allowed=tuple(a2a_tools._allowed_rpc_origins(entry))
+        card=None
+        try:card=a2a_tools._fetch_card(base_url,headers,min(timeout,30),allowed)
+        except:pass
+        rpc_url=a2a_tools._rpc_url(base_url,card)
+        if not a2a_tools._origin_allowed(rpc_url,entry):
+            logger.warning("A2A: peer '%s' card advertised cross-origin RPC URL %s; not in peer's allowed_rpc_origins — using configured origin %s instead",_bounded_redacted_detail(peer,128),_bounded_redacted_detail(rpc_url,300),_bounded_redacted_detail(base_url,300))
+            rpc_url=base_url.rstrip("/")
+        rpc_body={"jsonrpc":"2.0","id":protocol.new_task_id(),"method":"SendMessage","params":{"message":protocol.text_message(protocol.ROLE_USER,text,context_id=context_id,sender=self._sender_identity())}}
+        tenant=a2a_tools._interface_tenant(card,entry)
+        if tenant:rpc_body["params"]["tenant"]=tenant
+        resp=None
+        _push_outcome=protocol.PushOutcome(success=False,category="transport",error="unknown")
         try:
-            card = a2a_tools._fetch_card(base_url, headers, min(timeout, 30), allowed)
-        except Exception:
-            pass
-        rpc_url = a2a_tools._rpc_url(base_url, card)
-        if not a2a_tools._origin_allowed(rpc_url, entry):
-            logger.warning(
-                "A2A: peer '%s' card advertised cross-origin RPC URL %s; not in "
-                "peer's allowed_rpc_origins — using configured origin %s instead",
-                peer, rpc_url, base_url)
-            rpc_url = base_url.rstrip("/")
-        rpc_body = {
-            "jsonrpc": "2.0",
-            "id": protocol.new_task_id(),
-            "method": "SendMessage",
-            "params": {
-                "message": protocol.text_message(
-                    protocol.ROLE_USER, text, context_id=context_id, sender=self._sender_identity()
-                ),
-            },
-        }
-        tenant = a2a_tools._interface_tenant(card, entry)
-        if tenant:
-            rpc_body["params"]["tenant"] = tenant
-        resp = None
-        _push_outcome: protocol.PushOutcome = protocol.PushOutcome(success=False, category="transport", error="unknown")
-        try:
-            resp = a2a_tools._http_post_json(rpc_url, rpc_body, headers, timeout, allowed_origins=allowed)
-            if isinstance(resp, dict) and "error" in resp:
-                _redacted, _payload = _redacted_jsonrpc_detail(resp["error"])
-                logger.warning("A2A: out-of-band push for context %s got JSON-RPC error: %s", context_id, _redacted)
-                _push_outcome = protocol.PushOutcome(success=False, category="jsonrpc", error=_redacted, payload=_payload)
-            elif resp is None or not isinstance(resp, dict):
-                logger.warning("A2A: out-of-band push for context %s got invalid response: %r", context_id, resp)
-                _push_outcome = protocol.PushOutcome(success=False, category="transport", error=f"invalid response: {resp!r}")
+            resp=a2a_tools._http_post_json(rpc_url,rpc_body,headers,timeout,allowed_origins=allowed)
+            if isinstance(resp,dict) and "error" in resp:
+                _red,_pay=_redacted_jsonrpc_detail(resp["error"])
+                logger.warning("A2A: out-of-band push for context %s got JSON-RPC error: %s",_bounded_redacted_detail(context_id,128),_bounded_redacted_detail(_red,_DETAIL_MAX_CODEPOINTS))
+                _push_outcome=_failure_outcome("jsonrpc",_red,peer=peer,task_id="",context_id=context_id,payload=_pay)
+            elif resp is None:
+                b=_bounded_redacted_detail("no response",_DETAIL_MAX_CODEPOINTS)
+                logger.warning("A2A: out-of-band push for context %s got no response",_bounded_redacted_detail(context_id,128))
+                _push_outcome=_failure_outcome("transport",b,peer=peer,task_id="",context_id=context_id)
+            elif not isinstance(resp,dict):
+                b=_bounded_redacted_detail(resp,_DETAIL_MAX_CODEPOINTS)
+                logger.warning("A2A: out-of-band push for context %s got invalid response: %s",_bounded_redacted_detail(context_id,128),b)
+                _push_outcome=_failure_outcome("invalid_response",b,peer=peer,task_id="",context_id=context_id)
             else:
-                # Strict V1 parsing for push result
                 try:
-                    _parsed = protocol.parse_send_message_result(resp.get("result"), "V1_WRAPPED")
-                    _push_outcome = protocol.PushOutcome(success=True, category="transport", error="", payload=_parsed.payload)
+                    _parsed=protocol.parse_send_message_result(resp.get("result"),"V1_WRAPPED")
+                    _push_outcome=protocol.PushOutcome(success=True,category="transport",error="",payload=_parsed.payload)
                 except protocol.A2AResultValidationError as ve:
-                    logger.warning("A2A: out-of-band push for context %s got malformed/invalid result: %r (%s)", context_id, resp.get("result"), ve.reason)
-                    _push_outcome = protocol.PushOutcome(success=False, category="invalid_response", error=f"{ve.reason}: {ve.detail}", payload=None)
+                    b=_bounded_redacted_detail(f"{ve.reason}: {ve.detail}",_DETAIL_MAX_CODEPOINTS)
+                    logger.warning("A2A: out-of-band push for context %s got malformed/invalid result: %s",_bounded_redacted_detail(context_id,128),b)
+                    _push_outcome=_failure_outcome("invalid_response",b,peer=peer,task_id="",context_id=context_id)
         except Exception as exc:
-            logger.warning("A2A: out-of-band push for context %s failed: %s", context_id, exc)
-            # Redact to ensure no credential leak in error; preserve category transport
-            safe = security.redact_outbound(str(exc))
-            if len(safe) > 300:
-                safe = safe[:300] + "...[truncated]"
-            _push_outcome = protocol.PushOutcome(success=False, category="transport", error=safe)
+            b=_bounded_redacted_detail(exc,_DETAIL_MAX_CODEPOINTS)
+            logger.warning("A2A: out-of-band push for context %s failed: %s",_bounded_redacted_detail(context_id,128),b)
+            if _push_outcome.success or _push_outcome.error=="unknown":_push_outcome=_failure_outcome("transport",b,peer=peer,task_id="",context_id=context_id)
         finally:
-            # Amendment A: conversation agent entry is evidence of validated successful push only.
-            # All failure categories must NOT persist agent entry, must emit exactly one failure audit, no success metric/log.
-            # Post-commit side effects are best-effort and cannot downgrade committed success.
             if _push_outcome.success:
                 try:
-                    protocol.persist_message(context_id, "agent", text)
-                except Exception as exc:
-                    logger.warning("A2A: out-of-band push conversation persist failed for %s (best-effort): %s", context_id, exc)
-                try:
-                    security.audit("push", peer, rpc_body["id"], text, context_id=context_id)
-                except Exception as exc:
-                    logger.warning("A2A: out-of-band push audit failed for %s (best-effort): %s", context_id, exc)
-                logger.info("A2A: pushed out-of-band reply for context %s to peer %s", context_id, peer)
-            else:
-                _audit_safe("push_failed", peer, rpc_body["id"], _push_outcome.error, context_id=context_id)
-                logger.warning("A2A: out-of-band push for context %s to peer %s failed or got invalid result: %s", context_id, peer, _push_outcome.error)
-        if not _push_outcome.success:
-            return _push_outcome
-        if want_reply and resp is not None and _push_outcome.payload is not None:
-            # Round-trip: the peer answered inside the push's HTTP
-            # response — surface non-empty reply into LOCAL gateway.
-            # Use validated payload text, not second permissive unwrap.
-            try:
-                _validated = _push_outcome.payload
-                if isinstance(_validated, dict) and "parts" in _validated:
-                    reply = protocol.extract_text(_validated)
-                else:
-                    # Task: extract from status.message or artifacts
-                    reply = ""
-                    if isinstance(_validated, dict):
-                        status = _validated.get("status", {}) or {}
-                        msg = status.get("message") if isinstance(status, dict) else None
-                        if isinstance(msg, dict):
-                            reply = protocol.extract_text(msg)
-                        if not reply:
-                            for art in _validated.get("artifacts", []) or []:
-                                reply = protocol.extract_text(art)
-                                if reply:
-                                    break
-                        if not reply:
-                            reply = a2a_tools._reply_text_from_result(_validated)
-                if reply:
-                    # Loopback for reply surfacing must also be typed but fire-and-forget
-                    loop_res = self._push_loopback_in_process(context_id, peer, reply, want_reply=True)
-                    if not loop_res.success:
-                        logger.warning("A2A: surfaced push reply loopback failed for %s: %s", context_id, loop_res.error)
-            except Exception as exc:
-                logger.warning(
-                    "A2A: could not surface push reply for context %s: %s",
-                    context_id, exc,
-                )
-
+                    try:
+                        reply=""
+                        try:reply=a2a_tools._reply_text_from_result(_push_outcome.payload) or ""
+                        except:
+                            try:
+                                v=_push_outcome.payload
+                                if isinstance(v,dict) and "parts" in v:reply=protocol.extract_text(v)
+                                elif isinstance(v,dict):
+                                    s=v.get("status",{}) or {};m=s.get("message") if isinstance(s,dict) else None
+                                    if isinstance(m,dict):reply=protocol.extract_text(m)
+                                    if not reply:
+                                        for art in v.get("artifacts",[]) or []:
+                                            reply=protocol.extract_text(art)
+                                            if reply:break
+                                    if not reply:reply=a2a_tools._reply_text_from_result(v)
+                            except:reply=""
+                        if reply:
+                            try:protocol.persist_message(context_id,"agent",reply)
+                            except Exception as e2:logger.warning("A2A: post-commit persist failed for %s: %s",_bounded_redacted_detail(context_id,128),_bounded_redacted_detail(e2,_DETAIL_MAX_CODEPOINTS))
+                            try:security.audit("push",peer,"",reply,context_id=context_id)
+                            except Exception as e2:logger.warning("A2A: post-commit audit failed for %s: %s",_bounded_redacted_detail(context_id,128),_bounded_redacted_detail(e2,_DETAIL_MAX_CODEPOINTS))
+                            try:
+                                lr=self._push_loopback_in_process(context_id,peer,reply,want_reply=True)
+                                if not lr.success:logger.warning("A2A: surfaced loopback failed for %s: %s",_bounded_redacted_detail(context_id,128),_bounded_redacted_detail(lr.error,_DETAIL_MAX_CODEPOINTS))
+                            except Exception as e2:logger.warning("A2A: surfaced loopback exception for %s: %s",_bounded_redacted_detail(context_id,128),_bounded_redacted_detail(e2,_DETAIL_MAX_CODEPOINTS))
+                    except Exception as e2:logger.warning("A2A: post-commit extraction failed for %s: %s",_bounded_redacted_detail(context_id,128),_bounded_redacted_detail(e2,_DETAIL_MAX_CODEPOINTS))
+                except:pass
         return _push_outcome
-    def _drop_unresolvable_reply(self, context_id: str, peer: str) -> None:
-        security.audit(
-            "push_dropped", peer, "", "peer identity not resolvable",
-            context_id=context_id,
-        )
-        logger.warning(
-            "A2A: out-of-band REPLY for context %s dropped: peer identity %r "
-            "is not resolvable (no external destination)",
-            context_id, peer,
-        )
+    def _drop_unresolvable_reply(self, context_id: str, peer: str) -> protocol.PushOutcome:
+        _o=_failure_outcome("routing","peer identity not resolvable",peer=peer,task_id="",context_id=context_id)
+        logger.warning("A2A: out-of-band REPLY for context %s dropped: peer identity %r is not resolvable",_bounded_redacted_detail(context_id,128),_bounded_redacted_detail(peer,128))
+        return _o
 
     def _push_reply_after_client_gone(self, req_id: Any, result: Optional[dict], is_v1: bool = True) -> protocol.PushOutcome:
         try:
-            inner = (result or {}).get("result")
-            _mode = "V1_WRAPPED" if is_v1 else "LEGACY_BARE"
-            try:
-                _parsed = protocol.parse_send_message_result(inner, _mode)
+            inner=(result or {}).get("result")
+            _mode="V1_WRAPPED" if is_v1 else "LEGACY_BARE"
+            try:_parsed=protocol.parse_send_message_result(inner,_mode)
             except protocol.A2AResultValidationError as ve:
-                logger.warning("A2A: rescue found invalid result for req %s: %s (%s)", req_id, ve.reason, ve.detail)
-                err = f"{ve.reason}: {ve.detail}"
-                safe = security.redact_outbound(err)
-                if len(safe) > 500:
-                    safe = safe[:500]
-                _audit_safe("push_failed", "", str(req_id), safe, context_id="")
-                return protocol.PushOutcome(success=False, category="invalid_response", error=err)
-            if _parsed.kind == "task":
-                context_id = _parsed.context_id
-                state = _parsed.state
-                reply = _parsed.text
-            else:
-                logger.debug("A2A: rescue got message result, not task terminal, skipping")
-                _audit_safe("push_dropped", "", str(req_id), "message result not pushable via rescue", context_id="")
-                return protocol.PushOutcome(success=False, category="routing", error="message result not pushable via rescue")
-            if not context_id or state not in (
-                protocol.STATE_COMPLETED, protocol.STATE_INPUT_REQUIRED,
-            ):
-                logger.debug(
-                    "A2A: not pushing reply after client disconnect for %s (state=%r)",
-                    context_id, state,
-                )
-                _audit_safe("push_dropped", "", str(req_id), f"state not pushable: {state!r}", context_id=context_id or "")
-                return protocol.PushOutcome(success=False, category="routing", error=f"state not pushable: {state!r}")
-            if not reply:
-                _audit_safe("push_dropped", "", str(req_id), "no reply to push", context_id=context_id)
-                return protocol.PushOutcome(success=False, category="routing", error="no reply to push")
-            outcome = self._push_out_of_band(context_id, reply, want_reply=True)
-            if not outcome.success:
-                logger.warning(
-                    "A2A: rescue push for context %s failed — reply not delivered (want_reply=True): %s",
-                    context_id, outcome.error,
-                )
-                return outcome
-            logger.info(
-                "A2A: client disconnected before response write; pushed reply "
-                "for context %s out-of-band",
-                context_id,
-            )
+                b=_bounded_redacted_detail(f"{ve.reason}: {ve.detail}",_DETAIL_MAX_CODEPOINTS)
+                logger.warning("A2A: rescue found invalid result for req %s: %s",_bounded_redacted_detail(req_id,128),b)
+                return _failure_outcome("invalid_response",b,peer="",task_id=str(req_id),context_id="")
+            if _parsed.kind=="task":context_id=_parsed.context_id;state=_parsed.state;reply=_parsed.text
+            else:return _failure_outcome("routing","message result not pushable via rescue",peer="",task_id=str(req_id),context_id="")
+            if not context_id or state not in (protocol.STATE_COMPLETED,protocol.STATE_INPUT_REQUIRED):return _failure_outcome("routing",f"state not pushable: {state!r}",peer="",task_id=str(req_id),context_id=context_id or "")
+            if not reply:return _failure_outcome("routing","no reply to push",peer="",task_id=str(req_id),context_id=context_id)
+            outcome=self._push_out_of_band(context_id,reply,want_reply=True)
+            if not outcome.success:logger.warning("A2A: rescue push for context %s failed — reply not delivered (want_reply=True): %s",_bounded_redacted_detail(context_id,128),_bounded_redacted_detail(outcome.error,_DETAIL_MAX_CODEPOINTS));return outcome
+            logger.info("A2A: client disconnected before response write; pushed reply for context %s out-of-band",_bounded_redacted_detail(context_id,128))
             return outcome
         except Exception as exc:
-            logger.warning(
-                "A2A: could not push reply after client disconnect (req %s): %s",
-                req_id, exc,
-            )
-            safe = security.redact_outbound(str(exc))
-            if len(safe) > 500:
-                safe = safe[:500]
-            _audit_safe("push_failed", "", str(req_id), safe, context_id="")
-            return protocol.PushOutcome(success=False, category="transport", error=safe)
+            b=_bounded_redacted_detail(exc,_DETAIL_MAX_CODEPOINTS)
+            logger.warning("A2A: could not push reply after client disconnect (req %s): %s",_bounded_redacted_detail(req_id,128),b)
+            return _failure_outcome("transport",b,peer="",task_id=str(req_id),context_id="")
 
-    def _push_loopback_in_process(self, context_id: str, peer: str, text: str,
-                                  want_reply: bool = False) -> protocol.PushOutcome:
-        params = {
-            "message": protocol.text_message(
-                protocol.ROLE_USER, text, context_id=context_id, sender=self._sender_identity()
-            ),
-        }
-        try:
-            terminal, pending = self._prepare_task(params, peer)
+    def _push_loopback_in_process(self, context_id: str, peer: str, text: str,want_reply: bool = False) -> protocol.PushOutcome:
+        params={"message":protocol.text_message(protocol.ROLE_USER,text,context_id=context_id,sender=self._sender_identity())}
+        try:terminal,pending=self._prepare_task(params,peer)
         except protocol.DurablePublishError as dpe:
-            logger.error("A2A: loopback WORKING publish failed for context %s: %s", context_id, dpe)
-            _audit_loopback_failure(peer, context_id, f"durability failure: {dpe}", "durability", task_id=getattr(dpe, "task_id", "") or "")
-            return protocol.PushOutcome(success=False, category="durability", error=f"durability failure: {dpe}")
+            b=_bounded_redacted_detail(dpe,_DETAIL_MAX_CODEPOINTS)
+            logger.error("A2A: loopback WORKING publish failed for context %s: %s",_bounded_redacted_detail(context_id,128),b)
+            return _failure_outcome("durability",f"durability failure: {b}",peer=peer,task_id=getattr(dpe,"task_id","") or "",context_id=context_id)
         except Exception as exc:
-            logger.error("A2A: loopback _prepare_task exception for context %s: %s", context_id, exc)
-            _audit_loopback_failure(peer, context_id, str(exc), "transport")
-            return protocol.PushOutcome(success=False, category="transport", error=str(exc))
+            b=_bounded_redacted_detail(exc,_DETAIL_MAX_CODEPOINTS)
+            logger.error("A2A: loopback _prepare_task exception for context %s: %s",_bounded_redacted_detail(context_id,128),b)
+            return _failure_outcome("transport",b,peer=peer,task_id="",context_id=context_id)
         if terminal is not None:
-            state = (terminal.get("status") or {}).get("state", "unknown")
-            logger.warning("A2A: loopback push for context %s rejected (%s)", context_id, state)
-            _audit_loopback_failure(peer, context_id, f"rejected: {state}", "routing", task_id=str(terminal.get("id", "")) if isinstance(terminal, dict) else "")
-            return protocol.PushOutcome(success=False, category="routing", error=f"rejected: {state}")
-        assert pending is not None  # _prepare_task returns (terminal, None) or (None, pending)
+            state=(terminal.get("status") or {}).get("state","unknown")
+            logger.warning("A2A: loopback push for context %s rejected (%s)",_bounded_redacted_detail(context_id,128),_bounded_redacted_detail(state,128))
+            return _failure_outcome("routing",f"rejected: {state}",peer=peer,task_id=str(terminal.get("id","")) if isinstance(terminal,dict) else "",context_id=context_id)
+        assert pending is not None
         if want_reply:
-            # Session-reply path: the task stays pending for send() to resolve.
-            # WORKING already durably created and dispatch scheduled — commit point.
-            # Post-commit side effects are best-effort and cannot downgrade committed success.
-            try:
-                protocol.persist_message(context_id, "agent", text)
-            except Exception as exc:
-                logger.warning("A2A: loopback want_reply conversation persist failed for %s (best-effort): %s", context_id, exc)
-            try:
-                security.audit("push", peer, pending["task_id"], text, context_id=context_id)
-            except Exception as exc:
-                logger.warning("A2A: loopback want_reply push audit failed for %s (best-effort): %s", context_id, exc)
-            logger.info("A2A: pushed out-of-band reply for context %s to peer %s (want_reply)", context_id, peer)
-            return protocol.PushOutcome(success=True, category="transport", error="")
+            try:protocol.persist_message(context_id,"agent",text)
+            except Exception as exc:logger.warning("A2A: loopback want_reply persist failed for %s: %s",_bounded_redacted_detail(context_id,128),_bounded_redacted_detail(exc,_DETAIL_MAX_CODEPOINTS))
+            try:security.audit("push",peer,pending["task_id"],text,context_id=context_id)
+            except Exception as exc:logger.warning("A2A: loopback want_reply audit failed for %s: %s",_bounded_redacted_detail(context_id,128),_bounded_redacted_detail(exc,_DETAIL_MAX_CODEPOINTS))
+            logger.info("A2A: pushed out-of-band reply for context %s to peer %s (want_reply)",_bounded_redacted_detail(context_id,128),_bounded_redacted_detail(peer,128))
+            return protocol.PushOutcome(success=True,category="transport",error="")
         else:
-            # Fire-and-forget (notifier): complete the task immediately
-            # Durable COMPLETED publication must precede terminal effects and success (Amendment B).
             try:
-                self._finalize_task(pending, protocol.STATE_COMPLETED, text, audit_direction="push")
-                logger.info("A2A: delivered fire-and-forget loopback for context %s (task %s completed)", context_id, pending["task_id"])
-                return protocol.PushOutcome(success=True, category="transport", error="")
+                self._finalize_task(pending,protocol.STATE_COMPLETED,text,audit_direction="push")
+                logger.info("A2A: delivered fire-and-forget loopback for context %s (task %s completed)",_bounded_redacted_detail(context_id,128),_bounded_redacted_detail(pending["task_id"],128))
+                return protocol.PushOutcome(success=True,category="transport",error="")
             except protocol.DurablePublishError as dpe:
-                logger.error("A2A: loopback COMPLETED publish failed for context %s task %s: %s", context_id, pending.get("task_id", ""), dpe)
-                _audit_loopback_failure(peer, context_id, f"durability failure: {dpe}", "durability", task_id=pending.get("task_id", "") if isinstance(pending, dict) else "")
-                return protocol.PushOutcome(success=False, category="durability", error=f"durability failure: {dpe}")
+                b=_bounded_redacted_detail(dpe,_DETAIL_MAX_CODEPOINTS)
+                logger.error("A2A: loopback COMPLETED publish failed for context %s task %s: %s",_bounded_redacted_detail(context_id,128),_bounded_redacted_detail(pending.get("task_id",""),128),b)
+                return _failure_outcome("durability",f"durability failure: {b}",peer=peer,task_id=pending.get("task_id","") if isinstance(pending,dict) else "",context_id=context_id)
             except Exception as exc:
-                logger.error("A2A: loopback finalize exception for context %s: %s", context_id, exc)
-                _audit_loopback_failure(peer, context_id, str(exc), "transport", task_id=pending.get("task_id", "") if isinstance(pending, dict) else "")
-                return protocol.PushOutcome(success=False, category="transport", error=str(exc))
+                b=_bounded_redacted_detail(exc,_DETAIL_MAX_CODEPOINTS)
+                logger.error("A2A: loopback finalize exception for context %s: %s",_bounded_redacted_detail(context_id,128),b)
+                return _failure_outcome("transport",b,peer=peer,task_id=pending.get("task_id","") if isinstance(pending,dict) else "",context_id=context_id)
 
 
     async def on_processing_complete(self, event, outcome):
