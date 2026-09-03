@@ -161,10 +161,9 @@ def test_write_ahead_persistence_before_dispatch(monkeypatch, tmp_path):
     adapter = _bare_adapter()
     adapter.host = "127.0.0.1"
     adapter.port = 18888
-    # Setup loop and handler that records dispatch time vs ledger state
+    # Setup handler that records dispatch time vs ledger state
     loop = asyncio.new_event_loop()
-    t = threading.Thread(target=loop.run_forever, daemon=True)
-    t.start()
+    adapter._loop = loop
     ledger_before = []
     ledger_after = []
 
@@ -184,8 +183,28 @@ def test_write_ahead_persistence_before_dispatch(monkeypatch, tmp_path):
         pass  # keep task WORKING for cancel test
 
     adapter.handle_message = handler  # type: ignore
-    adapter._message_handler = object()
-    adapter._loop = loop
+    adapter._message_handler = object()  # type: ignore
+    # Mock dispatch to run handler synchronously without needing a running loop thread
+    from concurrent.futures import Future as CFuture
+
+    def fake_run(coro, target_loop):
+        try:
+            asyncio.run(coro)
+        except RuntimeError:
+            new_loop = asyncio.new_event_loop()
+            try:
+                new_loop.run_until_complete(coro)
+            finally:
+                try:
+                    new_loop.close()
+                except Exception:
+                    pass
+        fut = CFuture()
+        fut.set_result(None)
+        return fut
+
+    import asyncio as _asyncio
+    monkeypatch.setattr(_asyncio, "run_coroutine_threadsafe", fake_run)
     # Need to connect to set up tasks store? Use _prepare_task directly
     # Create a task via _prepare_task and check ledger
     # We need to mock _register_context_peer etc. to avoid side effects
@@ -227,8 +246,14 @@ def test_write_ahead_persistence_before_dispatch(monkeypatch, tmp_path):
     else:
         pytest.fail("prepare_task returned terminal, expected pending")
 
-    loop.call_soon_threadsafe(loop.stop)
-    t.join(timeout=2)
+    try:
+        loop.close()
+    except Exception:
+        pass
+    try:
+        adapter._unregister_adapter()
+    except Exception:
+        pass
 
 
 def test_truthful_out_of_band_results(monkeypatch, tmp_path):

@@ -1440,6 +1440,16 @@ class TestDeadClientReplyPush:
         assert final_rec is not None
         assert final_rec["state"] == protocol.STATE_COMPLETED
         assert final_rec["reply"] == "LATE_REPORT"
+        # Cleanup: close the event loop created for this test to avoid
+        # PytestUnraisableExceptionWarning / ResourceWarning under -W error.
+        try:
+            loop.close()
+        except Exception:
+            pass
+        try:
+            adapter._unregister_adapter()
+        except Exception:
+            pass
 
     def test_write_failure_pushes_completed_reply_v1(self, monkeypatch):
         """v1.0 envelope: a completed reply whose response write fails

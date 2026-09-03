@@ -465,6 +465,8 @@ def _send_task(agent_label: str, peer: dict, message: str, context_id: str) -> t
         raise ValueError(f"Peer '{agent_label}' returned an error: {err.get('message', err)}")
 
     result = resp.get("result", {})
+    if not protocol.is_valid_a2a_result(result):
+        raise ValueError(f"Peer '{agent_label}' returned malformed result: {result!r}")
     payload = protocol.unwrap_send_message_response(result)
     reply = _reply_text_from_result(payload)
     reply_ctx, state = ctx, ""
@@ -481,7 +483,9 @@ def _reply_text_from_result(result: Any) -> str:
     if result is None:
         return ""
     if not isinstance(result, dict):
-        return str(result) if result is not None else ""
+        # Invalid scalar results must not become pseudo-reply text; treat as empty
+        # so callers can distinguish malformed from valid text.
+        return ""
     # Artifacts first (final output), then status message (interim/clarify).
     for artifact in result.get("artifacts", []) or []:
         txt = protocol.extract_text(artifact)

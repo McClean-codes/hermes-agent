@@ -212,6 +212,52 @@ def unwrap_send_message_response(result: Any) -> Any:
             return result["message"]
     return result
 
+def is_valid_a2a_result(result: Any) -> bool:
+    """Return True when ``result`` is a valid A2A Task/Message completion shape.
+
+    Accepts the ``result`` field from a JSON-RPC 2.0 SendMessage response.
+    Valid when, after unwrapping the optional ``{"task": ...}`` / ``{"message": ...}``
+    wrapper, the payload is a non-empty dict containing at least one A2A payload key
+    (``status.state``, ``artifacts``, ``parts`` / ``role``). Empty dicts,
+    scalars, and malformed objects are invalid and must be treated as
+    structured failure.
+    """
+    if result is None:
+        return False
+    if not isinstance(result, dict):
+        return False
+    payload = unwrap_send_message_response(result)
+    if not isinstance(payload, dict) or not payload:
+        return False
+    # Task with status.state
+    st = payload.get("status")
+    if isinstance(st, dict) and st.get("state"):
+        return True
+    # Task with artifacts
+    arts = payload.get("artifacts")
+    if isinstance(arts, list) and arts:
+        # Valid if at least one artifact has parts
+        for art in arts:
+            if isinstance(art, dict) and art.get("parts"):
+                return True
+        if payload.get("id") or payload.get("contextId"):
+            return True
+        return False
+    # Message with parts
+    if isinstance(payload.get("parts"), list) and payload["parts"]:
+        return True
+    if payload.get("role") and payload.get("parts"):
+        return True
+    # Fallback: any known key with meaningful content
+    known_task = {"id", "contextId", "status", "artifacts", "history"}
+    known_msg = {"role", "parts", "messageId", "contextId", "metadata"}
+    if known_task & set(payload.keys()) or known_msg & set(payload.keys()):
+        if "id" in payload or "status" in payload:
+            return True
+        if "artifacts" in payload or "parts" in payload or "role" in payload:
+            return True
+    return False
+
 
 def stream_task(task: dict) -> dict:
     """v1.0 StreamResponse with a task member."""

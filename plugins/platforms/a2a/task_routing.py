@@ -263,7 +263,7 @@ class TaskRPCHandler:
             from .a2a_persistence import _task_ledger_path
             self.tasks.persist(_task_ledger_path())
         except Exception:
-            logger.debug("A2A: could not persist task ledger at CANCELED", exc_info=True)
+            logger.error("A2A: failed to persist task ledger at CANCELED for task %s", task_id, exc_info=True)
         self._turns.reset(rec["context_id"])
         self._resolve_task(task_id, protocol.STATE_CANCELED, "")
         rec = self.tasks.get(task_id, *self._scope_for_agent(agent)) or rec
