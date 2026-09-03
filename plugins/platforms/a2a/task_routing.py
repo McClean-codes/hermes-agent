@@ -16,6 +16,7 @@ import urllib.request
 from concurrent.futures import TimeoutError as FuturesTimeout
 from typing import Any, Optional
 
+from gateway.platforms.base import MessageEvent, ProcessingOutcome
 from . import protocol, security
 
 logger = logging.getLogger(__name__)
@@ -260,10 +261,16 @@ class TaskRPCHandler:
                 f"task {task_id} already {rec['state']}")
         self.tasks.complete(task_id, protocol.STATE_CANCELED, "")
         try:
-            from .a2a_persistence import _task_ledger_path
-            self.tasks.persist(_task_ledger_path())
+            from .a2a_persistence import _try_persist_task_ledger, _task_ledger_path
+            ok = _try_persist_task_ledger(self.tasks, _task_ledger_path(), f"CANCELED {task_id}")
         except Exception:
             logger.error("A2A: failed to persist task ledger at CANCELED for task %s", task_id, exc_info=True)
+            ok = False
+        if not ok:
+            logger.error("A2A: failed to persist CANCELED state for task %s — returning indeterminate failure", task_id)
+            self._turns.reset(rec["context_id"])
+            # Fail-closed: do not claim durable cancellation when disk write failed.
+            return protocol.jsonrpc_error(req_id, -32000, f"task {task_id} cancellation persistence failed — state indeterminate")
         self._turns.reset(rec["context_id"])
         self._resolve_task(task_id, protocol.STATE_CANCELED, "")
         rec = self.tasks.get(task_id, *self._scope_for_agent(agent)) or rec
@@ -326,6 +333,114 @@ class TaskRPCHandler:
                 req_id, protocol.ERR_TASK_NOT_FOUND,
                 f"push config not found for task: {task_id}")
         return protocol.jsonrpc_result(req_id, {"deleted": True})
+
+
+    def _finalize_task(self, pending: dict, state: str, reply: str,
+                       audit_direction: str = "outbound") -> tuple[str, str]:
+        """Record the outcome of a dispatched task. Returns (state, reply) after
+        redaction and input-required detection.
+
+        ``audit_direction`` overrides the security audit direction (default
+        ``"outbound"``).  Fire-and-forget loopback pushes use ``"push"``.
+        """
+        task_id = pending["task_id"]
+        context_id = pending["context_id"]
+        peer = pending["peer"]
+        self._pop_pending(task_id)
+
+        reply = security.redact_outbound(reply or "")
+
+        # The agent flags clarification requests with a leading marker; map
+        # them to the A2A input-required state so the peer knows to answer.
+        if state == protocol.STATE_COMPLETED:
+            stripped = reply.lstrip()
+            if stripped.upper().startswith(protocol.INPUT_REQUIRED_MARKER):
+                state = protocol.STATE_INPUT_REQUIRED
+                reply = stripped[len(protocol.INPUT_REQUIRED_MARKER):].strip()
+
+        protocol.persist_message(context_id, "agent", reply, task_id)
+        security.audit(audit_direction, peer, task_id, reply, context_id=context_id)
+
+        if state in (protocol.STATE_COMPLETED, protocol.STATE_INPUT_REQUIRED):
+            protocol.metrics.outbound_total += 1
+            protocol.metrics.tasks_completed += 1
+            protocol.metrics.record_latency(time.time() - pending["started"])
+        else:
+            protocol.metrics.tasks_failed += 1
+
+        self.tasks.complete(task_id, state, reply)
+        # Persist the task ledger so GetTask/ListTasks/SubscribeToTask survive a gateway restart.
+        # Fail-closed: if durable write fails, caller must not receive a successful terminal result.
+        from .a2a_persistence import _try_persist_task_ledger, _task_ledger_path
+        ok = _try_persist_task_ledger(self.tasks, _task_ledger_path(), f"terminal {state} {task_id}")
+        if not ok:
+            logger.error("A2A: failed to persist terminal %s for task %s — returning indeterminate failure", state, task_id)
+            # Force memory to FAILED indeterminate so GetTask does not claim durable success.
+            # Complete is terminal-idempotent, so we must mutate directly when already terminal.
+            try:
+                with self.tasks._lock:
+                    rec = self.tasks._tasks.get(task_id)
+                    if rec is not None:
+                        rec["state"] = protocol.STATE_FAILED
+                        rec["reply"] = "[terminal persistence failed — state indeterminate]"
+                        rec["completed_at"] = rec.get("completed_at") or __import__("time").time()
+                # Best-effort second attempt to persist the failure state (may also fail)
+                _try_persist_task_ledger(self.tasks, _task_ledger_path(), f"FAILED after terminal persist fail {task_id}")
+            except Exception:
+                pass
+            protocol.metrics.tasks_failed += 1
+            return protocol.STATE_FAILED, "[terminal persistence failed — state indeterminate]"
+        self._send_push_notification(task_id, context_id, reply, state)
+        return state, reply
+
+
+    async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
+        """Resolve the task future when processing ends without a reply send.
+
+        The success path resolves via send(); this hook catches failures,
+        cancellations, and empty runs so the HTTP thread returns promptly
+        instead of waiting out the reply timeout. For deferred disconnects
+        (HTTP waiter already gone), failure/cancellation must immediately
+        terminalize the TaskStore record and durably persist — otherwise
+        GetTask/SubscribeToTask remain stale WORKING. Success keeps the
+        deferred WORKING semantics so a late send() can still finalize the
+        original task.
+        """
+        task_id = str(getattr(event, "message_id", "") or "")
+        if not task_id:
+            return
+        if outcome == ProcessingOutcome.FAILURE:
+            self._resolve_task(task_id, protocol.STATE_FAILED, "[agent processing failed]")
+            # Deferred failure: if TaskStore still non-terminal (HTTP waiter
+            # disconnected, no one will call _finalize_task), terminalize now.
+            rec = self.tasks.get(task_id)
+            if rec and rec["state"] not in protocol.TERMINAL_STATES:
+                self.tasks.complete(task_id, protocol.STATE_FAILED, "[agent processing failed]")
+                from .a2a_persistence import _try_persist_task_ledger, _task_ledger_path
+                ok = _try_persist_task_ledger(self.tasks, _task_ledger_path(), f"FAILED on_processing_complete {task_id}")
+                if not ok:
+                    logger.error("A2A: failed to persist FAILED state for task %s after disconnect — state indeterminate", task_id)
+                protocol.metrics.tasks_failed += 1
+                try:
+                    self._send_push_notification(task_id, rec["context_id"], "[agent processing failed]", protocol.STATE_FAILED)
+                except Exception:
+                    pass
+        elif outcome == ProcessingOutcome.CANCELLED:
+            self._resolve_task(task_id, protocol.STATE_CANCELED, "")
+            rec = self.tasks.get(task_id)
+            if rec and rec["state"] not in protocol.TERMINAL_STATES:
+                self.tasks.complete(task_id, protocol.STATE_CANCELED, "")
+                from .a2a_persistence import _try_persist_task_ledger, _task_ledger_path
+                ok = _try_persist_task_ledger(self.tasks, _task_ledger_path(), f"CANCELED on_processing_complete {task_id}")
+                if not ok:
+                    logger.error("A2A: failed to persist CANCELED state for task %s after disconnect — state indeterminate", task_id)
+                protocol.metrics.tasks_failed += 1
+                try:
+                    self._send_push_notification(task_id, rec["context_id"], "", protocol.STATE_CANCELED)
+                except Exception:
+                    pass
+        else:
+            self._resolve_task(task_id, protocol.STATE_COMPLETED, "")
 
     # ── Push notification delivery ────────────────────────────────────────
 

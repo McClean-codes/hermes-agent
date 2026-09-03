@@ -217,10 +217,11 @@ def is_valid_a2a_result(result: Any) -> bool:
 
     Accepts the ``result`` field from a JSON-RPC 2.0 SendMessage response.
     Valid when, after unwrapping the optional ``{"task": ...}`` / ``{"message": ...}``
-    wrapper, the payload is a non-empty dict containing at least one A2A payload key
-    (``status.state``, ``artifacts``, ``parts`` / ``role``). Empty dicts,
-    scalars, and malformed objects are invalid and must be treated as
-    structured failure.
+    wrapper, the payload is a non-empty dict containing at least one genuinely
+    meaningful A2A payload key (``status.state`` string, ``artifacts`` with
+    non-empty ``parts``, or ``parts`` non-empty). Empty dicts, scalars,
+    id-only, empty-status, and other malformed objects are invalid and must be
+    treated as structured failure.
     """
     if result is None:
         return False
@@ -229,33 +230,20 @@ def is_valid_a2a_result(result: Any) -> bool:
     payload = unwrap_send_message_response(result)
     if not isinstance(payload, dict) or not payload:
         return False
-    # Task with status.state
+    # Task with status.state — requires a non-empty string state
     st = payload.get("status")
-    if isinstance(st, dict) and st.get("state"):
+    if isinstance(st, dict) and isinstance(st.get("state"), str) and st.get("state"):
         return True
-    # Task with artifacts
+    # Task with artifacts — require at least one artifact with non-empty parts
     arts = payload.get("artifacts")
     if isinstance(arts, list) and arts:
-        # Valid if at least one artifact has parts
         for art in arts:
-            if isinstance(art, dict) and art.get("parts"):
+            if isinstance(art, dict) and isinstance(art.get("parts"), list) and art.get("parts"):
                 return True
-        if payload.get("id") or payload.get("contextId"):
-            return True
         return False
-    # Message with parts
+    # Message with parts — require non-empty parts list
     if isinstance(payload.get("parts"), list) and payload["parts"]:
         return True
-    if payload.get("role") and payload.get("parts"):
-        return True
-    # Fallback: any known key with meaningful content
-    known_task = {"id", "contextId", "status", "artifacts", "history"}
-    known_msg = {"role", "parts", "messageId", "contextId", "metadata"}
-    if known_task & set(payload.keys()) or known_msg & set(payload.keys()):
-        if "id" in payload or "status" in payload:
-            return True
-        if "artifacts" in payload or "parts" in payload or "role" in payload:
-            return True
     return False
 
 
