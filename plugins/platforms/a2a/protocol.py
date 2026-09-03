@@ -898,9 +898,17 @@ class TaskStore:
                 dir=str(path.parent), suffix=".tmp"
             )
             try:
-                os.fchmod(tmp_fd, 0o600)
+                try:
+                    os.fchmod(tmp_fd, 0o600)
+                except (AttributeError, OSError, NotImplementedError):
+                    pass
                 with os.fdopen(tmp_fd, "w") as f:
                     json.dump(snapshot, f, ensure_ascii=False, indent=2)
+                # Windows-safe permission hardening: chmod works on both platforms
+                try:
+                    os.chmod(tmp_path, 0o600)
+                except OSError:
+                    pass
                 os.replace(tmp_path, str(path))
             except BaseException:
                 try:

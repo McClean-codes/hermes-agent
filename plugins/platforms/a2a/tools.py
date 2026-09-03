@@ -478,8 +478,10 @@ def _send_task(agent_label: str, peer: dict, message: str, context_id: str) -> t
 
 def _reply_text_from_result(result: Any) -> str:
     result = protocol.unwrap_send_message_response(result)
+    if result is None:
+        return ""
     if not isinstance(result, dict):
-        return str(result)
+        return str(result) if result is not None else ""
     # Artifacts first (final output), then status message (interim/clarify).
     for artifact in result.get("artifacts", []) or []:
         txt = protocol.extract_text(artifact)

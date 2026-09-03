@@ -1016,6 +1016,8 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
             "A2A: serving Agent Card + JSON-RPC on http://%s:%s (%s) as %r; %d routed agent(s)",
             self.host, self.port, exposure, self.agent_name, len(self._agents),
         )
+        # Plugin-registered native handlers (ctx.register_platform_handler).
+        self._wire_plugin_handlers(None)
         return True
 
     async def disconnect(self) -> None:
@@ -1976,6 +1978,78 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
         marker; those must not satisfy the JSON-RPC caller.
         """
         message_id = str(int(time.time() * 1000))
+        # Task-authority: prefer the specific task via thread_id (ContextVar) to avoid cross-talk
+        task_id_via_thread = ""
+        try:
+            from gateway.session_context import get_session_env
+            task_id_via_thread = str(get_session_env("HERMES_SESSION_THREAD_ID") or "").strip()
+        except Exception:
+            task_id_via_thread = ""
+        if task_id_via_thread:
+            # Pending path: resolve the exact pending Future for this task
+            _resolved_via_thread = False
+            with self._pending_lock:
+                ent = self._pending.get(task_id_via_thread)
+                if ent and ent[0] == chat_id and not ent[1].done():
+                    try:
+                        ent[1].set_result((protocol.STATE_COMPLETED, content or ""))
+                    except Exception:
+                        pass
+                    order = self._pending_order.get(chat_id)
+                    if order is not None:
+                        try:
+                            order.remove(task_id_via_thread)
+                        except ValueError:
+                            pass
+                        if not order:
+                            self._pending_order.pop(chat_id, None)
+                    self._pending.pop(task_id_via_thread, None)
+                    try:
+                        self.tasks.complete(task_id_via_thread, protocol.STATE_COMPLETED, content or "")
+                        self.tasks.persist(_task_ledger_path())
+                    except Exception:
+                        pass
+                    _resolved_via_thread = True
+            if _resolved_via_thread:
+                return SendResult(success=True, message_id=message_id)
+            # Store path: disconnected task still WORKING in TaskStore — finalize the specific record
+            try:
+                rec_thr = self.tasks.get(task_id_via_thread)
+                if rec_thr and rec_thr.get("context_id") == chat_id and rec_thr.get("state") not in protocol.TERMINAL_STATES:
+                    logger.info("A2A: late completion for disconnected task %s (context %s) — finalizing original task record (thread_id path)", task_id_via_thread, chat_id)
+                    self._finalize_task({"task_id": task_id_via_thread, "context_id": chat_id, "peer": rec_thr.get("peer", ""), "started": rec_thr.get("created_at", time.time()), "created_iso": rec_thr.get("created_iso", "")}, protocol.STATE_COMPLETED, content or "", audit_direction="push")
+                    return SendResult(success=True, message_id=message_id)
+            except Exception:
+                pass
+        if not task_id_via_thread and reply_to:
+            cand = str(reply_to).strip()
+            if cand:
+                with self._pending_lock:
+                    ent2 = self._pending.get(cand)
+                    if ent2 and ent2[0] == chat_id and not ent2[1].done():
+                        try:
+                            ent2[1].set_result((protocol.STATE_COMPLETED, content or ""))
+                        except Exception:
+                            pass
+                        order2 = self._pending_order.get(chat_id)
+                        if order2 is not None:
+                            try:
+                                order2.remove(cand)
+                            except ValueError:
+                                pass
+                            if not order2:
+                                self._pending_order.pop(chat_id, None)
+                        self._pending.pop(cand, None)
+                        return SendResult(success=True, message_id=message_id)
+                # TaskStore fallback for reply_to
+                try:
+                    rec2 = self.tasks.get(cand)
+                    if rec2 and rec2.get("context_id") == chat_id and rec2.get("state") not in protocol.TERMINAL_STATES:
+                        logger.info("A2A: late completion for disconnected task %s (context %s) — finalizing via reply_to", cand, chat_id)
+                        self._finalize_task({"task_id": cand, "context_id": chat_id, "peer": rec2.get("peer", ""), "started": rec2.get("created_at", time.time()), "created_iso": rec2.get("created_iso", "")}, protocol.STATE_COMPLETED, content or "", audit_direction="push")
+                        return SendResult(success=True, message_id=message_id)
+                except Exception:
+                    pass
         if not (metadata or {}).get("notify"):
             logger.debug("A2A: ignoring non-final send for context %s", chat_id)
             return SendResult(success=True, message_id=message_id)
@@ -2069,16 +2143,18 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
             # want_reply=True for session-reply pushes (the peer answers
             # inside the push's HTTP response — the round-trip path); False
             # for notifier pushes (fire-and-forget, unchanged).
-            await asyncio.to_thread(
+            ok = await asyncio.to_thread(
                 self._push_out_of_band, chat_id, content or "",
                 not (metadata or {}).get("a2a_push"),
             )
         except Exception as exc:
             logger.warning("A2A: out-of-band push for context %s failed: %s", chat_id, exc)
             return SendResult(success=False, message_id=message_id, error=str(exc))
+        if not ok:
+            return SendResult(success=False, message_id=message_id, error="out-of-band push failed")
         return SendResult(success=True, message_id=message_id)
 
-    def _push_out_of_band(self, context_id: str, text: str, want_reply: bool = False) -> None:
+    def _push_out_of_band(self, context_id: str, text: str, want_reply: bool = False) -> bool:
         """POST a new message/send to the peer that owns ``context_id``.
 
         Runs on a worker thread (blocking urllib). Resolves the peer from
@@ -2107,7 +2183,7 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
             peer = self._context_peers.get(context_id, "")
         if not peer:
             logger.debug("A2A: out-of-band send for %s has no known peer; dropping", context_id)
-            return
+            return False
         from . import tools as a2a_tools
 
         entry = a2a_tools._resolve_peer(peer)
@@ -2124,7 +2200,7 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
             if fallback:
                 if want_reply:
                     self._drop_unresolvable_reply(context_id, peer)
-                    return
+                    return False
                 logger.info(
                     "A2A: out-of-band send for %s: identity %r not in a2a_agents; "
                     "falling back to local endpoint %s",
@@ -2140,7 +2216,7 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
                 # instead: the exact same code path as an inbound
                 # message/send, minus the connection and the wait.
                 self._push_loopback_in_process(context_id, peer, text, want_reply=False)
-                return
+                return True
             else:
                 # Stale/unresolvable peer: a registered peer identity that
                 # can't be resolved to a URL.  Loud failure so notifier/cursor
@@ -2154,7 +2230,7 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
                     "not resolvable — delivery dropped",
                     context_id, peer,
                 )
-                return
+                return False
         base_url = entry["url"]
         # Own-endpoint guard: if the resolved target is THIS gateway (the
         # context→peer map can be refined to our own URL — an in-process
@@ -2167,21 +2243,29 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
         if _is_own_endpoint(base_url, self.host, self.port):
             if want_reply:
                 self._drop_unresolvable_reply(context_id, peer)
-                return
+                return False
             logger.info(
                 "A2A: out-of-band send for %s: resolved peer %r is this gateway "
                 "(%s); delivering in-process",
                 context_id, peer, base_url,
             )
             self._push_loopback_in_process(context_id, peer, text, want_reply=False)
-            return
+            return True
         headers = a2a_tools._auth_header(entry.get("auth") or {})
         timeout = int(entry.get("timeout", 120))
+        allowed = tuple(a2a_tools._allowed_rpc_origins(entry))
         card = None
         try:
-            card = a2a_tools._fetch_card(base_url, headers, min(timeout, 30))
+            card = a2a_tools._fetch_card(base_url, headers, min(timeout, 30), allowed)
         except Exception:
             pass
+        rpc_url = a2a_tools._rpc_url(base_url, card)
+        if not a2a_tools._origin_allowed(rpc_url, entry):
+            logger.warning(
+                "A2A: peer '%s' card advertised cross-origin RPC URL %s; not in "
+                "peer's allowed_rpc_origins — using configured origin %s instead",
+                peer, rpc_url, base_url)
+            rpc_url = base_url.rstrip("/")
         rpc_body = {
             "jsonrpc": "2.0",
             "id": protocol.new_task_id(),
@@ -2196,21 +2280,29 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
         if tenant:
             rpc_body["params"]["tenant"] = tenant
         resp = None
+        success = False
         try:
-            resp = a2a_tools._http_post_json(a2a_tools._rpc_url(base_url, card), rpc_body, headers, timeout)
+            resp = a2a_tools._http_post_json(rpc_url, rpc_body, headers, timeout, allowed_origins=allowed)
+            if isinstance(resp, dict) and "error" in resp:
+                logger.warning("A2A: out-of-band push for context %s got JSON-RPC error: %s", context_id, resp["error"])
+                success = False
+            elif resp is None or not isinstance(resp, dict):
+                logger.warning("A2A: out-of-band push for context %s got invalid response: %r", context_id, resp)
+                success = False
+            elif resp.get("result") is None:
+                logger.warning("A2A: out-of-band push for context %s got None result", context_id)
+                success = False
+            else:
+                success = True
+        except Exception as exc:
+            logger.warning("A2A: out-of-band push for context %s failed: %s", context_id, exc)
+            success = False
         finally:
-            # Bookkeeping runs even when the client times out: the receiving
-            # gateway answers only after its agent session finishes, which
-            # can exceed the client timeout even though the message was
-            # delivered. The audit row + reply log are the
-            # delivery records the notifier path relies on.
             protocol.persist_message(context_id, "agent", text)
-            # The 'push' audit direction is documented in security.py but had no
-            # caller — every out-of-band push was invisible in a2a_audit.jsonl,
-            # which made diagnosing the push pipeline harder. Best-effort, like
-            # every other audit call.
             security.audit("push", peer, rpc_body["id"], text, context_id=context_id)
             logger.info("A2A: pushed out-of-band reply for context %s to peer %s", context_id, peer)
+        if not success:
+            return False
         if want_reply and resp is not None:
             # Round-trip: the peer answered inside the push's HTTP
             # response — a verdict arriving this way was previously
@@ -2228,6 +2320,8 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
                     "A2A: could not surface push reply for context %s: %s",
                     context_id, exc,
                 )
+
+        return True
 
     def _drop_unresolvable_reply(self, context_id: str, peer: str) -> None:
         """Loud failure for a reply push with no resolvable external target.
