@@ -342,9 +342,9 @@ def test_send_task_stamps_sender_on_outbound(monkeypatch, tmp_path):
     def fake_post(url, body, headers, timeout, **kw):
         posted["url"] = url
         posted["body"] = body
-        return {"jsonrpc": "2.0", "id": body["id"], "result": protocol.build_task(
+        return {"jsonrpc": "2.0", "id": body["id"], "result": {"task": protocol.build_task(
             "task-1", "ctx-out-1", protocol.STATE_COMPLETED, "ok",
-        )}
+        )}}
 
     monkeypatch.setattr(tools, "_http_post_json", fake_post)
 
