@@ -99,6 +99,19 @@ class TurnRunner:
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             preview_str = f' "{preview}"' if preview else ""
             ctx.log_queue.put(f"{ts}  {tool_name}:{preview_str}".rstrip())
+        # Fire on_tool_call_start hook for dynamic reaction swapping.
+        # Runs before the progress_queue guard so reactions work even when
+        # tool progress messages are off.
+        if event_type == "tool.started" and tool_name and getattr(ctx, "_status_adapter", None) and ctx._run_still_current():
+            try:
+                self._schedule(
+                    ctx._status_adapter._run_processing_hook(
+                        "on_tool_call_start", ctx.source, tool_name
+                    ),
+                    "on_tool_call_start scheduling error",
+                )
+            except Exception:
+                pass
         if not ctx.progress_queue or not ctx._run_still_current():
             return
         if event_type == "tool.completed" and not ctx.long_tool_hint_fired[0]:
