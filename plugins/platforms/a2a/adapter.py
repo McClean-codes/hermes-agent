@@ -16,6 +16,7 @@ import urllib.parse
 import urllib.request
 import weakref
 from collections import deque
+import collections.abc as _collections_abc
 from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FuturesTimeout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -170,6 +171,20 @@ def _sanitize_string_for_jsonrpc(v,m=300):
   if not isinstance(r,str):r=_REDACTED_MARKER
  except:r=_REDACTED_MARKER
  return _truncate_codepoints(r,m)
+def _redacted_reply_text(value: object) -> str:
+ try:
+  if not isinstance(value, str):
+   return _REDACTED_MARKER
+  s = value
+ except:
+  return _REDACTED_MARKER
+ try:
+  r = security.redact_outbound(s)
+  if not isinstance(r, str):
+   return _REDACTED_MARKER
+  return r
+ except:
+  return _REDACTED_MARKER
 def _sanitize_jsonrpc_value(v,d):
  try:
   if d>_JSONRPC_MAX_DEPTH:return _REDACTED_MARKER
@@ -179,12 +194,17 @@ def _sanitize_jsonrpc_value(v,d):
   if isinstance(v,str):return _sanitize_string_for_jsonrpc(v,_JSONRPC_STRING_MAX_CODEPOINTS)
   if isinstance(v,dict):
    out={}
-   try:items=list(v.items())
-   except:return _REDACTED_MARKER
-   c=0
-   for k,val in items:
-    if c>=_JSONRPC_MAX_WIDTH:break
-    c+=1
+   try:
+    iterator = iter(dict.items(v))
+   except:
+    return _REDACTED_MARKER
+   for _ in range(_JSONRPC_MAX_WIDTH):
+    try:
+     k,val = next(iterator)
+    except StopIteration:
+     break
+    except:
+     return _REDACTED_MARKER
     if isinstance(k,str):
      try:
       rk=security.redact_outbound(k)
@@ -192,28 +212,54 @@ def _sanitize_jsonrpc_value(v,d):
      except:rk=_REDACTED_MARKER
      sk=_truncate_codepoints(rk,_JSONRPC_KEY_MAX_CODEPOINTS)
     else:sk=_REDACTED_MARKER
-    if sk in out:continue
+    if sk in out:
+     continue
     out[sk]=_sanitize_jsonrpc_value(val,d+1)
    return out
   if isinstance(v,list):
-   try:t=v[:_JSONRPC_MAX_WIDTH]
+   try:
+    t=v[:_JSONRPC_MAX_WIDTH]
    except:return _REDACTED_MARKER
    return [_sanitize_jsonrpc_value(x,d+1) for x in t]
+  if isinstance(v,_collections_abc.Mapping):
+   return _REDACTED_MARKER
   return _REDACTED_MARKER
  except:return _REDACTED_MARKER
 def _redacted_jsonrpc_detail(raw):
  payload={}
  try:
-  if isinstance(raw,dict):
-   if "code" in raw:
-    rc=raw.get("code")
+  if isinstance(raw,_collections_abc.Mapping) and not isinstance(raw,dict):
+   payload={"message":_REDACTED_MARKER}
+  elif isinstance(raw,dict):
+   try:
+    has_code = dict.__contains__(raw, "code")
+   except:
+    has_code = False
+   if has_code:
+    try:
+     rc = dict.get(raw, "code")
+    except:
+     rc = None
     if isinstance(rc,int) and not isinstance(rc,bool) and _JSONRPC_CODE_MIN<=rc<=_JSONRPC_CODE_MAX:payload["code"]=rc
-   if "message" in raw:
-    rm=raw.get("message")
+   try:
+    has_message = dict.__contains__(raw, "message")
+   except:
+    has_message = False
+   if has_message:
+    try:
+     rm = dict.get(raw, "message")
+    except:
+     rm = None
     if isinstance(rm,str):payload["message"]=_sanitize_string_for_jsonrpc(rm,_JSONRPC_STRING_MAX_CODEPOINTS)
     elif rm is not None:payload["message"]=_bounded_redacted_detail(rm,_JSONRPC_STRING_MAX_CODEPOINTS)
-   if "data" in raw:
-    try:payload["data"]=_sanitize_jsonrpc_value(raw["data"],0)
+   try:
+    has_data = dict.__contains__(raw, "data")
+   except:
+    has_data = False
+   if has_data:
+    try:
+     _data = dict.get(raw, "data")
+     payload["data"]=_sanitize_jsonrpc_value(_data,0)
     except:payload["data"]=_REDACTED_MARKER
    if not payload:payload["message"]=_REDACTED_MARKER
   else:
@@ -572,6 +618,8 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
         self._watchdog_thread: Optional[threading.Thread] = None
 
         self._bounded_redacted_detail=_bounded_redacted_detail
+        self._redacted_reply_text=_redacted_reply_text
+        self._audit_safe=_audit_safe
         # Register this adapter so the outbound client tools can map local
         # contexts back to this gateway's peer table (see _register_context_peer).
         with _ADAPTERS_GUARD:
@@ -2204,7 +2252,13 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
             else:
                 try:
                     _parsed=protocol.parse_send_message_result(resp.get("result"),"V1_WRAPPED")
-                    _push_outcome=protocol.PushOutcome(success=True,category="transport",error="",payload=_parsed.payload)
+                    _raw_reply = _parsed.text if isinstance(getattr(_parsed,"text",None),str) else ""
+                    _safe_reply = _redacted_reply_text(_raw_reply)
+                    _audit_reply = _bounded_redacted_detail(_safe_reply,300)
+                    _push_outcome=protocol.PushOutcome(success=True,category="transport",error="",payload=None)
+                    _oob_safe_reply = _safe_reply
+                    _oob_audit_reply = _audit_reply
+                    _oob_has_reply = bool(_safe_reply)
                 except protocol.A2AResultValidationError as ve:
                     b=_bounded_redacted_detail(f"{ve.reason}: {ve.detail}",_DETAIL_MAX_CODEPOINTS)
                     logger.warning("A2A: out-of-band push for context %s got malformed/invalid result: %s",_bounded_redacted_detail(context_id,128),b)
@@ -2217,28 +2271,16 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
             if _push_outcome.success:
                 try:
                     try:
-                        reply=""
-                        try:reply=a2a_tools._reply_text_from_result(_push_outcome.payload) or ""
-                        except:
-                            try:
-                                v=_push_outcome.payload
-                                if isinstance(v,dict) and "parts" in v:reply=protocol.extract_text(v)
-                                elif isinstance(v,dict):
-                                    s=v.get("status",{}) or {};m=s.get("message") if isinstance(s,dict) else None
-                                    if isinstance(m,dict):reply=protocol.extract_text(m)
-                                    if not reply:
-                                        for art in v.get("artifacts",[]) or []:
-                                            reply=protocol.extract_text(art)
-                                            if reply:break
-                                    if not reply:reply=a2a_tools._reply_text_from_result(v)
-                            except:reply=""
-                        if reply:
-                            try:protocol.persist_message(context_id,"agent",reply)
+                        safe_reply = locals().get("_oob_safe_reply", "")
+                        audit_reply = locals().get("_oob_audit_reply", "")
+                        has_reply = locals().get("_oob_has_reply", False)
+                        if has_reply and safe_reply:
+                            try:protocol.persist_message(context_id,"agent",safe_reply)
                             except Exception as e2:logger.warning("A2A: post-commit persist failed for %s: %s",_bounded_redacted_detail(context_id,128),_bounded_redacted_detail(e2,_DETAIL_MAX_CODEPOINTS))
-                            try:security.audit("push",peer,"",reply,context_id=context_id)
+                            try:_audit_safe("push",peer,"",audit_reply,context_id=context_id)
                             except Exception as e2:logger.warning("A2A: post-commit audit failed for %s: %s",_bounded_redacted_detail(context_id,128),_bounded_redacted_detail(e2,_DETAIL_MAX_CODEPOINTS))
                             try:
-                                lr=self._push_loopback_in_process(context_id,peer,reply,want_reply=True)
+                                lr=self._push_loopback_in_process(context_id,peer,safe_reply,want_reply=True)
                                 if not lr.success:logger.warning("A2A: surfaced loopback failed for %s: %s",_bounded_redacted_detail(context_id,128),_bounded_redacted_detail(lr.error,_DETAIL_MAX_CODEPOINTS))
                             except Exception as e2:logger.warning("A2A: surfaced loopback exception for %s: %s",_bounded_redacted_detail(context_id,128),_bounded_redacted_detail(e2,_DETAIL_MAX_CODEPOINTS))
                     except Exception as e2:logger.warning("A2A: post-commit extraction failed for %s: %s",_bounded_redacted_detail(context_id,128),_bounded_redacted_detail(e2,_DETAIL_MAX_CODEPOINTS))
@@ -2272,7 +2314,9 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
             return _failure_outcome("transport",b,peer="",task_id=str(req_id),context_id="")
 
     def _push_loopback_in_process(self, context_id: str, peer: str, text: str,want_reply: bool = False) -> protocol.PushOutcome:
-        params={"message":protocol.text_message(protocol.ROLE_USER,text,context_id=context_id,sender=self._sender_identity())}
+        safe_text = _redacted_reply_text(text)
+        audit_text = _bounded_redacted_detail(safe_text,300)
+        params={"message":protocol.text_message(protocol.ROLE_USER,safe_text,context_id=context_id,sender=self._sender_identity())}
         try:terminal,pending=self._prepare_task(params,peer)
         except protocol.DurablePublishError as dpe:
             b=_bounded_redacted_detail(dpe,_DETAIL_MAX_CODEPOINTS)
@@ -2288,15 +2332,15 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
             return _failure_outcome("routing",f"rejected: {state}",peer=peer,task_id=str(terminal.get("id","")) if isinstance(terminal,dict) else "",context_id=context_id)
         assert pending is not None
         if want_reply:
-            try:protocol.persist_message(context_id,"agent",text)
+            try:protocol.persist_message(context_id,"agent",safe_text)
             except Exception as exc:logger.warning("A2A: loopback want_reply persist failed for %s: %s",_bounded_redacted_detail(context_id,128),_bounded_redacted_detail(exc,_DETAIL_MAX_CODEPOINTS))
-            try:security.audit("push",peer,pending["task_id"],text,context_id=context_id)
+            try:_audit_safe("push",peer,pending["task_id"],audit_text,context_id=context_id)
             except Exception as exc:logger.warning("A2A: loopback want_reply audit failed for %s: %s",_bounded_redacted_detail(context_id,128),_bounded_redacted_detail(exc,_DETAIL_MAX_CODEPOINTS))
             logger.info("A2A: pushed out-of-band reply for context %s to peer %s (want_reply)",_bounded_redacted_detail(context_id,128),_bounded_redacted_detail(peer,128))
             return protocol.PushOutcome(success=True,category="transport",error="")
         else:
             try:
-                self._finalize_task(pending,protocol.STATE_COMPLETED,text,audit_direction="push")
+                self._finalize_task(pending,protocol.STATE_COMPLETED,safe_text,audit_direction="push")
                 logger.info("A2A: delivered fire-and-forget loopback for context %s (task %s completed)",_bounded_redacted_detail(context_id,128),_bounded_redacted_detail(pending["task_id"],128))
                 return protocol.PushOutcome(success=True,category="transport",error="")
             except protocol.DurablePublishError as dpe:
