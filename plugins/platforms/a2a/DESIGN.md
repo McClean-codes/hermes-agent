@@ -368,10 +368,24 @@ Acceptance: normal, assertion/error, and cancellation exits reach `CLOSED`; capt
 plugins/platforms/a2a/
 ├── plugin.yaml      # manifest (kind: platform)
 ├── __init__.py      # register(): platform adapter + client tools
-├── adapter.py       # inbound A2A v1.0 server (stdlib http.server)
+├── adapter.py       # inbound A2A lifecycle, dispatch, persistence, origin/send/OOB
+├── http_transport.py # HTTP/wire boundary: JSON-RPC bounds, redaction, _A2AServer, A2ARequestHandler
+├── task_routing.py  # TaskRPC mixin: message/send, stream, task, push-config RPC handlers
+├── a2a_persistence.py # file-lock, context→peer/session, fanout, task-ledger paths
 ├── tools.py         # outbound client tools
 ├── protocol.py      # Agent Card, JSON-RPC framing, task store, persistence + strict parser + durable primitive
 ├── security.py      # auth/identity, injection filters, redaction, audit
 ├── DESIGN.md
 └── README.md
+tools/
+├── send_message_tool.py        # schema, target parsing, cron dedup, live-adapter dispatch
+└── send_message_transports.py  # standalone platform transports (telegram, signal, matrix, …)
 ```
+
+Inline push: `TaskRPCHandler._inline_push_fields` is a pure validator (inspects only
+`configuration.taskPushNotificationConfig`, accepts direct `.url` and nested
+`.pushNotificationConfig.url`, requires dict containers, nonblank string, agreement,
+and `is_safe_callback_url`); it generates one `cfg-` + 12 hex ID before the
+accepted WORKING candidate, and `_prepare_task` publishes URL/ID atomically in
+the first `publish_durable` call (no pre-task `set_push_config`). Missing or
+malformed/unsafe config keeps empty fields with at most one bounded warning.

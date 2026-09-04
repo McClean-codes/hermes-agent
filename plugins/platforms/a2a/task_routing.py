@@ -292,12 +292,77 @@ class TaskRPCHandler:
     # ── JSON-RPC: push notification config ───────────────────────────────
 
     def _register_inline_push(self, task_id: str, params: dict, agent=None):
-        cfg = (params.get("configuration") or {}).get("taskPushNotificationConfig") or {}
-        if not isinstance(cfg, dict):
-            return
-        url = cfg.get("url") or (cfg.get("pushNotificationConfig") or {}).get("url") or ""
-        if url:
-            self.tasks.set_push_config(task_id, str(url), *self._scope_for_agent(agent))
+        # Deprecated shim — inline push is now handled atomically in
+        # _prepare_task via _inline_push_fields.  Kept for monkeypatch
+        # compatibility; no longer called on the accepted path.
+        return
+
+    def _inline_push_fields(self, task_id: str, params: dict, *, localhost_mode: bool) -> tuple[str, str]:
+        """Pure helper: validate inline push config and return (push_url, push_config_id).
+
+        Inspects only ``params.configuration.taskPushNotificationConfig``.
+        Accepts direct ``.url`` and compatibility-nested ``.pushNotificationConfig.url``.
+        Requires dict containers, nonblank string URL, agreement when both present,
+        and ``security.is_safe_callback_url`` acceptance for *localhost_mode*.
+        On success returns (url, ``cfg-`` + 12 hex chars); otherwise ("", "").
+        Never calls TaskStore or mutates state.  At most one bounded warning
+        names a reason category without raw URL/configuration.
+        """
+        try:
+            cfg_container = params.get("configuration") if isinstance(params, dict) else None
+            if not isinstance(cfg_container, dict):
+                return "", ""
+            tpc = cfg_container.get("taskPushNotificationConfig")
+            if tpc is None:
+                return "", ""
+            if not isinstance(tpc, dict):
+                logger.warning("A2A: inline push config: task %s: non-dict taskPushNotificationConfig", task_id[:32] if isinstance(task_id, str) else "")
+                return "", ""
+            direct_url = tpc.get("url")
+            nested_obj = tpc.get("pushNotificationConfig")
+            nested_url = None
+            if nested_obj is not None:
+                if not isinstance(nested_obj, dict):
+                    logger.warning("A2A: inline push config: task %s: non-dict pushNotificationConfig", task_id[:32] if isinstance(task_id, str) else "")
+                    return "", ""
+                nested_url = nested_obj.get("url")
+            has_direct = direct_url is not None and direct_url != ""
+            has_nested = nested_url is not None and nested_url != ""
+            if not has_direct and not has_nested:
+                return "", ""
+            if has_direct and not isinstance(direct_url, str):
+                logger.warning("A2A: inline push config: task %s: non-string url", task_id[:32] if isinstance(task_id, str) else "")
+                return "", ""
+            if has_nested and not isinstance(nested_url, str):
+                logger.warning("A2A: inline push config: task %s: non-string nested url", task_id[:32] if isinstance(task_id, str) else "")
+                return "", ""
+            direct_str = str(direct_url).strip() if has_direct else ""
+            nested_str = str(nested_url).strip() if has_nested else ""
+            if has_direct and not direct_str:
+                logger.warning("A2A: inline push config: task %s: blank url", task_id[:32] if isinstance(task_id, str) else "")
+                return "", ""
+            if has_nested and not nested_str:
+                logger.warning("A2A: inline push config: task %s: blank nested url", task_id[:32] if isinstance(task_id, str) else "")
+                return "", ""
+            if has_direct and has_nested and direct_str != nested_str:
+                logger.warning("A2A: inline push config: task %s: conflicting urls", task_id[:32] if isinstance(task_id, str) else "")
+                return "", ""
+            url = direct_str if has_direct else nested_str
+            if not url:
+                return "", ""
+            try:
+                if not security.is_safe_callback_url(url, localhost_mode=localhost_mode):
+                    logger.warning("A2A: inline push config: task %s: unsafe url", task_id[:32] if isinstance(task_id, str) else "")
+                    return "", ""
+            except Exception:
+                logger.warning("A2A: inline push config: task %s: url validation error", task_id[:32] if isinstance(task_id, str) else "")
+                return "", ""
+            import secrets as _secrets
+            cfg_id = "cfg-" + _secrets.token_hex(6)
+            return url, cfg_id
+        except Exception:
+            logger.warning("A2A: inline push config: task %s: parse error", task_id[:32] if isinstance(task_id, str) else "")
+            return "",
 
     def _rpc_push_config_create(self, req_id, params: dict, agent=None) -> dict:
         task_id = str(params.get("taskId") or "")
