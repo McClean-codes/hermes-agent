@@ -1203,6 +1203,89 @@ def test_disconnect_persist_failure_does_not_publish_terminal(monkeypatch, tmp_p
 # ---------------------------------------------------------------------------
 # 19. Forwarded completion
 # ---------------------------------------------------------------------------
+def test_disconnect_callback_uses_authoritative_context_not_stale_pending(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from plugins.platforms.a2a.adapter import A2AAdapter
+    import asyncio
+    from concurrent.futures import Future
+    from collections import deque
+    import json
+    adapter = A2AAdapter(PlatformConfig(enabled=True, extra={"port": 0}))
+    adapter.tasks = TaskStore()
+    ledger = tmp_path / "ledger_authority.json"
+    monkeypatch.setattr("plugins.platforms.a2a.a2a_persistence._task_ledger_path", lambda: ledger)
+    monkeypatch.setattr("plugins.platforms.a2a.adapter._task_ledger_path", lambda: ledger)
+    rec = {"task_id": "authority-task", "context_id": "ctx-authoritative", "peer": "p1", "agent_slug": "", "tenant": "", "state": protocol.STATE_WORKING, "reply": "", "created_at": time.time(), "created_iso": protocol.now_iso(), "push_url": "http://example.com/hook", "push_config_id": "cfg-abc123def456"}
+    out = adapter.tasks.publish_durable(ledger, "authority-task", rec)
+    assert out.published and out.newly_published
+    fut = Future()
+    stale_ctx = "ctx-stale-waiter"
+    with adapter._pending_lock:
+        adapter._pending["authority-task"] = (stale_ctx, fut)
+        adapter._pending_order.setdefault(stale_ctx, deque()).append("authority-task")
+    order = []
+    orig_publish = adapter.tasks.publish_durable
+    def tracking_publish(path, tid, cand):
+        order.append(("publish", tid, cand.get("state"), cand.get("context_id")))
+        return orig_publish(path, tid, cand)
+    monkeypatch.setattr(adapter.tasks, "publish_durable", tracking_publish)
+    push_calls = []
+    def spy_push(tid, ctx, reply, state):
+        push_calls.append((tid, ctx, reply, state))
+        order.append(("push", tid, ctx, state, reply))
+        return None
+    monkeypatch.setattr(adapter, "_send_push_notification", spy_push)
+    asyncio.run(adapter.disconnect())
+    assert any(e[0] == "publish" and e[1] == "authority-task" for e in order), f"publish missing {order}"
+    assert len(push_calls) == 1, f"expected exactly one push, got {push_calls}"
+    push_tid, push_ctx, push_reply, push_state = push_calls[0]
+    assert push_tid == "authority-task", f"push task mismatch {push_tid}"
+    assert push_ctx == "ctx-authoritative", f"push context must be authoritative, got stale {push_ctx}"
+    assert push_state == protocol.STATE_FAILED
+    assert push_reply == "[agent shutting down]"
+    pub_idx = next(i for i, e in enumerate(order) if e[0] == "publish")
+    push_idx = next(i for i, e in enumerate(order) if e[0] == "push")
+    assert pub_idx < push_idx, "callback must occur after durable publish"
+    assert fut.done()
+    assert fut.result() == (protocol.STATE_FAILED, "[agent shutting down]")
+    with adapter._pending_lock:
+        assert "authority-task" not in adapter._pending
+        assert stale_ctx not in adapter._pending_order or "authority-task" not in adapter._pending_order.get(stale_ctx, [])
+    rec_after = adapter.tasks.get("authority-task")
+    assert rec_after is not None
+    assert rec_after["state"] == protocol.STATE_FAILED
+    assert rec_after["context_id"] == "ctx-authoritative"
+    data = json.loads(ledger.read_text())
+    assert data["authority-task"]["state"] == protocol.STATE_FAILED
+    assert data["authority-task"]["context_id"] == "ctx-authoritative"
+    # Best-effort: push failure does not rollback durable state
+    adapter2 = A2AAdapter(PlatformConfig(enabled=True, extra={"port": 0}))
+    adapter2.tasks = TaskStore()
+    ledger2 = tmp_path / "ledger_authority2.json"
+    monkeypatch.setattr("plugins.platforms.a2a.a2a_persistence._task_ledger_path", lambda: ledger2)
+    monkeypatch.setattr("plugins.platforms.a2a.adapter._task_ledger_path", lambda: ledger2)
+    rec2 = {"task_id": "authority-task2", "context_id": "ctx-auth2", "peer": "p1", "agent_slug": "", "tenant": "", "state": protocol.STATE_WORKING, "reply": "", "created_at": time.time(), "created_iso": protocol.now_iso(), "push_url": "http://example.com/hook2", "push_config_id": "cfg-def456abc789"}
+    out2 = adapter2.tasks.publish_durable(ledger2, "authority-task2", rec2)
+    assert out2.published
+    fut2 = Future()
+    stale2 = "ctx-stale2"
+    with adapter2._pending_lock:
+        adapter2._pending["authority-task2"] = (stale2, fut2)
+        adapter2._pending_order.setdefault(stale2, deque()).append("authority-task2")
+    def failing_push(tid, ctx, reply, state):
+        raise RuntimeError("injected push failure")
+    monkeypatch.setattr(adapter2, "_send_push_notification", failing_push)
+    asyncio.run(adapter2.disconnect())
+    rec2_after = adapter2.tasks.get("authority-task2")
+    assert rec2_after is not None
+    assert rec2_after["state"] == protocol.STATE_FAILED
+    assert json.loads(ledger2.read_text())["authority-task2"]["state"] == protocol.STATE_FAILED
+    assert fut2.done()
+    assert fut2.result() == (protocol.STATE_FAILED, "[agent shutting down]")
+    with adapter2._pending_lock:
+        assert "authority-task2" not in adapter2._pending
+
+
 def test_forwarded_terminal_write_failure_returns_internal_error(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     from plugins.platforms.a2a.adapter import A2AAdapter
