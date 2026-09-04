@@ -361,7 +361,24 @@ class TaskRPCHandler:
         peer = pending["peer"]
         self._pop_pending(task_id)
 
-        reply = security.redact_outbound(reply or "")
+        # B2: derive full safe redacted semantic reply before any surface
+        try:
+            _rrt = getattr(self, "_redacted_reply_text", None)
+            if callable(_rrt):
+                display_reply = _rrt(reply or "")
+            else:
+                v = reply or ""
+                if not isinstance(v, str):
+                    display_reply = "[redacted]"
+                else:
+                    try:
+                        r = security.redact_outbound(v)
+                        display_reply = r if isinstance(r, str) else "[redacted]"
+                    except:
+                        display_reply = "[redacted]"
+        except:
+            display_reply = "[redacted]"
+        reply = display_reply
 
         # The agent flags clarification requests with a leading marker; map
         # them to the A2A input-required state so the peer knows to answer.
@@ -370,6 +387,7 @@ class TaskRPCHandler:
             if stripped.upper().startswith(protocol.INPUT_REQUIRED_MARKER):
                 state = protocol.STATE_INPUT_REQUIRED
                 reply = stripped[len(protocol.INPUT_REQUIRED_MARKER):].strip()
+                display_reply = reply
 
         # Retrieve existing durable record to build candidate
         _existing = self.tasks.get(task_id)
@@ -401,12 +419,17 @@ class TaskRPCHandler:
         if _outcome.newly_published:
             try:
                 try:
-                    protocol.persist_message(context_id, "agent", reply, task_id)
+                    protocol.persist_message(context_id, "agent", display_reply, task_id)
                 except Exception as exc:
                     bounded = self._bounded_redacted_detail(exc, 300) if hasattr(self, '_bounded_redacted_detail') else str(exc)[:300]
                     logger.warning("A2A: _finalize_task persist failed for task %s (best-effort): %s", self._bounded_redacted_detail(task_id, 128) if hasattr(self, '_bounded_redacted_detail') else task_id, bounded)
                 try:
-                    security.audit(audit_direction, peer, task_id, reply, context_id=context_id)
+                    audit_reply = self._bounded_redacted_detail(display_reply, 300) if hasattr(self, '_bounded_redacted_detail') else display_reply[:300]
+                    audit_fn = getattr(self, "_audit_safe", None)
+                    if callable(audit_fn):
+                        audit_fn(audit_direction, peer, task_id, audit_reply, context_id=context_id)
+                    else:
+                        security.audit(audit_direction, peer, task_id, audit_reply, context_id=context_id)
                 except Exception as exc:
                     bounded = self._bounded_redacted_detail(exc, 300) if hasattr(self, '_bounded_redacted_detail') else str(exc)[:300]
                     logger.warning("A2A: _finalize_task audit failed for task %s (best-effort): %s", self._bounded_redacted_detail(task_id, 128) if hasattr(self, '_bounded_redacted_detail') else task_id, bounded)
@@ -422,7 +445,7 @@ class TaskRPCHandler:
                     bounded = self._bounded_redacted_detail(exc, 300) if hasattr(self, '_bounded_redacted_detail') else str(exc)[:300]
                     logger.warning("A2A: _finalize_task metrics failed for task %s (best-effort): %s", self._bounded_redacted_detail(task_id, 128) if hasattr(self, '_bounded_redacted_detail') else task_id, bounded)
                 try:
-                    self._send_push_notification(task_id, context_id, reply, state)
+                    self._send_push_notification(task_id, context_id, display_reply, state)
                 except Exception as exc:
                     bounded = self._bounded_redacted_detail(exc, 300) if hasattr(self, '_bounded_redacted_detail') else str(exc)[:300]
                     logger.warning("A2A: _finalize_task push notification failed for task %s (best-effort): %s", self._bounded_redacted_detail(task_id, 128) if hasattr(self, '_bounded_redacted_detail') else task_id, bounded)
@@ -433,7 +456,7 @@ class TaskRPCHandler:
                     logger.warning("A2A: _finalize_task post-commit tail failed for task %s (best-effort): %s", self._bounded_redacted_detail(task_id, 128) if hasattr(self, '_bounded_redacted_detail') else task_id, bounded)
                 except Exception:
                     pass
-        return state, reply
+        return state, display_reply
 
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
