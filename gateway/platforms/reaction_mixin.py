@@ -52,6 +52,8 @@ def _rxn_normalize_bool(value: Any, default: bool = False) -> bool:
 
     Prevents quoted-false truthiness where ``bool("false")`` is True.
     Unrecognized strings return ``default`` (fail-closed).
+    Only documented scalar forms (bool and string tokens) are accepted;
+    unsupported types (numbers, lists, dicts, etc.) fail closed to ``default``.
     """
     if isinstance(value, bool):
         return value
@@ -64,11 +66,8 @@ def _rxn_normalize_bool(value: Any, default: bool = False) -> bool:
         return default
     if value is None:
         return default
-    # numbers: 0 => False, non-zero => True, but bool("false") already handled
-    try:
-        return bool(value)
-    except Exception:
-        return default
+    # Unsupported types (int, list, dict, etc.) fail closed
+    return default
 
 
 def _rxn_normalize_cooldown(value: Any, default: float = 1.0) -> float:
@@ -80,7 +79,7 @@ def _rxn_normalize_cooldown(value: Any, default: float = 1.0) -> float:
     """
     try:
         f = float(value) if not isinstance(value, bool) else float(int(value))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
     if not math.isfinite(f) or f < 0:
         return default
@@ -163,6 +162,10 @@ class DynamicReactionMixin:
         self._rxn_locks: Dict[Hashable, asyncio.Lock] = {}
         # Stale emojis that failed to be removed; remain cleanup-reachable
         self._rxn_stale: Dict[Hashable, set[str]] = {}
+        # Pending stale for previous same-key messages: key → list[(msg_ref, set[emoji])]
+        self._rxn_pending: Dict[Hashable, list[tuple[Any, set[str]]]] = {}
+        # Per-key turn generation for late-callback rejection
+        self._rxn_generation: Dict[Hashable, int] = {}
 
         # Resolve config once
         self._rxn_persona_emoji: str = self._rxn_resolve_persona_emoji()
@@ -220,6 +223,8 @@ class DynamicReactionMixin:
 
         Delegates to the adapter's own ``_reactions_enabled()`` if it exists
         as a callable, or reads it as a bool attribute.  Otherwise returns True.
+        Only documented scalar forms (bool/string tokens) are accepted; unsupported
+        types and malformed strings fail closed to disabled.
         """
         attr = getattr(self, "_reactions_enabled", None)
         # If the subclass defines _reactions_enabled as a method, call it.
@@ -228,16 +233,37 @@ class DynamicReactionMixin:
         if callable(attr):
             try:
                 result = attr()
-                # Normalize boolean strings fail-closed
+                if isinstance(result, bool):
+                    return result
                 if isinstance(result, str):
-                    return _rxn_normalize_bool(result, default=True)
-                return bool(result)
+                    token = result.strip().lower()
+                    if token in ("false", "0", "no", "off"):
+                        return False
+                    if token in ("true", "1", "yes", "on"):
+                        return True
+                    if token == "":
+                        return True
+                    return False
+                if result is None:
+                    return True
+                return False
             except Exception:
                 return False
         if attr is not None:
+            if isinstance(attr, bool):
+                return attr
             if isinstance(attr, str):
-                return _rxn_normalize_bool(attr, default=True)
-            return bool(attr)
+                token = attr.strip().lower()
+                if token in ("false", "0", "no", "off"):
+                    return False
+                if token in ("true", "1", "yes", "on"):
+                    return True
+                if token == "":
+                    return True
+                return False
+            if attr is None:
+                return True
+            return False
         return True
 
     # ── Lifecycle hooks ──────────────────────────────────────────────────
@@ -248,19 +274,67 @@ class DynamicReactionMixin:
             self._rxn_locks[key] = asyncio.Lock()
         return self._rxn_locks[key]
 
-    async def _rxn_on_processing_start(self, event: Any) -> None:
-        """Add persona emoji when processing begins."""
+    async def _rxn_on_processing_start(self, event: Any) -> bool:
+        """Add persona emoji when processing begins. Returns True if remote add succeeded."""
         if not getattr(self, "_rxn_initialized", False):
-            return
+            return False
         if not self._rxn_reactions_enabled():
-            return
+            return False
 
         msg_ref = self._reaction_resolve_message(event)
         if msg_ref is None:
-            return
+            return False
         key = self._reaction_msg_key(event)
         if key is None:
-            return
+            return False
+
+        # --- Stale reachability: drain previous same-key message before overwriting cache ---
+        # Retain failed cleanup per message/turn until remote remove succeeds.
+        old_msg_ref = self._rxn_msg_refs.get(key)
+        if old_msg_ref is not None and old_msg_ref is not msg_ref:
+            old_stale = set(self._rxn_stale.get(key, set())) if key in self._rxn_stale else set()
+            # Only drain stale emojis from the old message; active is the final state and should remain.
+            # Tool-swap stales are tracked in _rxn_stale, so this covers the probe's orphaned reaction.
+            to_clean_old: set[str] = set(old_stale)
+            if to_clean_old:
+                failed_old: set[str] = set()
+                for emoji in list(to_clean_old):
+                    if self._reaction_replace_mode:
+                        continue
+                    try:
+                        ok_rm = await self._reaction_remove(old_msg_ref, emoji)
+                        ok_rm = bool(ok_rm)
+                    except Exception as e:
+                        logger.debug("stale drain remove failed (%s): %s", emoji, e)
+                        ok_rm = False
+                    if not ok_rm:
+                        failed_old.add(emoji)
+                if failed_old:
+                    pending = self._rxn_pending.setdefault(key, [])
+                    merged = False
+                    for idx, (pending_ref, pending_set) in enumerate(pending):
+                        if pending_ref is old_msg_ref:
+                            pending_set.update(failed_old)
+                            merged = True
+                            break
+                    if not merged:
+                        pending.append((old_msg_ref, failed_old))
+            # Clear current stale tracking for old message (moved to pending or cleaned); keep active for now
+            # Active for old message is its final persona/tool state; new turn will overwrite it below.
+            self._rxn_stale.pop(key, None)
+            self._rxn_active.pop(key, None)
+            # Bump generation for new turn
+            self._rxn_generation[key] = self._rxn_generation.get(key, 0) + 1
+        elif old_msg_ref is None:
+            # First turn for this key
+            if key not in self._rxn_generation:
+                self._rxn_generation[key] = 1
+            else:
+                self._rxn_generation[key] = self._rxn_generation.get(key, 0) + 1
+        else:
+            # Same msg_ref object reused (unlikely but safe) — still bump generation for idempotence
+            # but do not drain; keep stale handling below
+            self._rxn_generation[key] = self._rxn_generation.get(key, 0) + 1
 
         emoji = self._rxn_persona_emoji
         translated = self._reaction_translate_emoji(emoji)
@@ -282,13 +356,15 @@ class DynamicReactionMixin:
         if ok:
             self._rxn_active[key] = translated
             self._rxn_msg_refs[key] = msg_ref
-            # Successful start clears any prior stale for this key
+            # Successful start clears any prior stale for the NEW message only; pending retains old
             self._rxn_stale.pop(key, None)
+            return True
         else:
             # Cache the msg_ref even on failure so later tool swaps can retry
             # without requiring raw_message on the SessionSource event.
             self._rxn_msg_refs[key] = msg_ref
             # Do NOT mark active; a later no-tool completion will correctly retry.
+            return False
 
     async def _rxn_on_tool_call_start(self, event: Any, tool_name: str) -> None:
         """Swap reaction to tool-specific emoji (with cooldown)."""
@@ -301,7 +377,16 @@ class DynamicReactionMixin:
         if key is None:
             return
 
+        # Generation check: capture at entry, reject late callbacks after new start
+        gen_at_entry = self._rxn_generation.get(key)
+        if gen_at_entry is None:
+            # No processing start yet for this key; ignore
+            return
+
         async with self._rxn_lock(key):
+            # Reject late callback if generation advanced while waiting for lock
+            if self._rxn_generation.get(key) != gen_at_entry:
+                return
             msg_ref = self._rxn_msg_refs.get(key)
             if msg_ref is None:
                 # Try resolving from event directly (fallback)
@@ -395,7 +480,36 @@ class DynamicReactionMixin:
                     self._rxn_msg_refs.pop(key, None)
                     self._rxn_last_swap.pop(key, None)
                     self._rxn_stale.pop(key, None)
+                    # Also attempt to drain pending for this key (old messages)
+                    pending = self._rxn_pending.get(key)
+                    if pending:
+                        # Try to clean pending even without current msg_ref? keep for next try
+                        pass
                     return
+
+                # --- Drain pending stale from previous same-key turns before handling current ---
+                pending_list = self._rxn_pending.get(key, [])
+                if pending_list:
+                    new_pending: list[tuple[Any, set[str]]] = []
+                    for pending_msg_ref, pending_emojis in list(pending_list):
+                        failed_pending: set[str] = set()
+                        for emoji in list(pending_emojis):
+                            if self._reaction_replace_mode:
+                                continue
+                            try:
+                                ok_rm = await self._reaction_remove(pending_msg_ref, emoji)
+                                ok_rm = bool(ok_rm)
+                            except Exception as e:
+                                logger.debug("pending cleanup remove failed (%s): %s", emoji, e)
+                                ok_rm = False
+                            if not ok_rm:
+                                failed_pending.add(emoji)
+                        if failed_pending:
+                            new_pending.append((pending_msg_ref, failed_pending))
+                    if new_pending:
+                        self._rxn_pending[key] = new_pending
+                    else:
+                        self._rxn_pending.pop(key, None)
 
                 # Peek current and stale without popping yet; only pop after success
                 current = self._rxn_active.get(key)

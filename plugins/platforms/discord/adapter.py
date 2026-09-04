@@ -2749,23 +2749,34 @@ class DiscordAdapter(DynamicReactionMixin, BasePlatformAdapter):
 
     def _reactions_enabled(self) -> bool:
         """Check if message reactions are enabled via config/env."""
-        # Normalize env var fail-closed: "false"/"0"/"no"/"off" disables
+        # Normalize env var fail-closed: only documented tokens enable
         raw_env = os.getenv("DISCORD_REACTIONS", "true")
-        if isinstance(raw_env, str) and raw_env.strip().lower() in ("false", "0", "no", "off"):
-            return False
+        if isinstance(raw_env, str):
+            token = raw_env.strip().lower()
+            if token in ("false", "0", "no", "off"):
+                return False
+            if token in ("true", "1", "yes", "on", ""):
+                # empty or recognized true -> check config gate next
+                pass
+            else:
+                # unrecognized string fail-closed to disabled
+                return False
         # Normalize config.extra.reactions with the same fail-closed rule
         extra_val = self.config.extra.get("reactions", True) if isinstance(getattr(self.config, "extra", None), dict) else True
-        if isinstance(extra_val, str):
-            if extra_val.strip().lower() in ("false", "0", "no", "off"):
-                return False
-            if extra_val.strip().lower() in ("true", "1", "yes", "on", ""):
-                # empty string treated as not set -> fallback true
-                return True if extra_val.strip().lower() != "" else True
-            # unrecognized string: fail-closed to default true? but log?
-            return True
         if isinstance(extra_val, bool):
             return extra_val
-        return bool(extra_val) if extra_val is not None else True
+        if isinstance(extra_val, str):
+            token = extra_val.strip().lower()
+            if token in ("false", "0", "no", "off"):
+                return False
+            if token in ("true", "1", "yes", "on"):
+                return True
+            if token == "":
+                return True
+            return False
+        if extra_val is None:
+            return True
+        return False
 
     def _session_key_from_source(self, source) -> str:
         """Derive a canonical, participant- and profile-aware session key.
@@ -2878,11 +2889,11 @@ class DiscordAdapter(DynamicReactionMixin, BasePlatformAdapter):
         raw = getattr(event, "raw_message", None)
         if raw:
             self._session_raw_messages[key] = raw
-        await self._rxn_on_processing_start(event)
+        acked = await self._rxn_on_processing_start(event)
         await asyncio.to_thread(
             self._record_discord_processing_start,
             event,
-            emoji_ack=True,
+            emoji_ack=bool(acked),
         )
 
     async def on_tool_call_start(self, event, tool_name: str) -> None:
