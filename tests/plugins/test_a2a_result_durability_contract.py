@@ -34,140 +34,106 @@ _REAL_RUN_COROUTINE_THREADSAFE = _aio_l.run_coroutine_threadsafe
 
 @contextlib.contextmanager
 def _a2a_managed_loop(primary_adapter, monkeypatch, *, timeout=5, additional_adapters=(), application_scheduler=_REAL_RUN_COROUTINE_THREADSAFE, cleanup_scheduler=_REAL_RUN_COROUTINE_THREADSAFE):
-    # NEW state machine with single owner
-    loop = _aio_l.new_event_loop()
-    ready = _thr_l.Event()
-    def _runner():
-        _aio_l.set_event_loop(loop)
-        ready.set()
-        loop.run_forever()
-    th = _thr_l.Thread(target=_runner, daemon=True)
-    th.start()
-    # bounded readiness
-    ready.wait(timeout)
-    if not th.is_alive() or not ready.is_set():
-        try:
-            loop.close()
-        except BaseException:
-            pass
-        raise AssertionError("managed loop failed to start")
-
-    # prepare ownership tracking
+    loop = None
+    th = None
+    ready = None
     captured: list[_cf.Future] = []
-
-    # helper to schedule with correct ownership semantics
-    def _schedule_owned(coro, tgt_loop):
-        # retain coro before delegate
-        retained = coro
-        try:
-            fut = application_scheduler(retained, tgt_loop)
-        except BaseException as sched_exc:
-            # ownership did not transfer: close exactly once
-            try:
-                retained.close()
-            except BaseException as close_exc:
-                raise BaseExceptionGroup("schedule rejection and coroutine close failure", [sched_exc, close_exc])
-            raise
-        # ownership transferred: record exactly once
-        captured.append(fut)
-        return fut
-
-    def _cap(coro, tgt_loop):
-        return _schedule_owned(coro, tgt_loop)
-
-    def _schedule(coro, loop_arg=None):
-        # handle.schedule(coro) API - loop is bound to owned loop, ignore loop_arg if provided for compatibility
-        return _schedule_owned(coro, loop)
-
-    class _Handle:
-        __slots__ = ("loop", "thread", "captured_futures", "schedule")
-        def __init__(self, loop, thread, captured_futures, schedule_fn):
-            self.loop = loop
-            self.thread = thread
-            self.captured_futures = captured_futures
-            self.schedule = schedule_fn
-        def __iter__(self):
-            return iter((self.loop, self.thread, self.captured_futures, self.schedule))
-        def __getitem__(self, idx):
-            return (self.loop, self.thread, self.captured_futures, self.schedule)[idx]
-
-    handle = _Handle(loop, th, captured, _schedule)
-
-    # scoped monkeypatch
-    # we use monkeypatch.context() so nested use does not stack wrappers
-    # Also need to bind adapter loop/handler
-    # Use try to ensure patches restored even if setup fails
-    body_exc = None
-    body_tb = None
-    # Set up patches and adapter binding inside context
-    # We need to handle that monkeypatch may be pytest's MonkeyPatch fixture
-    # Use context manager protocol
     ctx = None
+    m = None
+    handle = None
+    primary_exc = None
+    primary_tb = None
     try:
+        loop = _aio_l.new_event_loop()
+        ready = _thr_l.Event()
+        def _runner():
+            _aio_l.set_event_loop(loop)
+            ready.set()
+            loop.run_forever()
+        th = _thr_l.Thread(target=_runner, daemon=True)
+        th.start()
+        ready.wait(timeout)
+        if not th.is_alive() or not ready.is_set():
+            raise AssertionError("managed loop failed to start")
+        def _schedule_owned(coro, tgt_loop):
+            retained = coro
+            try:
+                fut = application_scheduler(retained, tgt_loop)
+            except BaseException as sched_exc:
+                try:
+                    retained.close()
+                except BaseException as close_exc:
+                    raise BaseExceptionGroup("schedule rejection and coroutine close failure", [sched_exc, close_exc])
+                raise
+            captured.append(fut)
+            return fut
+        def _cap(coro, tgt_loop):
+            return _schedule_owned(coro, tgt_loop)
+        def _schedule(coro, loop_arg=None):
+            return _schedule_owned(coro, loop)
+        class _Handle:
+            __slots__ = ("loop", "thread", "captured_futures", "schedule")
+            def __init__(self, loop, thread, captured_futures, schedule_fn):
+                self.loop = loop
+                self.thread = thread
+                self.captured_futures = captured_futures
+                self.schedule = schedule_fn
+            def __iter__(self):
+                return iter((self.loop, self.thread, self.captured_futures, self.schedule))
+            def __getitem__(self, idx):
+                return (self.loop, self.thread, self.captured_futures, self.schedule)[idx]
+        handle = _Handle(loop, th, captured, _schedule)
         ctx = monkeypatch.context()
         m = ctx.__enter__()
-        # install capture wrapper
         m.setattr(_aio_l, "run_coroutine_threadsafe", _cap)
         try:
             import plugins.platforms.a2a.adapter as _mod
             m.setattr(_mod.asyncio, "run_coroutine_threadsafe", _cap)
         except BaseException:
             pass
-        # bind adapter loop
         primary_adapter._loop = loop
-        # minimal handler to avoid None dispatch errors; tests may override handle_message afterwards
         async def _no_op(_e):
             return None
-        # preserve original handler? Not needed; helper owns binding
         primary_adapter._message_handler = object()
         try:
             primary_adapter.handle_message = _no_op  # type: ignore[attr-defined]
         except BaseException:
             pass
-
         try:
             yield handle
         except BaseException as e:
-            body_exc = e
-            body_tb = sys.exc_info()[2]
-        finally:
-            # All-exit teardown from one outer finally
-            cleanup_failures: list[BaseException] = []
-
-            # SETTLING_FUTURES: settle captured futures in capture order, guard BaseException per future
-            for _f in list(captured):
+            primary_exc = e
+            primary_tb = sys.exc_info()[2]
+    except BaseException as e:
+        if primary_exc is None:
+            primary_exc = e
+            primary_tb = sys.exc_info()[2]
+    finally:
+        cleanup_failures: list[BaseException] = []
+        for _f in list(captured):
+            try:
                 try:
-                    try:
-                        is_done = _f.done()
-                    except BaseException as e:
-                        cleanup_failures.append(BaseExceptionGroup("drain.settle.done", [e]))
-                        continue
-                    if is_done:
-                        try:
-                            _f.result(timeout=0)
-                        except _cf.CancelledError:
-                            pass
-                        except BaseException as e:
-                            # unexpected future exception visible
-                            cleanup_failures.append(BaseExceptionGroup("drain.settle.result", [e]))
-                    else:
-                        # unfinished: one cancellation attempt
-                        try:
-                            _f.cancel()
-                        except BaseException as e:
-                            cleanup_failures.append(BaseExceptionGroup("drain.settle.cancel", [e]))
-                        else:
-                            # false not alone proof, do not record as failure for captured futures
-                            pass
+                    is_done = _f.done()
                 except BaseException as e:
-                    # outer per-future guard (should not happen as we already guarded inner)
-                    cleanup_failures.append(BaseExceptionGroup("drain.settle.outer", [e]))
-
-            # DRAINING_TASKS: schedule drain coroutine via cleanup_scheduler, with timeout handling
-            drain_coro = None
-            drain_future = None
-
-            # Define drain coroutine with full 10-step fail-visible algorithm
+                    cleanup_failures.append(BaseExceptionGroup("drain.settle.done", [e]))
+                    continue
+                if is_done:
+                    try:
+                        _f.result(timeout=0)
+                    except _cf.CancelledError:
+                        pass
+                    except BaseException as e:
+                        cleanup_failures.append(BaseExceptionGroup("drain.settle.result", [e]))
+                else:
+                    try:
+                        _f.cancel()
+                    except BaseException as e:
+                        cleanup_failures.append(BaseExceptionGroup("drain.settle.cancel", [e]))
+            except BaseException as e:
+                cleanup_failures.append(BaseExceptionGroup("drain.settle.outer", [e]))
+        drain_coro = None
+        drain_future = None
+        if loop is not None:
             async def _drain_impl():
                 import asyncio as _a2
                 failures: list[BaseException] = []
@@ -175,10 +141,7 @@ def _a2a_managed_loop(primary_adapter, monkeypatch, *, timeout=5, additional_ada
                 self_task = None
                 initial_tasks = None
                 initial_unknown = False
-
-                # 1. current_task
                 try:
-                    # version-correct: try without loop arg first, fallback to loop arg on TypeError
                     try:
                         self_task = _a2.current_task()  # type: ignore[call-arg]
                     except TypeError:
@@ -186,8 +149,6 @@ def _a2a_managed_loop(primary_adapter, monkeypatch, *, timeout=5, additional_ada
                 except BaseException as e:
                     failures.append(BaseExceptionGroup("drain.current_task", [e]))
                     self_task = None
-
-                # 2. initial_all_tasks
                 try:
                     try:
                         initial_tasks = set(_a2.all_tasks(loop))  # type: ignore[call-arg]
@@ -201,18 +162,13 @@ def _a2a_managed_loop(primary_adapter, monkeypatch, *, timeout=5, additional_ada
                     initial_unknown = False
                     if initial_tasks is not None:
                         known_tasks.update(initial_tasks)
-
-                # 3. cancel_tasks
                 todo: list = []
                 if self_task is None or initial_unknown:
-                    # cannot safely cancel; record unproven settlement
                     if self_task is None:
                         failures.append(AssertionError("drain.cancel_skipped_self_unknown"))
                     elif initial_unknown:
                         failures.append(AssertionError("drain.cancel_skipped_tasks_unknown"))
-                    # todo stays empty, but we still continue to next phases
                 else:
-                    # inspect every task other than self
                     for t in list(initial_tasks):  # type: ignore[union-attr]
                         if t is self_task:
                             continue
@@ -229,8 +185,6 @@ def _a2a_managed_loop(primary_adapter, monkeypatch, *, timeout=5, additional_ada
                         except BaseException as e:
                             failures.append(BaseExceptionGroup("drain.cancel", [e]))
                             continue
-
-                # 4. gather
                 if todo:
                     gather_coro = None
                     try:
@@ -246,15 +200,10 @@ def _a2a_managed_loop(primary_adapter, monkeypatch, *, timeout=5, additional_ada
                             for r in results:
                                 if isinstance(r, BaseException) and not isinstance(r, _a2.CancelledError):
                                     failures.append(BaseExceptionGroup("drain.task_exception", [r]))
-                                # CancelledError or normal result is settled
-
-                # 5. yield
                 try:
                     await _a2.sleep(0)
                 except BaseException as e:
                     failures.append(BaseExceptionGroup("drain.yield", [e]))
-
-                # 6. final_current_task retry if unknown
                 if self_task is None:
                     try:
                         try:
@@ -265,12 +214,8 @@ def _a2a_managed_loop(primary_adapter, monkeypatch, *, timeout=5, additional_ada
                         failures.append(BaseExceptionGroup("drain.final_current_task", [e]))
                         self_task_retry = None
                     else:
-                        # original failure remains recorded; use retry for survivor exclusion
                         if self_task_retry is not None:
                             self_task = self_task_retry
-                    # if retry still None, self_task remains None
-
-                # 7. final_all_tasks
                 final_tasks = None
                 final_unknown = False
                 try:
@@ -286,8 +231,6 @@ def _a2a_managed_loop(primary_adapter, monkeypatch, *, timeout=5, additional_ada
                     final_unknown = False
                     if final_tasks is not None:
                         known_tasks.update(final_tasks)
-
-                # 8. survivors
                 pending_survivors: list = []
                 if not final_unknown and final_tasks is not None:
                     for t in list(final_tasks):
@@ -302,10 +245,7 @@ def _a2a_managed_loop(primary_adapter, monkeypatch, *, timeout=5, additional_ada
                             pending_survivors.append(t)
                             failures.append(AssertionError(f"drain.survivor {t!r}"))
                 elif final_unknown:
-                    # enumeration failure already recorded as visible; no survivor check
                     pass
-
-                # 9. salvage: retain every task learned from either enumeration
                 salvage_tasks: list = []
                 for t in list(known_tasks):
                     if t is self_task:
@@ -321,7 +261,6 @@ def _a2a_managed_loop(primary_adapter, monkeypatch, *, timeout=5, additional_ada
                             t.cancel()
                         except BaseException as e:
                             failures.append(BaseExceptionGroup("drain.salvage_cancel", [e]))
-
                 if salvage_tasks:
                     try:
                         salvage_gather = _a2.gather(*salvage_tasks, return_exceptions=True)
@@ -336,8 +275,6 @@ def _a2a_managed_loop(primary_adapter, monkeypatch, *, timeout=5, additional_ada
                             for r in s_results:
                                 if isinstance(r, BaseException) and not isinstance(r, _a2.CancelledError):
                                     failures.append(BaseExceptionGroup("drain.salvage_task_exception", [r]))
-
-                # 10. proof_enumeration
                 try:
                     try:
                         proof_tasks = set(_a2.all_tasks(loop))  # type: ignore[call-arg]
@@ -356,25 +293,19 @@ def _a2a_managed_loop(primary_adapter, monkeypatch, *, timeout=5, additional_ada
                             is_done = False
                         if not is_done:
                             failures.append(AssertionError(f"drain.proof_survivor {t!r}"))
-
                 if failures:
                     raise BaseExceptionGroup("drain failed", failures)
                 return []
-
-            # Schedule drain_coro via cleanup_scheduler (not via _cap)
             try:
                 drain_coro = _drain_impl()
-                # inline construction prohibited already satisfied: drain_coro is named local
                 try:
                     drain_future = cleanup_scheduler(drain_coro, loop)
                 except BaseException as sched_exc:
-                    # close exactly once, preserve both
                     try:
                         drain_coro.close()
                     except BaseException as close_exc:
                         cleanup_failures.append(BaseExceptionGroup("drain.schedule_and_close", [sched_exc, close_exc]))
                     else:
-                        # even if close succeeded, verify CORO_CLOSED
                         try:
                             is_closed = getattr(drain_coro, "cr_frame", None) is None
                         except BaseException:
@@ -386,7 +317,6 @@ def _a2a_managed_loop(primary_adapter, monkeypatch, *, timeout=5, additional_ada
                     drain_future = None
                     drain_coro = None
             except BaseException as e:
-                # setup failure (drain_coro creation)
                 cleanup_failures.append(BaseExceptionGroup("drain.setup", [e]))
                 if drain_coro is not None:
                     try:
@@ -394,14 +324,11 @@ def _a2a_managed_loop(primary_adapter, monkeypatch, *, timeout=5, additional_ada
                     except BaseException as ce:
                         cleanup_failures.append(BaseExceptionGroup("drain.setup_close", [ce]))
                 drain_future = None
-
             if drain_future is not None:
                 try:
-                    # This will raise if drain_impl raised Group
                     drain_future.result(timeout=timeout)
                 except _cf.TimeoutError as e:
                     cleanup_failures.append(BaseExceptionGroup("drain.timeout", [e]))
-                    # cancel once, preserve failure or false
                     try:
                         cancelled = drain_future.cancel()
                     except BaseException as ce:
@@ -409,41 +336,30 @@ def _a2a_managed_loop(primary_adapter, monkeypatch, *, timeout=5, additional_ada
                     else:
                         if not cancelled:
                             cleanup_failures.append(AssertionError("drain.cancel_not_accepted"))
-                    # continue teardown
                 except BaseException as e:
-                    # drain internal failures escaped via future
-                    # e may be BaseExceptionGroup from drain_impl
                     if isinstance(e, BaseExceptionGroup):
-                        # extend with its exceptions to preserve phase-tagged order
-                        # but keep grouping? For outer cleanup precedence, we want each phase failure visible.
-                        # We'll extend list with e.exceptions preserving order
                         for sub in e.exceptions:
-                            # sub may already be Group with phase tag; keep as is
                             cleanup_failures.append(sub)
                     else:
                         cleanup_failures.append(BaseExceptionGroup("drain.future_result", [e]))
-
-            # STOPPING
+        if loop is not None:
             try:
                 loop.call_soon_threadsafe(loop.stop)
             except BaseException as e:
                 cleanup_failures.append(BaseExceptionGroup("drain.stop", [e]))
-
-            # JOINING
+        if th is not None:
             try:
                 th.join(timeout=timeout)
                 if th.is_alive():
                     cleanup_failures.append(AssertionError(f"drain.join_timeout thread still alive after {timeout}s"))
             except BaseException as e:
                 cleanup_failures.append(BaseExceptionGroup("drain.join", [e]))
-                # even on exception, still check alive
                 try:
                     if th.is_alive():
                         cleanup_failures.append(AssertionError("drain.join_thread_still_alive"))
                 except BaseException as ee:
                     cleanup_failures.append(BaseExceptionGroup("drain.join_alive_check", [ee]))
-
-            # CLOSING
+        if loop is not None:
             try:
                 try:
                     loop.close()
@@ -458,50 +374,35 @@ def _a2a_managed_loop(primary_adapter, monkeypatch, *, timeout=5, additional_ada
                         cleanup_failures.append(AssertionError("drain.loop_not_closed"))
             except BaseException as e:
                 cleanup_failures.append(BaseExceptionGroup("drain.close_outer", [e]))
-
-            # UNREGISTERING: every owned adapter exactly once primary-then-additional, identity distinct
-            # Build ordered distinct list
-            seen_ids = set()
-            owned_adapters = []
-            for ad in (primary_adapter,) + tuple(additional_adapters):
-                if ad is None:
-                    continue
-                oid = id(ad)
-                if oid in seen_ids:
-                    continue
-                seen_ids.add(oid)
-                owned_adapters.append(ad)
-            for ad in owned_adapters:
-                try:
-                    ad._unregister_adapter()
-                except BaseException as e:
-                    cleanup_failures.append(BaseExceptionGroup(f"drain.unregister {ad!r}", [e]))
-
-            # Restore will happen via context exit, but we treat it as phase; if ctx exit raises, it will be caught outside
-            # Preserve primary vs cleanup precedence
-            if body_exc is None and not cleanup_failures:
-                pass
-            elif body_exc is None and cleanup_failures:
-                raise BaseExceptionGroup("managed-loop cleanup failed", cleanup_failures)
-            elif body_exc is not None and not cleanup_failures:
-                raise body_exc.with_traceback(body_tb) if body_tb is not None else body_exc  # type: ignore[union-attr]
-            else:
-                # primary + cleanup
-                cleanup_group = BaseExceptionGroup("managed-loop cleanup failed", cleanup_failures)
-                raise BaseExceptionGroup("managed-loop primary and cleanup failed", [body_exc, cleanup_group])
-
-    finally:
-        # ensure context restoration even if teardown raised
+        seen_ids = set()
+        owned_adapters = []
+        for ad in (primary_adapter,) + tuple(additional_adapters):
+            if ad is None:
+                continue
+            oid = id(ad)
+            if oid in seen_ids:
+                continue
+            seen_ids.add(oid)
+            owned_adapters.append(ad)
+        for ad in owned_adapters:
+            try:
+                ad._unregister_adapter()
+            except BaseException as e:
+                cleanup_failures.append(BaseExceptionGroup(f"drain.unregister {ad!r}", [e]))
         if ctx is not None:
             try:
                 ctx.__exit__(None, None, None)
             except BaseException as e:
-                # restoration failure visible but should not mask primary/cleanup already handling?
-                # If we are already handling exception, this will be suppressed; but spec says restore is last phase attempt.
-                # Since we already attempted restore via context exit, if it fails we need to surface.
-                # However we already exited the `with` block's finally, so this is extra.
-                # For simplicity, re-raise as cleanup failure if no body_exc?
-                pass
+                cleanup_failures.append(BaseExceptionGroup("drain.restore", [e]))
+        if primary_exc is None and not cleanup_failures:
+            pass
+        elif primary_exc is None and cleanup_failures:
+            raise BaseExceptionGroup("managed-loop cleanup failed", cleanup_failures)
+        elif primary_exc is not None and not cleanup_failures:
+            raise primary_exc.with_traceback(primary_tb) if primary_tb is not None else primary_exc  # type: ignore[union-attr]
+        else:
+            cleanup_group = BaseExceptionGroup("managed-loop cleanup failed", cleanup_failures)
+            raise BaseExceptionGroup("managed-loop primary and cleanup failed", [primary_exc, cleanup_group])
 
 
 # ---------------------------------------------------------------------------
@@ -3212,37 +3113,51 @@ def test_push_out_of_band_loopback_propagates_inner_failure_without_reaudit(monk
     except BaseException as e:
         matrix_failures.append(f"R24 unexpected {e!r}")
 
-    # B5-R25 single-owner source shape
-    before_r25 = ""
+    # B5-R25 single-owner source shape - strengthened to inspect committed source/AST
     try:
-        import pathlib
+        import pathlib, ast
         p = pathlib.Path("tests/plugins/test_a2a_result_durability_contract.py")
         src = p.read_text(encoding="utf-8")
-        if "_manual_loop_drain(" in before_r25:
-            matrix_failures.append("R25 _manual_loop_drain still exists in file")
-        # Check no running-loop thread creation outside _a2a_managed_loop
-        # Look for "new_event_loop" and "Thread(" outside helper
-        # Count occurrences: helper has one, plus maybe other tests? But spec says no running-loop thread or linear teardown tail exists outside _a2a_managed_loop
-        # We already removed manual loops, so check that there are not "loop.call_soon_threadsafe(loop.stop); th.join" patterns outside helper
-        # The helper itself contains those patterns, but they are inside helper; we need to check outside helper
-        # For simplicity, check that total occurrences of "new_event_loop" after helper is only inside helper
-        # The file after helper should have no "new_event_loop" except inside helper and except closed-loop probe (allowed)
-        # Closed-loop probe is allowed only for R08 and must be locally closed
-        # We allow one occurrence of "new_event_loop" inside R08's closed-loop test (which creates loop_closed = new_event_loop then close)
-        # So we check that any "new_event_loop" not in helper and not in R08 is failure
-        # Find helper end marker: after helper definition, count
+        tree = ast.parse(src)
         helper_end = src.find("# ---------------------------------------------------------------------------\n# 1. Legal")
-        after_helper = src[helper_end:]
+        after_helper = src[helper_end:] if helper_end != -1 else src
         r25_block_start = after_helper.find("# B5-R25 single-owner")
         before_r25 = after_helper[:r25_block_start] if r25_block_start != -1 else after_helper
-        if "_manual_loop_drain(" in before_r25:
+        # 1) _manual_loop_drain must be absent in before_r25 (excludes R25's own check) and not defined via AST
+        if "_manual_loop_drain" in before_r25:
             matrix_failures.append("R25 _manual_loop_drain still exists in file")
-        if "loop.call_soon_threadsafe(loop.stop); th.join" in before_r25:
-            matrix_failures.append("R25 linear teardown tail exists outside helper")
+        else:
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "_manual_loop_drain":
+                    matrix_failures.append("R25 _manual_loop_drain still exists in file")
+                    break
+        # 2) Only _a2a_managed_loop may start a running loop thread
         if "_a2a_managed_loop" not in src:
             matrix_failures.append("R25 helper missing")
-        if before_r25.count("new_event_loop()") < 1:
-            matrix_failures.append("R25 new_event_loop probe missing")
+        else:
+            helper_node = next((n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_a2a_managed_loop"), None)
+            if helper_node is None:
+                matrix_failures.append("R25 helper missing")
+            else:
+                helper_src = ast.get_source_segment(src, helper_node) or ""
+                if "new_event_loop()" not in helper_src or "Thread(" not in helper_src or "run_forever()" not in helper_src:
+                    matrix_failures.append("R25 helper missing running loop primitives")
+                if "Thread(" in before_r25 and "run_forever" in before_r25:
+                    matrix_failures.append("R25 running loop thread exists outside helper")
+                if "run_forever" in before_r25:
+                    matrix_failures.append("R25 run_forever outside helper")
+                nl_count = before_r25.count("new_event_loop()")
+                if nl_count < 1:
+                    matrix_failures.append("R25 new_event_loop probe missing")
+                elif nl_count > 1:
+                    matrix_failures.append("R25 too many new_event_loop outside helper")
+        # 3) No caller-owned linear teardown tail outside helper - precise helper pattern
+        if "loop.call_soon_threadsafe(loop.stop)" in before_r25:
+            matrix_failures.append("R25 linear teardown tail exists outside helper")
+        if "th.join(" in before_r25:
+            matrix_failures.append("R25 linear teardown tail exists outside helper")
+        if before_r25.count("loop.close()") > 1:
+            matrix_failures.append("R25 linear teardown tail exists outside helper")
     except BaseException as e:
         matrix_failures.append(f"R25 setup {e!r}: {type(e)}")
 
