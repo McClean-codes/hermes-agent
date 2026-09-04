@@ -651,12 +651,13 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
                 logger.error("A2A: disconnect durable publish exception for task %s: %s", tid, exc, exc_info=True)
                 outcome = protocol.DurablePublishOutcome(published=False, newly_published=False, record=rec, durable_state=rec.get("state", ""), error=str(exc))
             if outcome.published and outcome.newly_published:
-                # Commit succeeded — now resolve waiter with shutdown outcome and clean pending
+                auth_rec = outcome.record if outcome.record is not None else rec; cb_task_id, cb_context_id, cb_state, cb_reply = str(auth_rec.get("task_id") or tid), str(auth_rec.get("context_id") or auth_rec.get("contextId") or ""), str(auth_rec.get("state") or protocol.STATE_FAILED), str(auth_rec.get("reply") if auth_rec.get("reply") is not None else "[agent shutting down]")
+                # Commit succeeded — now resolve waiter with authoritative outcome and clean pending
                 with self._pending_lock:
                     ent = self._pending.get(tid)
                     if ent is not None and ent[1] is fut and not fut.done():
                         try:
-                            fut.set_result((protocol.STATE_FAILED, "[agent shutting down]"))
+                            fut.set_result((cb_state, cb_reply))
                         except Exception:
                             pass
                     self._pending.pop(tid, None)
@@ -669,7 +670,7 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
                         if not order:
                             self._pending_order.pop(ctx, None)
                 try:
-                    self._send_push_notification(tid, ctx, "[agent shutting down]", protocol.STATE_FAILED)
+                    self._send_push_notification(cb_task_id, cb_context_id, cb_reply, cb_state)
                 except Exception:
                     pass
             else:
@@ -702,8 +703,9 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
                     if not outcome.published:
                         logger.error("A2A: disconnect orphan durable publish failed for %s: %s", tid, outcome.error)
                     elif outcome.newly_published:
+                        auth2 = outcome.record if outcome.record is not None else cand; cb2_tid, cb2_ctx, cb2_state, cb2_reply = str(auth2.get("task_id") or tid), str(auth2.get("context_id") or auth2.get("contextId") or ""), str(auth2.get("state") or protocol.STATE_FAILED), str(auth2.get("reply") if auth2.get("reply") is not None else "[agent shutting down]")
                         try:
-                            self._send_push_notification(tid, cand.get("context_id", ""), "[agent shutting down]", protocol.STATE_FAILED)
+                            self._send_push_notification(cb2_tid, cb2_ctx, cb2_reply, cb2_state)
                         except Exception:
                             pass
                 except Exception as exc:
