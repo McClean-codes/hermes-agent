@@ -841,6 +841,12 @@ DEFAULT_CONFIG = {
         # updates; false routes it to reasoning (visible only with show_reasoning).
         "show_commentary": True,
         "tool_progress_command": False,  # enable /verbose command in messaging gateway
+        # Per-tool progress mode overrides: {"skill_manage": "all", "terminal": "off", "mcp": "off", "plugins": "all"}.
+        # Overrides the global tool_progress mode for specific tools or categories (skills/mcp/plugins).
+        # When global mode is "off" but the filter has non-off entries, the progress queue stays active
+        # so whitelisted tools still emit messages. Supports per-platform overrides via
+        # display.platforms.<platform>.tool_progress_filter.
+        "tool_progress_filter": {},
         # display.tool_progress_overrides is deprecated (use display.platforms); a user-set value is
         # still honored at runtime and folded into platforms by migration.
         "tool_preview_length": 0,  # max chars for tool call previews (0 = no limit)

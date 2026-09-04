@@ -2640,6 +2640,25 @@ class GatewayTurnMixin:
         # Webhooks can't edit messages, so tool progress / log mode are off there.
         is_webhook = source.platform == Platform.WEBHOOK
         tool_progress_enabled = progress_mode not in {"off", "log"} and not is_webhook
+        # Per-tool/category progress filter: allows overriding global mode for specific tools
+        # (e.g., show skill_manage even when global is "off"). Supports categories
+        # "skills", "mcp", "plugins" when runtime metadata distinguishes them.
+        # Platform-level filter merges over global (platform entries win).
+        from gateway.display_config import resolve_tool_progress_filter as _resolve_filter
+        try:
+            tool_progress_filter = _resolve_filter(user_config, platform_key)
+        except Exception as _filter_err:
+            logger.debug("tool_progress_filter resolution failed: %s", _filter_err)
+            tool_progress_filter = {}
+        # If global is off/log but filter whitelists some tools/categories, keep the
+        # progress queue alive so those tools can still emit. The per-tool gate
+        # in TurnRunner.progress_callback enforces the actual visibility.
+        if not tool_progress_enabled and tool_progress_filter and not is_webhook:
+            try:
+                if any(v != "off" for v in tool_progress_filter.values()):
+                    tool_progress_enabled = True
+            except Exception:
+                pass
         # Live status for text-rendering typing indicators (Slack); independent of tool_progress.
         _live_status_mode = resolve_display_setting(user_config, platform_key, "live_status", "full")
         _live_status_adapter = (
@@ -2672,9 +2691,9 @@ class GatewayTurnMixin:
             disabled_toolsets=disabled_toolsets, resolve_display_setting=resolve_display_setting,
             progress_mode=progress_mode, progress_grouping=progress_grouping,
             _display_surface_mode=_display_surface_mode,
-            tool_progress_enabled=tool_progress_enabled, _live_status_mode=_live_status_mode,
-            _live_status_adapter=_live_status_adapter, log_mode_enabled=log_mode_enabled,
-            log_queue=queue.Queue() if log_mode_enabled else None,
+            tool_progress_enabled=tool_progress_enabled, tool_progress_filter=tool_progress_filter,
+            _live_status_mode=_live_status_mode, _live_status_adapter=_live_status_adapter,
+            log_mode_enabled=log_mode_enabled, log_queue=queue.Queue() if log_mode_enabled else None,
             interim_assistant_messages_enabled=interim_assistant_messages_enabled,
             _thinking_enabled=_thinking_enabled, _native_slack_task_cards=_native_slack_task_cards,
             needs_progress_queue=tool_progress_enabled or _thinking_enabled or _native_slack_task_cards,
@@ -2684,7 +2703,7 @@ class GatewayTurnMixin:
     # _RunAgentDisplay fields copied verbatim onto the TurnContext.
     _DISPLAY_TO_TURN_CTX = (
         "_live_status_adapter", "_live_status_mode", "_thinking_enabled", "progress_mode",
-        "progress_grouping", "tool_progress_enabled", "log_queue", "resolve_display_setting",
+        "progress_grouping", "tool_progress_enabled", "tool_progress_filter", "log_queue", "resolve_display_setting",
         "user_config", "enabled_toolsets", "disabled_toolsets", "log_mode_enabled",
         "interim_assistant_messages_enabled", "needs_progress_queue", "_native_slack_task_cards",
     )

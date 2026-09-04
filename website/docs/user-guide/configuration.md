@@ -1905,7 +1905,8 @@ This controls both the `text_to_speech` tool and spoken replies in voice mode (`
 
 ```yaml
 display:
-  tool_progress: all      # off | new | all | verbose
+  tool_progress: all      # off | new | all | verbose | log — global tool-progress mode
+  tool_progress_filter: {}  # per-tool/category overrides: {terminal: off, read_file: off, skills: all, mcp: off, plugins: all}. Keys are tool names or categories (skills/mcp/plugins); values are modes (off/new/all/verbose/log). Per-platform via display.platforms.<platform>.tool_progress_filter. When global is off but filter whitelists tools, the queue stays active for those tools. Empty/malformed/unknown entries fail safe to the global mode.
   tool_progress_command: false  # Enable /verbose slash command in messaging gateway
   focus_view: false       # CLI focus view (/focus) — reduced output, display-only
   platforms: {}           # Per-platform display overrides (see below)
@@ -2096,11 +2097,13 @@ Different platforms have different verbosity needs. Use `display.platforms` to s
 ```yaml
 display:
   tool_progress: all          # global default
+  tool_progress_filter: {}    # or e.g. {terminal: off, skills: all} — same per-tool/category filter as above, merged per platform (platform entries win)
   platforms:
     signal:
       tool_progress: 'off'    # Signal cannot currently display tool-progress bubbles
     telegram:
       tool_progress: verbose  # detailed progress on Telegram
+      tool_progress_filter: {}  # e.g. {terminal: off} to mute noisy commands on Telegram only
     slack:
       tool_progress: 'off'    # quiet in shared Slack workspace
 ```

@@ -34,6 +34,150 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
 
+# ---- progress filter helpers (per-tool + category) ---------------------------
+# Category aliases supported in display.tool_progress_filter keys. Normalized to lower case.
+# "skills" covers skill_manage/skill_view etc; "mcp" covers all MCP-discovered tools;
+# "plugins" covers tools registered by hermes_plugins. Unknown categories are stored but
+# never match, failing safe (no effect). Individual tool names take precedence over
+# categories.
+
+_CATEGORY_ALIASES: dict[str, str] = {
+    "skill": "skills",
+    "skills": "skills",
+    "mcp": "mcp",
+    "mcp_tools": "mcp",
+    "mcp-tools": "mcp",
+    "mcp_tool": "mcp",
+    "plugin": "plugins",
+    "plugins": "plugins",
+}
+
+# Static set of skill-related tool names for quick category matching when registry
+# is not yet populated. The registry path is preferred when available.
+_SKILL_TOOL_NAMES = frozenset({
+    "skill_manage", "skill_view", "skill_ledger", "skill_evaluator", "skill_usage",
+    "skills_tool", "skills_hub", "skill_manager_tool", "memory",  # memory often grouped with skills in fleet configs
+})
+
+def _normalize_filter_key(key: str) -> str:
+    k = key.strip().lower()
+    return _CATEGORY_ALIASES.get(k, k)
+
+def _get_tool_categories(tool_name: str) -> list[str]:
+    """Return category keys (normalized) for a tool name, for filter matching.
+
+    Categories are "skills", "mcp", "plugins" when runtime metadata can
+    distinguish them. Uses the tool registry when available, falls back to
+    name-prefix heuristics. Never raises; empty list means no category.
+    """
+    if not tool_name or not isinstance(tool_name, str):
+        return []
+    name_lower = tool_name.strip().lower()
+    cats: list[str] = []
+    # Heuristic: skill prefix
+    if name_lower.startswith("skill") or name_lower in _SKILL_TOOL_NAMES:
+        cats.append("skills")
+    # Registry-backed checks (best effort, never raises)
+    try:
+        from tools.registry import registry as _reg
+        toolset = None
+        try:
+            toolset = _reg.get_toolset_for_tool(tool_name)
+        except Exception:
+            try:
+                toolset = _reg.get_toolset_for_tool(name_lower)
+            except Exception:
+                toolset = None
+        if toolset and isinstance(toolset, str) and toolset.startswith("mcp-"):
+            if "mcp" not in cats:
+                cats.append("mcp")
+        # Plugin ownership: check handler module
+        try:
+            entry = None
+            # registry stores ToolEntry; try to get it
+            # Use internal _snapshot_entries if available
+            entries = _reg._snapshot_entries() if hasattr(_reg, "_snapshot_entries") else []
+            for e in entries:
+                if getattr(e, "name", None) == tool_name or getattr(e, "name", "").lower() == name_lower:
+                    entry = e
+                    break
+            if entry is not None:
+                mod = getattr(getattr(entry, "handler", None), "__module__", "") or ""
+                if mod.startswith("hermes_plugins.") or toolset == "plugin" or (toolset and "plugin" in toolset):
+                    if "plugins" not in cats:
+                        cats.append("plugins")
+                # Also detect plugin via registry helper
+                try:
+                    owner = _reg._plugin_owner_of(entry.handler) if hasattr(_reg, "_plugin_owner_of") else None
+                    if owner and "plugins" not in cats:
+                        cats.append("plugins")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    except Exception:
+        pass
+    # MCP fallback: check MCP server names dict (lives in tools.mcp_tool in this branch)
+    try:
+        import tools.mcp_tool as _mcp_mod
+        names = getattr(_mcp_mod, "_mcp_tool_server_names", None)
+        if isinstance(names, dict) and (tool_name in names or name_lower in {k.lower() for k in names.keys()}):
+            if "mcp" not in cats:
+                cats.append("mcp")
+        # Also try mcp_tool_common/_core for older layouts
+        try:
+            from tools.mcp_tool_common import _core as _mcp_core_common
+            names2 = getattr(_mcp_core_common, "_mcp_tool_server_names", None)
+            if isinstance(names2, dict) and (tool_name in names2 or name_lower in {k.lower() for k in names2.keys()}):
+                if "mcp" not in cats:
+                    cats.append("mcp")
+        except Exception:
+            pass
+        try:
+            from tools.mcp_tool import _core as _mcp_core_mod
+            names3 = getattr(_mcp_core_mod, "_mcp_tool_server_names", None)
+            if isinstance(names3, dict) and (tool_name in names3 or name_lower in {k.lower() for k in names3.keys()}):
+                if "mcp" not in cats:
+                    cats.append("mcp")
+        except Exception:
+            pass
+    except Exception:
+        pass
+    # Deduplicate preserving order
+    seen = set()
+    uniq = []
+    for c in cats:
+        if c not in seen:
+            seen.add(c)
+            uniq.append(c)
+    return uniq
+
+def _resolve_effective_mode(tool_name: str, global_mode: str, filter_dict: dict | None) -> str:
+    """Resolve per-tool effective progress mode, honoring filter overrides.
+
+    Precedence: exact tool name (case-insensitive) wins over category, then global.
+    Categories checked: skills/mcp/plugins. Returns global_mode if filter empty or no match.
+    """
+    if not filter_dict:
+        return global_mode
+    # filter_dict keys are already lowercased via normalization, but be defensive
+    lower_map = {str(k).strip().lower(): v for k, v in filter_dict.items() if isinstance(k, str)}
+    name_lower = tool_name.strip().lower() if isinstance(tool_name, str) else ""
+    if name_lower and name_lower in lower_map:
+        return lower_map[name_lower]
+    # Category check: tool may belong to multiple, first match wins
+    for cat in _get_tool_categories(tool_name):
+        cat_norm = _normalize_filter_key(cat)
+        if cat_norm in lower_map:
+            return lower_map[cat_norm]
+        # also try raw cat without alias (e.g., filter has "skill" vs "skills")
+        # _normalize handles alias, but also check alias variants direct
+        for alias, canonical in _CATEGORY_ALIASES.items():
+            if canonical == cat and alias in lower_map:
+                return lower_map[alias]
+    return global_mode
+
+
 
 class TurnRunner:
     """Per-turn collaborator carrying ``GatewayRunner._run_agent_inner``'s tool-progress callbacks."""
@@ -131,11 +275,21 @@ class TurnRunner:
             or self._agent_interrupted()
         ):
             return
-        # "new" mode: only report when tool changes
-        if ctx.progress_mode == "new" and tool_name == ctx.last_tool[0]:
+        # Per-tool/category filter: resolve effective mode for this tool.
+        # Filter entries override the global progress_mode per tool name or category
+        # (skills/mcp/plugins). Exact tool name wins over category. Malformed/absent
+        # filter fails safe to the global mode.
+        try:
+            _effective_mode = _resolve_effective_mode(tool_name, ctx.progress_mode, getattr(ctx, "tool_progress_filter", None))
+        except Exception:
+            _effective_mode = ctx.progress_mode
+        if _effective_mode == "off":
+            return
+        # "new" mode: only report when tool changes (per effective mode, not global)
+        if _effective_mode == "new" and tool_name == ctx.last_tool[0]:
             return
         ctx.last_tool[0] = tool_name
-        msg = self._progress_build_message(tool_name, preview, args)
+        msg = self._progress_build_message(tool_name, preview, args, _effective_mode=_effective_mode)
         if msg is not None:
             self._progress_emit(msg)
 
@@ -218,7 +372,7 @@ class TurnRunner:
             cmd_short += " ..."
         return f"{header}```\n{cmd_full}\n```", f"{header}```\n{cmd_short}\n```"
 
-    def _progress_build_message(self, tool_name, preview, args) -> Optional[str]:
+    def _progress_build_message(self, tool_name, preview, args, _effective_mode: str | None = None) -> Optional[str]:
         """Render the progress line. Verbose mode queues directly (no dedup) and returns None."""
         ctx = self._ctx
         from agent.display import get_tool_emoji
@@ -228,7 +382,12 @@ class TurnRunner:
         except Exception:
             adapter = None
         code_full, code_short = self._progress_terminal_blocks(adapter, tool_name, args, emoji)
-        verbose = ctx.progress_mode == "verbose"
+        if _effective_mode is None:
+            try:
+                _effective_mode = _resolve_effective_mode(tool_name, ctx.progress_mode, getattr(ctx, "tool_progress_filter", None))
+            except Exception:
+                _effective_mode = ctx.progress_mode
+        verbose = _effective_mode == "verbose"
         code = code_full if verbose else code_short
         ctx.last_was_terminal_block[0] = code is not None
         if verbose:
