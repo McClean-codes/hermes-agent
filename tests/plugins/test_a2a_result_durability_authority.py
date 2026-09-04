@@ -1253,4 +1253,3 @@ def test_push_out_of_band_loopback_propagates_inner_failure_without_reaudit(monk
         # Create a single AssertionError with joined messages, but also ensure pytest shows all
         msg = "B5 matrix failures (" + str(len(matrix_failures)) + "):\n" + "\n".join(f"- {m}" for m in matrix_failures)
         raise AssertionError(msg)
-

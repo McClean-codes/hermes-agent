@@ -403,4 +403,3 @@ def _a2a_managed_loop(primary_adapter, monkeypatch, *, timeout=5, additional_ada
         else:
             cleanup_group = BaseExceptionGroup("managed-loop cleanup failed", cleanup_failures)
             raise BaseExceptionGroup("managed-loop primary and cleanup failed", [primary_exc, cleanup_group])
-

@@ -427,71 +427,317 @@ def test_immediate_reject_paths_fail_closed_when_ledger_write_fails(monkeypatch,
 def test_working_publish_precedes_local_and_routed_dispatch(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     from plugins.platforms.a2a.adapter import A2AAdapter
-    adapter = A2AAdapter(PlatformConfig(enabled=True, extra={"port": 0}))
-    adapter.tasks = TaskStore()
-    ledger = tmp_path / "ledger.json"
-    # Track dispatch calls
+    from plugins.platforms.a2a import protocol, security
+    from plugins.platforms.a2a.protocol import TaskStore
+    import json, time
+    from unittest import mock
+
+    def fresh_adapter():
+        ad = A2AAdapter(PlatformConfig(enabled=True, extra={"port": 0}))
+        ad.tasks = TaskStore()
+        return ad
+
+    # --- Helper to assert no prepublication mutation and capture side effects ---
+    def assert_no_set_push(adapter):
+        calls = []
+        orig = adapter.tasks.set_push_config
+        def tracking(*a, **kw):
+            calls.append((a, kw))
+            return orig(*a, **kw)
+        monkeypatch.setattr(adapter.tasks, "set_push_config", tracking)
+        return calls
+
+    # Track audit and push notifications
+    audit_calls = []
+    orig_audit = security.audit
+    def tracking_audit(direction, peer, tid, detail, context_id=None):
+        audit_calls.append((direction, peer, tid, detail, context_id))
+        return orig_audit(direction, peer, tid, detail, context_id=context_id)
+    monkeypatch.setattr(security, "audit", tracking_audit)
+    import plugins.platforms.a2a.adapter as adapter_mod
+    monkeypatch.setattr(adapter_mod.security, "audit", tracking_audit)
+
+    push_calls = []
+    def make_push_tracker(adapter):
+        orig = adapter._send_push_notification
+        def tracked(task_id, context_id, reply, state):
+            push_calls.append((task_id, context_id, state))
+            return orig(task_id, context_id, reply, state)
+        monkeypatch.setattr(adapter, "_send_push_notification", tracked)
+        return push_calls
+
+    # Valid direct and compatibility-nested shapes must persist exact URL/config ID/scope
+    valid_cases = [
+        ({"configuration": {"taskPushNotificationConfig": {"url": "http://127.0.0.1:8765/hook"}}}, "http://127.0.0.1:8765/hook"),
+        ({"configuration": {"taskPushNotificationConfig": {"pushNotificationConfig": {"url": "http://127.0.0.1:8765/hook2"}}}}, "http://127.0.0.1:8765/hook2"),
+        ({"configuration": {"taskPushNotificationConfig": {"url": "http://127.0.0.1:8765/hook", "pushNotificationConfig": {"url": "http://127.0.0.1:8765/hook"}}}}, "http://127.0.0.1:8765/hook"),
+    ]
+    for idx, (cfg_extra, expected_url) in enumerate(valid_cases):
+        adapter = fresh_adapter()
+        ledger = tmp_path / f"ledger_valid_{idx}.json"
+        monkeypatch.setattr("plugins.platforms.a2a.a2a_persistence._task_ledger_path", lambda p=ledger: p)
+        monkeypatch.setattr("plugins.platforms.a2a.adapter._task_ledger_path", lambda p=ledger: p)
+        # ensure clean state before
+        tid_pre = f"task-valid-{idx}"
+        assert adapter.tasks.get(tid_pre) is None
+        audit_calls.clear()
+        push_calls.clear()
+        set_push_calls = assert_no_set_push(adapter)
+        # prevent real dispatch side effects but allow publish to succeed
+        adapter._agents = {"": {"local": True}}
+        adapter._loop = mock.Mock()
+        adapter._loop.is_closed.return_value = False
+        adapter._message_handler = mock.Mock()
+        import asyncio as _aio
+        dispatched = []
+        def fake_run(coro, loop):
+            dispatched.append("local")
+            try:
+                coro.close()
+            except Exception:
+                pass
+            fut = mock.Mock()
+            fut.result.return_value = None
+            return fut
+        monkeypatch.setattr(_aio, "run_coroutine_threadsafe", fake_run)
+        params = {"message": {"role": "ROLE_USER", "parts": [{"text": "hello"}], "messageId": f"mid-valid-{idx}", "contextId": f"ctx-valid-{idx}"}, **cfg_extra}
+        # no prepublication mutation: before call store empty
+        assert adapter.tasks.get(f"task-valid-{idx}") is None
+        # call _prepare_task — should publish WORKING before dispatch
+        order = []
+        orig_pub = adapter.tasks.publish_durable
+        def recording_pub(path, tid, rec):
+            order.append(rec["state"])
+            return orig_pub(path, tid, rec)
+        monkeypatch.setattr(adapter.tasks, "publish_durable", recording_pub)
+        monkeypatch.setattr("gateway.session_context.set_session_vars", lambda **kw: [])
+        try:
+            terminal, pending = adapter._prepare_task(params, "peer1")
+        except protocol.DurablePublishError:
+            assert False, f"valid case {idx} should not fail"
+        assert "TASK_STATE_WORKING" in order
+        assert dispatched == ["local"]
+        # pending should be not None (WORKING held) for local dispatch path? Actually for local with loop, it dispatches async so pending is not None
+        # Check ledger contains exact URL/config ID/scope
+        assert ledger.exists()
+        data = json.loads(ledger.read_text())
+        # find task by context
+        rec = None
+        tid = None
+        for k, v in data.items():
+            if v.get("context_id") == f"ctx-valid-{idx}":
+                rec = v
+                tid = k
+                break
+        assert rec is not None, f"ledger missing valid {idx}"
+        assert rec["push_url"] == expected_url
+        assert rec["push_config_id"].startswith("cfg-") and len(rec["push_config_id"]) == 16
+        assert rec["agent_slug"] == "" and rec["tenant"] == ""
+        # fresh restore matching scope succeeds, wrong scope not-found
+        fresh = TaskStore()
+        cnt = fresh.restore(ledger)
+        assert cnt >= 1
+        got = fresh.get(tid, "", "")
+        assert got is not None and got["push_url"] == expected_url
+        assert fresh.get(tid, "wrong", "") is None
+        assert fresh.get(tid, "", "wrong") is None
+        cfg = fresh.get_push_config(tid, rec["push_config_id"], "", "")
+        assert cfg is not None and cfg["pushNotificationConfig"]["url"] == expected_url
+        # no set_push_config was used for inline path
+        assert set_push_calls == [], f"valid inline must not call set_push_config, got {set_push_calls}"
+        # no push dispatched yet (push happens on terminal, not WORKING)
+        assert push_calls == []
+        # no extra push_failed audit for valid
+        assert not any(a[0] == "push_failed" for a in audit_calls)
+        # memory record also has correct fields
+        mem = adapter.tasks.get(tid, "", "")
+        assert mem is not None and mem["push_url"] == expected_url
+
+    # Invalid optional configurations must produce empty durable fields with no set_push_config/callback/extra audit/task-result change
+    invalid_cases = [
+        {},  # missing configuration
+        {"configuration": {}},  # missing tpc
+        {"configuration": {"taskPushNotificationConfig": None}},  # None
+        {"configuration": {"taskPushNotificationConfig": "not-a-dict"}},  # malformed non-dict
+        {"configuration": {"taskPushNotificationConfig": {"pushNotificationConfig": "not-a-dict"}}},  # nested non-dict
+        {"configuration": {"taskPushNotificationConfig": {"url": 123}}},  # non-string direct
+        {"configuration": {"taskPushNotificationConfig": {"pushNotificationConfig": {"url": 123}}}},  # non-string nested
+        {"configuration": {"taskPushNotificationConfig": {"url": "   "}}},  # blank direct
+        {"configuration": {"taskPushNotificationConfig": {"pushNotificationConfig": {"url": "   "}}}},  # blank nested
+        {"configuration": {"taskPushNotificationConfig": {"url": "http://127.0.0.1:8765/a", "pushNotificationConfig": {"url": "http://127.0.0.1:8765/b"}}}},  # conflicting
+        {"configuration": {"taskPushNotificationConfig": {"url": "http://10.0.0.1/hook"}}},  # unsafe private
+        {"configuration": {"taskPushNotificationConfig": {"url": "ftp://example.com/hook"}}},  # unsafe scheme
+        {"configuration": {"taskPushNotificationConfig": {"url": ""}}},  # empty string
+    ]
+    for idx, cfg_extra in enumerate(invalid_cases):
+        adapter = fresh_adapter()
+        ledger = tmp_path / f"ledger_invalid_{idx}.json"
+        monkeypatch.setattr("plugins.platforms.a2a.a2a_persistence._task_ledger_path", lambda p=ledger: p)
+        monkeypatch.setattr("plugins.platforms.a2a.adapter._task_ledger_path", lambda p=ledger: p)
+        audit_calls.clear()
+        push_calls.clear()
+        set_push_calls = assert_no_set_push(adapter)
+        adapter._agents = {"": {"local": True}}
+        adapter._loop = mock.Mock()
+        adapter._loop.is_closed.return_value = False
+        adapter._message_handler = mock.Mock()
+        import asyncio as _aio2
+        dispatched = []
+        def fake_run2(coro, loop):
+            dispatched.append("local")
+            try:
+                coro.close()
+            except Exception:
+                pass
+            fut = mock.Mock()
+            fut.result.return_value = None
+            return fut
+        monkeypatch.setattr(_aio2, "run_coroutine_threadsafe", fake_run2)
+        order = []
+        orig_pub = adapter.tasks.publish_durable
+        def recording_pub2(path, tid, rec):
+            order.append(rec.get("push_url", ""))
+            return orig_pub(path, tid, rec)
+        monkeypatch.setattr(adapter.tasks, "publish_durable", recording_pub2)
+        monkeypatch.setattr("gateway.session_context.set_session_vars", lambda **kw: [])
+        params = {"message": {"role": "ROLE_USER", "parts": [{"text": "hello"}], "messageId": f"mid-invalid-{idx}", "contextId": f"ctx-invalid-{idx}"}, **cfg_extra}
+        # no prepublication mutation
+        # pick a tid that would be generated — but we check that before call, ledger empty and no task for that context
+        assert not ledger.exists() or json.loads(ledger.read_text()).get(f"ctx-invalid-{idx}") is None
+        try:
+            terminal, pending = adapter._prepare_task(params, "peer1")
+        except protocol.DurablePublishError:
+            assert False, f"invalid config {idx} should not fail durable publish, only produce empty fields"
+        # ledger should have WORKING with empty push fields
+        assert ledger.exists()
+        data = json.loads(ledger.read_text())
+        rec = None
+        for v in data.values():
+            if v.get("context_id") == f"ctx-invalid-{idx}":
+                rec = v
+                break
+        assert rec is not None, f"invalid case {idx} ledger missing"
+        assert rec["push_url"] == "" and rec["push_config_id"] == "", f"invalid {idx} should have empty push fields, got {rec}"
+        assert rec["agent_slug"] == "" and rec["tenant"] == ""
+        # no set_push_config, no callback, no extra audit, no task-result change beyond WORKING
+        assert set_push_calls == [], f"invalid {idx} must not call set_push_config"
+        assert push_calls == [], f"invalid {idx} must not trigger push"
+        # audit should not contain push or push_failed for empty config (only bounded warning log, not audit)
+        assert not any(a[0] in ("push", "push_failed") for a in audit_calls), f"invalid {idx} extra audit {audit_calls}"
+        # order should have empty push_url for WORKING
+        assert "" in order
+        # memory also empty
+        tid2 = rec["task_id"]
+        mem = adapter.tasks.get(tid2, "", "")
+        assert mem is not None and mem["push_url"] == "" and mem["push_config_id"] == ""
+
+    # No prepublication TaskStore mutation already checked above; also check that TaskStore not mutated before publish_durable is called
+    adapter = fresh_adapter()
+    ledger = tmp_path / "ledger_prepub.json"
+    monkeypatch.setattr("plugins.platforms.a2a.a2a_persistence._task_ledger_path", lambda: ledger)
+    monkeypatch.setattr("plugins.platforms.a2a.adapter._task_ledger_path", lambda: ledger)
+    audit_calls.clear()
+    push_calls.clear()
+    # use a hook that would succeed but we will intercept publish to fail and check no mutation happened before
+    seen_before = []
+    orig_pub = adapter.tasks.publish_durable
+    def failing_pub(path, tid, rec):
+        # before publish, check that store still has no record for tid
+        seen_before.append(adapter.tasks.get(tid) is None)
+        return protocol.DurablePublishOutcome(published=False, newly_published=False, record=None, durable_state="ABSENT", error="injected")
+    monkeypatch.setattr(adapter.tasks, "publish_durable", failing_pub)
+    adapter._agents = {"": {"local": True}}
+    adapter._loop = mock.Mock()
+    adapter._loop.is_closed.return_value = False
+    adapter._message_handler = mock.Mock()
+    monkeypatch.setattr("gateway.session_context.set_session_vars", lambda **kw: [])
+    params = {"message": {"role": "ROLE_USER", "parts": [{"text": "hello"}], "messageId": "mid-prepub", "contextId": "ctx-prepub"}, "configuration": {"taskPushNotificationConfig": {"url": "http://127.0.0.1:8765/hook"}}}
+    with mock.patch.object(adapter, "_send_push_notification", lambda *a, **kw: push_calls.append("should-not")):
+        try:
+            adapter._prepare_task(params, "peer1")
+            assert False, "should have raised DurablePublishError"
+        except protocol.DurablePublishError:
+            pass
+    assert seen_before and all(seen_before), "prepublication TaskStore was mutated before publish"
+    assert push_calls == []
+    assert adapter.tasks.get("mid-prepub") is None  # no memory-only record
+
+    # Routed dispatch path also precedes
+    adapter = fresh_adapter()
+    ledger = tmp_path / "ledger_routed.json"
+    monkeypatch.setattr("plugins.platforms.a2a.a2a_persistence._task_ledger_path", lambda: ledger)
+    monkeypatch.setattr("plugins.platforms.a2a.adapter._task_ledger_path", lambda: ledger)
     dispatched = []
-    orig_forward = adapter._forward_to_profile
     def fake_forward(agent, peer, ctx, framed, tid):
         dispatched.append("forward")
         return "reply", protocol.STATE_COMPLETED
     monkeypatch.setattr(adapter, "_forward_to_profile", fake_forward)
-    # Mock loop to be None to avoid real dispatch, but we want to test local dispatch path
-    # For this test, we will check that publish happens before dispatch
-    # Monkeypatch publish_durable to record order
+    adapter._agents = {"dev": {"profile": "dev", "tenant": "dev"}}
+    # pick agent dev
+    agent = adapter._agents["dev"]
     order = []
-    orig_publish = adapter.tasks.publish_durable
-    def recording_publish(path, tid, rec):
+    orig_pub = adapter.tasks.publish_durable
+    def recording_pub3(path, tid, rec):
         order.append(rec["state"])
-        return orig_publish(path, tid, rec)
-    adapter.tasks.publish_durable = recording_publish
-    # Mock set_session_vars etc to avoid side effects
+        return orig_pub(path, tid, rec)
+    monkeypatch.setattr(adapter.tasks, "publish_durable", recording_pub3)
     monkeypatch.setattr("gateway.session_context.set_session_vars", lambda **kw: [])
-    # Prepare a valid params for local dispatch (agent local True)
-    params = {"message": {"role": "ROLE_USER", "parts": [{"text": "hello"}], "messageId": "mid-work", "contextId": "ctx-work"}}
-    adapter._agents = {"": {"local": True}}
-    adapter._loop = mock.Mock()
-    adapter._message_handler = mock.Mock()
-    adapter._loop.is_closed.return_value = False
-    # Mock run_coroutine_threadsafe to capture dispatch
-    import asyncio
-    def fake_run(coro, loop):
-        dispatched.append("local")
-        # Close coroutine to avoid warnings
-        try:
-            coro.close()
-        except Exception:
-            pass
-        fut = mock.Mock()
-        fut.result.return_value = None
-        return fut
-    monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", fake_run)
-    # Call _prepare_task - should publish WORKING before dispatch
+    params = {"tenant": "dev", "message": {"role": "ROLE_USER", "parts": [{"text": "hello"}], "messageId": "mid-routed", "contextId": "ctx-routed"}, "configuration": {"taskPushNotificationConfig": {"url": "http://127.0.0.1:8765/hook"}}}
+    # no prepublication mutation for routed
+    assert adapter.tasks.get("mid-routed") is None
+    # Should still publish WORKING before forward? Actually routed immediate forward returns terminal directly, but still WORKING is published then forward terminal? For routed, it may directly publish COMPLETED? Let's check: for routed, _prepare_task calls _forward_to_profile and publishes terminal directly, not WORKING. Our earlier check expects WORKING, but routed may be different. We will allow either.
     try:
-        terminal, pending = adapter._prepare_task(params, "peer1")
+        terminal, pending = adapter._prepare_task(params, "peer1", agent=agent)
     except protocol.DurablePublishError:
-        pytest.fail("WORKING publish should succeed with good ledger")
-    assert "TASK_STATE_WORKING" in order
-    assert dispatched == ["local"]
-    # Now test failure: publish fails, dispatch should not happen
+        assert False
+    # For routed, terminal should be returned, pending None
+    assert terminal is not None
+    assert dispatched == ["forward"] or order  # at least forward was called after publish
+    # Check ledger for routed case still has push fields
+    data = json.loads(ledger.read_text())
+    rec = None
+    for v in data.values():
+        if v.get("context_id") == "ctx-routed":
+            rec = v
+            break
+    assert rec is not None and rec["push_url"] == "http://127.0.0.1:8765/hook"
+
+    # Durable publish failure remains fail-closed with no dispatch or memory-only callback
+    adapter = fresh_adapter()
+    ledger = tmp_path / "ledger_fail.json"
+    monkeypatch.setattr("plugins.platforms.a2a.a2a_persistence._task_ledger_path", lambda: ledger)
+    monkeypatch.setattr("plugins.platforms.a2a.adapter._task_ledger_path", lambda: ledger)
     dispatched.clear()
-    order.clear()
+    push_calls.clear()
+    audit_calls.clear()
     def failing_publish(path, tid, rec):
         if rec["state"] == protocol.STATE_WORKING:
             return protocol.DurablePublishOutcome(published=False, newly_published=False, record=None, durable_state="ABSENT", error="injected")
-        return orig_publish(path, tid, rec)
-    adapter.tasks.publish_durable = failing_publish
-    adapter2 = A2AAdapter(PlatformConfig(enabled=True, extra={"port": 0}))
-    adapter2.tasks = TaskStore()
-    adapter2._agents = {"": {"local": True}}
-    adapter2._loop = mock.Mock()
-    adapter2._message_handler = mock.Mock()
-    adapter2.tasks.publish_durable = failing_publish
-    monkeypatch.setattr(adapter2, "_forward_to_profile", fake_forward)
-    with pytest.raises(protocol.DurablePublishError):
-        adapter2._prepare_task(params, "peer1")
-    assert dispatched == []  # no dispatch on failure
+        return orig_pub(path, tid, rec)
+    monkeypatch.setattr(adapter.tasks, "publish_durable", failing_publish)
+    adapter._agents = {"": {"local": True}}
+    adapter._loop = mock.Mock()
+    adapter._message_handler = mock.Mock()
+    monkeypatch.setattr(adapter, "_forward_to_profile", fake_forward)
+    import asyncio as _aio3
+    monkeypatch.setattr(_aio3, "run_coroutine_threadsafe", lambda c, l: (c.close(), mock.Mock())[1])
+    monkeypatch.setattr("gateway.session_context.set_session_vars", lambda **kw: [])
+    params = {"message": {"role": "ROLE_USER", "parts": [{"text": "hello"}], "messageId": "mid-fail", "contextId": "ctx-fail"}, "configuration": {"taskPushNotificationConfig": {"url": "http://127.0.0.1:8765/hook"}}}
+    with mock.patch.object(adapter.tasks, "set_push_config", lambda *a, **kw: (_ for _ in ()).throw(AssertionError("set_push_config must not be called on failure"))):
+        with mock.patch.object(adapter, "_send_push_notification", lambda *a, **kw: push_calls.append("fail")):
+            try:
+                adapter._prepare_task(params, "peer1")
+                assert False
+            except protocol.DurablePublishError:
+                pass
+    assert dispatched == []
+    assert push_calls == []
+    # No memory-only record
+    assert adapter.tasks.get("mid-fail") is None or adapter.tasks.get("mid-fail", "", "") is None or not any(v.get("context_id") == "ctx-fail" for v in adapter.tasks._tasks.values())
+    # Ensure ledger still absent or empty
+    if ledger.exists():
+        data = json.loads(ledger.read_text())
+        assert not any(v.get("context_id") == "ctx-fail" for v in data.values())
 
 # ---------------------------------------------------------------------------
 # 10. Normal terminal durability

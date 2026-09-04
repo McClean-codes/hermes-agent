@@ -362,7 +362,7 @@ class TaskRPCHandler:
             return url, cfg_id
         except Exception:
             logger.warning("A2A: inline push config: task %s: parse error", task_id[:32] if isinstance(task_id, str) else "")
-            return "",
+            return "", ""
 
     def _rpc_push_config_create(self, req_id, params: dict, agent=None) -> dict:
         task_id = str(params.get("taskId") or "")
