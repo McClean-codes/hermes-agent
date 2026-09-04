@@ -8,6 +8,7 @@ import os
 from functools import partial
 
 from agent.secret_scope import get_secret
+from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
 

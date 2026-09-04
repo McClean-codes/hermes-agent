@@ -631,8 +631,10 @@ class TestPushNotificationEndToEnd:
         monkeypatch.delenv("A2A_BEARER_TOKEN", raising=False)
         monkeypatch.delenv("A2A_PEER_TOKENS", raising=False)
         monkeypatch.setenv("A2A_PUSH_SECRET", "push-secret-1")
+        monkeypatch.setenv("A2A_REPLY_TIMEOUT", "15")
 
-        received = {}
+        callbacks: list[tuple[dict, str]] = []
+        cb_lock = threading.Lock()
         received_evt = threading.Event()
 
         class _Hook(BaseHTTPRequestHandler):
@@ -641,8 +643,10 @@ class TestPushNotificationEndToEnd:
 
             def do_POST(self):
                 length = int(self.headers.get("Content-Length", 0))
-                received["body"] = json.loads(self.rfile.read(length).decode())
-                received["signature"] = self.headers.get("X-A2A-Signature", "")
+                body = json.loads(self.rfile.read(length).decode())
+                sig = self.headers.get("X-A2A-Signature", "")
+                with cb_lock:
+                    callbacks.append((body, sig))
                 self.send_response(200)
                 self.send_header("Content-Length", "0")
                 self.end_headers()
@@ -652,38 +656,136 @@ class TestPushNotificationEndToEnd:
         hook_server = HTTPServer(("127.0.0.1", hook_port), _Hook)
         hook_thread = threading.Thread(target=hook_server.serve_forever, daemon=True)
         hook_thread.start()
+        hook_url = f"http://127.0.0.1:{hook_port}/hook"
 
-        adapter, base = _make_live_adapter(monkeypatch)
+        hold_started = threading.Event()
+        allow_reply = threading.Event()
+
+        from plugins.platforms.a2a.adapter import A2AAdapter
+        from gateway.config import PlatformConfig
+
+        port = _free_port()
+        monkeypatch.setenv("A2A_PORT", str(port))
+        adapter = A2AAdapter(PlatformConfig(enabled=True, extra={"port": port}))
+
+        async def controlled_handle(event):
+            hold_started.set()
+            await asyncio.to_thread(lambda: allow_reply.wait(timeout=10))
+            if not allow_reply.is_set():
+                await adapter.send(event.source.chat_id, "ECHO: timeout", metadata={"notify": True})
+                return
+            await adapter.send(event.source.chat_id, "ECHO: " + event.text, metadata={"notify": True})
+
+        adapter.handle_message = controlled_handle  # type: ignore
+        adapter._message_handler = object()
+        base = f"http://127.0.0.1:{port}"
 
         async def run():
             assert await adapter.connect() is True
+            from plugins.platforms.a2a.a2a_persistence import _task_ledger_path
+            from plugins.platforms.a2a.protocol import TaskStore
+            ledger_path = _task_ledger_path()
             body = _send_body("ping with push", extra_params={
                 "configuration": {
                     "taskPushNotificationConfig": {
-                        "url": f"http://127.0.0.1:{hook_port}/hook",
+                        "url": hook_url,
                     },
                 },
             })
-            resp = await asyncio.to_thread(_post_json, base + "/", body)
+            req_task = asyncio.create_task(asyncio.to_thread(_post_json, base + "/", body))
+            assert await asyncio.to_thread(lambda: hold_started.wait(timeout=5)), "agent handler never started — WORKING not held"
+            for _ in range(30):
+                await asyncio.sleep(0.1)
+                if ledger_path.exists():
+                    try:
+                        data = json.loads(ledger_path.read_text())
+                        for tid, rec in data.items():
+                            if rec.get("push_url") == hook_url and rec.get("state") == protocol.STATE_WORKING:
+                                break
+                        else:
+                            continue
+                        break
+                    except Exception:
+                        continue
+            else:
+                assert False, "durable ledger WORKING record not found"
+            data = json.loads(ledger_path.read_text())
+            task_id = None
+            config_id = None
+            context_id = None
+            rec_work = None
+            for tid, rec in data.items():
+                if rec.get("push_url") == hook_url:
+                    task_id = tid
+                    config_id = rec.get("push_config_id")
+                    context_id = rec.get("context_id")
+                    rec_work = rec
+                    break
+            assert task_id and config_id and context_id and rec_work
+            assert rec_work["push_url"] == hook_url
+            assert isinstance(config_id, str) and config_id.startswith("cfg-") and len(config_id) == 16
+            assert rec_work["agent_slug"] == "" and rec_work["tenant"] == ""
+            assert rec_work["state"] == protocol.STATE_WORKING
+            fresh = TaskStore()
+            cnt = fresh.restore(ledger_path)
+            assert cnt >= 1
+            got = fresh.get(task_id, "", "")
+            assert got is not None and got["push_url"] == hook_url and got["push_config_id"] == config_id
+            assert got["agent_slug"] == "" and got["tenant"] == ""
+            assert fresh.get(task_id, "wrong-slug", "") is None
+            assert fresh.get(task_id, "", "wrong-tenant") is None
+            cfg = fresh.get_push_config(task_id, config_id, "", "")
+            assert cfg is not None and cfg["pushNotificationConfig"]["url"] == hook_url
+            assert fresh.get_push_config(task_id, config_id, "wrong", "") is None
+            assert fresh.get_push_config(task_id, "cfg-000000000000", "", "") is None
+            allow_reply.set()
+            resp = await req_task
             task = resp["result"]
             assert task["status"]["state"] == "TASK_STATE_COMPLETED"
-
-            assert received_evt.wait(timeout=5), "push callback never received"
-            payload = received["body"]
-            # v1.0 push payload is a StreamResponse (statusUpdate member).
+            assert task["id"] == task_id
+            assert task["contextId"] == context_id
+            data2 = json.loads(ledger_path.read_text())
+            rec_done = data2.get(task_id)
+            assert rec_done is not None
+            assert rec_done["state"] == protocol.STATE_COMPLETED
+            assert rec_done["push_url"] == hook_url
+            assert rec_done["push_config_id"] == config_id
+            assert rec_done["agent_slug"] == "" and rec_done["tenant"] == ""
+            fresh2 = TaskStore()
+            fresh2.restore(ledger_path)
+            got2 = fresh2.get(task_id, "", "")
+            assert got2 is not None
+            assert got2["push_url"] == hook_url and got2["push_config_id"] == config_id
+            assert got2["agent_slug"] == "" and got2["tenant"] == ""
+            assert fresh2.get(task_id, "wrong", "") is None
+            assert await asyncio.to_thread(lambda: received_evt.wait(timeout=5)), "push callback never received"
+            await asyncio.sleep(0.3)
+            with cb_lock:
+                cbs = list(callbacks)
+            assert len(cbs) == 1, f"expected exactly one callback, got {len(cbs)}"
+            payload, signature = cbs[0]
             assert "statusUpdate" in payload
             su = payload["statusUpdate"]
-            assert su["taskId"] == task["id"]
+            assert su["taskId"] == task_id
+            assert su["contextId"] == context_id
             assert su["status"]["state"] == "TASK_STATE_COMPLETED"
             assert "ECHO:" in protocol.extract_text(su["status"]["message"])
-            # HMAC signature verifies against the shared secret.
+            assert "ping with push" in protocol.extract_text(su["status"]["message"])
             expected = hmac.new(
                 b"push-secret-1",
                 json.dumps(payload, sort_keys=True, ensure_ascii=False).encode(),
                 hashlib.sha256,
             ).hexdigest()
-            assert received["signature"] == expected
-
+            assert signature == expected
+            cand_dup = dict(got2)
+            cand_dup["state"] = protocol.STATE_COMPLETED
+            cand_dup["reply"] = got2.get("reply", "")
+            cand_dup["completed_at"] = got2.get("completed_at") or __import__("time").time()
+            outcome = fresh2.publish_durable(ledger_path, task_id, cand_dup)
+            assert outcome.published and not outcome.newly_published
+            await asyncio.sleep(0.5)
+            with cb_lock:
+                assert len(callbacks) == 1, "duplicate terminal publication produced second callback"
             await adapter.disconnect()
 
         try:
@@ -691,8 +793,11 @@ class TestPushNotificationEndToEnd:
         finally:
             hook_server.shutdown()
             hook_server.server_close()
-
-
+            hook_thread.join(timeout=2)
+            try:
+                asyncio.run(adapter.disconnect())
+            except Exception:
+                pass
 def test_agent_card_can_advertise_tenant():
     card = protocol.build_agent_card(
         name="tenant-agent",
