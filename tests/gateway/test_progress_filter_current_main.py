@@ -24,7 +24,7 @@ import queue
 import sys
 import types
 import asyncio
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -698,9 +698,11 @@ class TestImportantOutputDelivery:
         assert msg is not None
         assert "permission denied" in msg
 
-    def test_tool_completed_does_not_block_final_reply(self):
-        # Final reply via production gateway terminalization must not be suppressed by progress filter
+    @pytest.mark.asyncio
+    async def test_tool_completed_does_not_block_final_reply(self):
+        # Final reply via production gateway delivery must not be suppressed by progress filter
         pq = queue.Queue()
+        lq = queue.Queue()
         ctx = TurnContext(
             source=MagicMock(chat_id="c1"),
             _run_still_current=lambda: True,
@@ -712,7 +714,7 @@ class TestImportantOutputDelivery:
             tool_progress_enabled=False,
             tool_progress_filter={"terminal": "off"},
             progress_queue=pq,
-            log_queue=None,
+            log_queue=lq,
             last_progress_msg=[None],
             last_tool=[None],
             last_was_terminal_block=[False],
@@ -726,8 +728,11 @@ class TestImportantOutputDelivery:
             streaming_tts_consumer_holder=[None],
         )
         from gateway.run_turn_runner import TurnRunner
-        from gateway.config import Platform
+        from gateway.config import Platform, GatewayConfig
         from gateway.run import _sanitize_gateway_final_response
+        from gateway.session import SessionSource, SessionEntry
+        from gateway.platforms.base import MessageEvent
+        from datetime import datetime
 
         class StubRunner:
             def _adapter_for_source(self, s):
@@ -739,18 +744,112 @@ class TestImportantOutputDelivery:
         runner = TurnRunner(StubRunner(), ctx)  # type: ignore[arg-type]
         runner.progress_callback("tool.started", "terminal", "ls", {"command": "ls"})
         assert pq.empty(), "progress for filtered tool must be suppressed"
+        assert lq.empty(), "log rail must stay empty for filtered start"
+
+        # Production gateway final delivery via GatewayTurnMixin with only adapter send controlled
+        from gateway.run import GatewayRunner
+
+        ledger: list[str] = []
+        fake_adapter = MagicMock()
+        fake_adapter.supports_code_blocks = False
+        fake_adapter.format_tool_preview = lambda x, **kw: x.text if hasattr(x, "text") else str(x)
+        fake_adapter._streaming_tts_turn_completed = lambda *a, **kw: False
+        fake_adapter.supports_status_text = False
+        fake_adapter.native_task_cards_enabled = MagicMock(return_value=False)
+        fake_adapter.send = AsyncMock(side_effect=lambda chat_id, content, **kw: ledger.append(content) or MagicMock(success=True))
+        fake_adapter.send_stream_frame = AsyncMock(return_value=True)
+        fake_adapter.edit_message = AsyncMock(return_value=True)
+
+        config = GatewayConfig()
+        gw = object.__new__(GatewayRunner)
+        gw.config = config
+        gw.adapters = {Platform.TELEGRAM: fake_adapter}
+        gw._running_agents = {}
+        gw._running_agents_ts = {}
+        gw._pending_messages = {}
+        gw._pending_approvals = {}
+        gw._is_user_authorized = lambda _source: True
+        gw._set_session_env = lambda _context: None
+        gw._handle_active_session_busy_message = AsyncMock(return_value=False)
+        gw._session_db = MagicMock()
+        gw._recover_telegram_topic_thread_id = lambda _source: None
+        gw._cache_session_source = lambda _key, _source: None
+        gw._is_session_run_current = lambda _key, _gen: True
+        gw._begin_session_run_generation = lambda _key: 1
+        gw._reply_anchor_for_event = lambda _event: None
+        gw._get_guild_id = lambda _event: None
+        gw._should_send_voice_reply = lambda *_a, **_kw: False
+        gw.hooks = MagicMock()
+        gw.hooks.emit = AsyncMock()
+        gw.session_store = MagicMock()
+        gw.session_store.get_or_create_session.return_value = SessionEntry(
+            session_key="agent:main:telegram:group:-1001:12345",
+            session_id="sess-final-1",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            platform=Platform.TELEGRAM,
+            chat_type="group",
+        )
+        gw.session_store.load_transcript.return_value = []
+        gw.session_store.append_to_transcript = AsyncMock()
+        gw.session_store.has_platform_message_id.return_value = False
+        gw.session_store.update_session = AsyncMock()
+        gw.session_store._save = AsyncMock()
+        gw.session_store._record_gateway_session_peer = AsyncMock()
+        gw._adapter_for_source = lambda source: fake_adapter
+        gw._resolve_session_agent_runtime = MagicMock(return_value=("test/model", {"api_key": "fake", "base_url": ""}))
+        gw._resolve_session_reasoning_config = MagicMock(return_value=None)
+        gw._resolve_session_service_tier = MagicMock(return_value=None)
+        gw._provider_routing = {}
+        gw._reasoning_config = None
+        gw._service_tier = None
+        gw._async_session_store = gw.session_store  # type: ignore[attr-defined]
+
         final_text = "Hello final reply"
         sanitized = _sanitize_gateway_final_response(Platform.TELEGRAM, final_text)
         assert sanitized == final_text
-        # Deliver final via the authoritative TurnRunner terminalization seam (not manual ledger append)
-        result = {"final_response": sanitized, "messages": [], "failed": False, "completed": True, "api_calls": 0}
-        runner._finish_stream_consumer(result, agent_history=[], stream_consumer=None)
-        assert ctx.result_holder[0] is result
-        assert ctx.result_holder[0]["final_response"] == "Hello final reply"
+        mock_agent_result = {
+            "final_response": sanitized,
+            "messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": sanitized}],
+            "tools": [],
+            "failed": False,
+            "completed": True,
+            "api_calls": 1,
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+            "session_id": "sess-final-1",
+        }
+        gw._run_agent = AsyncMock(return_value=mock_agent_result)
+
+        event = MessageEvent(
+            text="hi",
+            source=SessionSource(platform=Platform.TELEGRAM, chat_id="-1001", chat_type="group", user_id="12345"),
+            message_id="msg-final-1",
+        )
+        source = event.source
+        session_entry = gw.session_store.get_or_create_session.return_value
+        session_key = "agent:main:telegram:group:-1001:12345"
+        run_generation = 1
+        agent_messages = mock_agent_result["messages"]
+        delivered = await gw._hmwa_deliver_turn_response(
+            event, source, session_entry, session_key, run_generation,
+            mock_agent_result, agent_messages, sanitized, "", False,
+        )
+        assert delivered == "Hello final reply"
+        delivery_ledger = [delivered] if delivered is not None else ledger
+        assert len(delivery_ledger) == 1
+        assert delivery_ledger[0] == "Hello final reply"
         assert pq.empty(), "progress must stay empty after final delivery"
+        assert lq.empty(), "log must stay empty after final delivery"
         runner.progress_callback("tool.completed", "terminal", None, {})
-        assert ctx.result_holder[0]["final_response"] == "Hello final reply", "tool completion must not clear final ledger"
-        assert pq.empty()
+        assert pq.empty(), "progress must stay empty after tool.completed"
+        assert delivery_ledger == ["Hello final reply"], "tool completion must not duplicate or clear final"
+        delivered2 = await gw._hmwa_deliver_turn_response(
+            event, source, session_entry, session_key, run_generation,
+            mock_agent_result, agent_messages, sanitized, "", False,
+        )
+        assert delivered2 == "Hello final reply"
+        assert delivery_ledger == ["Hello final reply"]
 
     def test_thinking_still_gated_separately(self):
         ctx = _make_ctx(progress_mode="off", tool_progress_filter={"terminal": "all"}, thinking_enabled=True)
@@ -972,32 +1071,95 @@ class TestPersonaIndependence:
         assert not ctx3.progress_queue.empty()
 
     def test_filter_does_not_block_tool_execution(self):
-        # Exercise the real production dispatch/execution/authorization path with only external effect boundary controlled
+        # Filter must suppress only the progress rail; tool must still execute via production executor
         from tools.registry import registry
-        executed = []
-        def real_handler(path: str = ""):
+        from unittest.mock import MagicMock, patch
+        import json
+        import uuid
+        from types import SimpleNamespace
+
+        executed: list[str] = []
+
+        def real_handler(*args, **kwargs):
+            # Registry may pass tool args as first positional dict (handler(args, task_id=...)) or as kwargs
+            path = ""
+            if args and isinstance(args[0], dict):
+                path = args[0].get("path", "")
+            elif "path" in kwargs:
+                path = kwargs.get("path", "")
+            elif args:
+                path = str(args[0])
             executed.append(path)
             return f"read {path}"
+
         schema = {"type": "object", "properties": {"path": {"type": "string"}}}
         tname = "_test_exec_real_tool_1"
         try:
             registry.register(name=tname, toolset="test-exec", schema=schema, handler=real_handler, check_fn=lambda: True)
-            entry = registry.get_entry(tname)
-            assert entry is not None
-            assert callable(entry.handler)
-            # Filtering must not deregister or block execution
+            # Production progress filtering check before execution
             ctx = _make_ctx(progress_mode="all", tool_progress_filter={tname: "off"})
             runner = _make_runner(ctx)
             runner.progress_callback("tool.started", tname, "x", {"path": "/tmp/x"})
-            assert ctx.progress_queue.empty()
-            # Real production dispatch via registry
-            result = registry.get_entry(tname).handler(path="/tmp/x")
-            assert result == "read /tmp/x"
-            assert executed == ["/tmp/x"]
-            # Authorization still holds: tool still listable and get_entry succeeds
-            assert tname in registry.get_all_tool_names()
-            # Filter must not have mutated context execution fields
-            assert ctx.tool_progress_filter == {tname: "off"}
+            assert ctx.progress_queue.empty(), "filtered tool progress must be suppressed via TurnRunner"
+
+            # Execute via the production tool-call executor so registry lookup, authorization,
+            # middleware, _begin_tool_execution and _invoke_tool are exercised.
+            # Use a real AIAgent with only external effect (our handler) controlled.
+            with patch("model_tools.get_tool_definitions", return_value=[{"type": "function", "function": {"name": tname, "description": "test", "parameters": schema}}]), \
+                 patch("model_tools.check_toolset_requirements", return_value={}), \
+                 patch("agent.process_bootstrap.OpenAI"):
+                from run_agent import AIAgent
+
+                agent = AIAgent(api_key="test-key-1234567890", base_url="https://openrouter.ai/api/v1", quiet_mode=True, skip_context_files=True, skip_memory=True)
+                agent.client = MagicMock()
+                # Make the agent aware of our disposable tool for authorization
+                agent.valid_tool_names = set(registry.get_all_tool_names())
+                # Wire progress callbacks so _begin_tool_execution exercises the real filter
+                progress_started: list[tuple] = []
+                tool_start_ledger: list[tuple] = []
+                tool_complete_ledger: list[tuple] = []
+
+                orig_progress_cb = runner.progress_callback
+
+                def _wrapped_progress(*a, **kw):
+                    progress_started.append(a)
+                    return orig_progress_cb(*a, **kw)
+
+                agent.tool_progress_callback = _wrapped_progress
+                agent.tool_start_callback = lambda call_id, name, args: tool_start_ledger.append((call_id, name, args))
+                agent.tool_complete_callback = lambda call_id, name, args, result: tool_complete_ledger.append((call_id, name, args, result))
+
+                def _mock_tool_call(name=tname, arguments='{"path": "/tmp/x"}', call_id=None):
+                    return SimpleNamespace(id=call_id or f"call_{uuid.uuid4().hex[:8]}", type="function", function=SimpleNamespace(name=name, arguments=arguments))
+
+                def _mock_assistant_msg(content="", tool_calls=None):
+                    return SimpleNamespace(content=content, tool_calls=tool_calls)
+
+                tc = _mock_tool_call(name=tname, arguments=json.dumps({"path": "/tmp/x"}), call_id="c1")
+                mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
+                messages: list[dict] = []
+                agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
+
+                # Filter must have kept progress suppressed even though executor called _begin_tool_execution
+                assert ctx.progress_queue.empty(), "filtered tool must stay suppressed when executed via production executor"
+                # Tool must have executed through the production path and returned expected result
+                assert executed == ["/tmp/x"], "handler must have been invoked via production executor, not direct call"
+                assert len(messages) == 1
+                assert messages[0]["role"] == "tool"
+                assert "read /tmp/x" in messages[0]["content"]
+                # Authorization/registry membership must remain intact after filtered execution
+                assert tname in registry.get_all_tool_names()
+                assert registry.get_entry(tname) is not None
+                # Real callbacks prove the production path was exercised
+                assert any(name == tname for _, name, *_ in tool_start_ledger), "tool_start must have been called via production executor"
+                assert any(name == tname for _, name, *_ in tool_complete_ledger), "tool_complete must have been called via production executor"
+                # Filter must not have mutated context execution fields
+                assert ctx.tool_progress_filter == {tname: "off"}
+                # Progress for a non-filtered tool would still be visible (sanity)
+                ctx2 = _make_ctx(progress_mode="all", tool_progress_filter={tname: "off"})
+                runner2 = _make_runner(ctx2)
+                runner2.progress_callback("tool.started", "read_file", "x", {"path": "/tmp/y"})
+                assert not ctx2.progress_queue.empty()
         finally:
             try:
                 registry.deregister(tname)
