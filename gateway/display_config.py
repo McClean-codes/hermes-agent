@@ -198,8 +198,25 @@ def _norm_int(value: Any) -> int:
 # Valid modes for the filter are the same as tool_progress but interpreted per tool/category.
 # Unknown/malformed entries are skipped (fail-safe: fallback to global mode) rather than
 # flooding or hiding. Empty/None → {}. List input is treated as an allowlist (each entry → "all").
+# Category aliases are canonicalized before dedup/merge so platform alias precedence is deterministic.
 
 _FILTER_VALID_MODES = {"off", "new", "all", "verbose", "log"}
+
+# Canonical category keys for alias handling; platform alias entries must override
+# global canonical entries (platform-wins). Duplicate spellings within one dict use last-wins.
+_FILTER_CATEGORY_CANONICAL: dict[str, str] = {
+    "skill": "skills",
+    "skills": "skills",
+    "mcp": "mcp",
+    "mcp_tools": "mcp",
+    "mcp-tools": "mcp",
+    "mcp_tool": "mcp",
+    "plugin": "plugins",
+    "plugins": "plugins",
+}
+
+def _canonical_filter_key(key: str) -> str:
+    return _FILTER_CATEGORY_CANONICAL.get(key, key)
 
 def _norm_tool_progress_filter(value: Any) -> dict:
     """Normalize display.tool_progress_filter to a clean {tool_or_category: mode} dict.
@@ -210,6 +227,8 @@ def _norm_tool_progress_filter(value: Any) -> dict:
     - malformed entries are skipped with a warning; duplicate keys (case-insensitive) last wins.
     - values are normalized: booleans → off/all, truthy/falsy strings → all/off, known modes pass through.
     Unknown mode strings are skipped (warn) rather than defaulting to "all" to avoid flooding.
+    Category aliases (skill/skills, mcp_tools/mcp, plugin/plugins) are canonicalized before dedup
+    so last-wins across alias spellings is deterministic.
     """
     if value is None:
         return {}
@@ -220,12 +239,13 @@ def _norm_tool_progress_filter(value: Any) -> dict:
             if not isinstance(entry, str):
                 logger.warning("Ignoring non-string tool_progress_filter list entry %r", entry)
                 continue
-            key = entry.strip().lower()
-            if not key:
+            raw_key = entry.strip().lower()
+            if not raw_key:
                 logger.warning("Ignoring empty tool_progress_filter list entry %r", entry)
                 continue
+            key = _canonical_filter_key(raw_key)
             if key in out:
-                logger.debug("Duplicate tool_progress_filter key %r, last wins", key)
+                logger.debug("Duplicate tool_progress_filter key %r (canonical %r), last wins", entry, key)
             out[key] = "all"
         if out:
             logger.debug("Normalized list-style tool_progress_filter to dict with %d entries", len(out))
@@ -238,10 +258,11 @@ def _norm_tool_progress_filter(value: Any) -> dict:
         if not isinstance(raw_k, str):
             logger.warning("Ignoring non-string tool_progress_filter key %r", raw_k)
             continue
-        key = raw_k.strip().lower()
-        if not key:
+        raw_key = raw_k.strip().lower()
+        if not raw_key:
             logger.warning("Ignoring empty/blank tool_progress_filter key %r", raw_k)
             continue
+        key = _canonical_filter_key(raw_key)
         mode = None
         if isinstance(raw_v, bool):
             mode = "all" if raw_v else "off"
@@ -270,7 +291,7 @@ def _norm_tool_progress_filter(value: Any) -> dict:
                 logger.warning("Ignoring malformed tool_progress_filter value %r for key %r", raw_v, raw_k)
                 continue
         if key in out:
-            logger.debug("Duplicate tool_progress_filter key %r (normalized), last wins", key)
+            logger.debug("Duplicate tool_progress_filter key %r (canonical %r), last wins", raw_k, key)
         out[key] = mode
     return out
 

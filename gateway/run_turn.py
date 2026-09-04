@@ -2643,22 +2643,27 @@ class GatewayTurnMixin:
         # Per-tool/category progress filter: allows overriding global mode for specific tools
         # (e.g., show skill_manage even when global is "off"). Supports categories
         # "skills", "mcp", "plugins" when runtime metadata distinguishes them.
-        # Platform-level filter merges over global (platform entries win).
+        # Platform-level filter merges over global (platform entries win). Aliases like
+        # skill->skills are canonicalized before the merge so platform precedence is deterministic.
         from gateway.display_config import resolve_tool_progress_filter as _resolve_filter
         try:
             tool_progress_filter = _resolve_filter(user_config, platform_key)
         except Exception as _filter_err:
             logger.debug("tool_progress_filter resolution failed: %s", _filter_err)
             tool_progress_filter = {}
-        # If global is off/log but filter whitelists some tools/categories, keep the
-        # progress queue alive so those tools can still emit. The per-tool gate
-        # in TurnRunner.progress_callback enforces the actual visibility.
-        if not tool_progress_enabled and tool_progress_filter and not is_webhook:
-            try:
-                if any(v != "off" for v in tool_progress_filter.values()):
-                    tool_progress_enabled = True
-            except Exception:
-                pass
+        # If global is off/log but filter explicitly whitelists visible modes, keep the
+        # progress queue alive for those tools. Log-only entries must NOT enable chat progress;
+        # they go only to the log sink. Per-tool gate in TurnRunner handles actual visibility.
+        _has_visible_override = False
+        _has_log_filter = False
+        try:
+            if tool_progress_filter:
+                _has_visible_override = any(v in ("all", "new", "verbose") for v in tool_progress_filter.values())
+                _has_log_filter = any(v == "log" for v in tool_progress_filter.values())
+        except Exception:
+            pass
+        if not tool_progress_enabled and tool_progress_filter and not is_webhook and _has_visible_override:
+            tool_progress_enabled = True
         # Live status for text-rendering typing indicators (Slack); independent of tool_progress.
         _live_status_mode = resolve_display_setting(user_config, platform_key, "live_status", "full")
         _live_status_adapter = (
@@ -2666,6 +2671,9 @@ class GatewayTurnMixin:
         )
         # "log" mode: tool calls go to ~/.hermes/logs/tool_calls.log instead of the chat. Gateway-only.
         log_mode_enabled = progress_mode == "log" and not is_webhook
+        # Per-tool log overrides also need the log sink even when global is not "log";
+        # otherwise effective "log" would have no destination and be silently dropped.
+        _needs_log_queue = (log_mode_enabled or _has_log_filter) and not is_webhook
         # Interim assistant messages and thinking_progress are independent of tool progress (same
         # queue). Mattermost requires a per-platform opt-in: scratch text leaks into public threads.
         interim_assistant_messages_mode = _display_surface_mode(
@@ -2693,7 +2701,7 @@ class GatewayTurnMixin:
             _display_surface_mode=_display_surface_mode,
             tool_progress_enabled=tool_progress_enabled, tool_progress_filter=tool_progress_filter,
             _live_status_mode=_live_status_mode, _live_status_adapter=_live_status_adapter,
-            log_mode_enabled=log_mode_enabled, log_queue=queue.Queue() if log_mode_enabled else None,
+            log_mode_enabled=log_mode_enabled, log_queue=queue.Queue() if _needs_log_queue else None,
             interim_assistant_messages_enabled=interim_assistant_messages_enabled,
             _thinking_enabled=_thinking_enabled, _native_slack_task_cards=_native_slack_task_cards,
             needs_progress_queue=tool_progress_enabled or _thinking_enabled or _native_slack_task_cards,
@@ -3832,7 +3840,7 @@ class GatewayTurnMixin:
         # Progress sender drains BOTH tool-progress lines and thinking bubbles (needs_progress_queue).
         spawn = asyncio.create_task
         progress_task = spawn(turn_runner.send_progress_messages()) if disp.needs_progress_queue else None
-        log_task = spawn(self._run_agent_write_tool_log(disp.log_queue)) if disp.log_mode_enabled else None
+        log_task = spawn(self._run_agent_write_tool_log(disp.log_queue)) if disp.log_queue is not None else None
         # The stream consumer is created inside run_sync; this task polls for it.
         stream_task = spawn(self._run_agent_stream_consumer_task(turn_ctx.stream_consumer_holder))
         tracking_task = spawn(self._run_agent_track_agent(turn_ctx))

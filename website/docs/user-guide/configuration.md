@@ -1906,7 +1906,7 @@ This controls both the `text_to_speech` tool and spoken replies in voice mode (`
 ```yaml
 display:
   tool_progress: all      # off | new | all | verbose | log — global tool-progress mode
-  tool_progress_filter: {}  # per-tool/category overrides: {terminal: off, read_file: off, skills: all, mcp: off, plugins: all}. Keys are tool names or categories (skills/mcp/plugins); values are modes (off/new/all/verbose/log). Per-platform via display.platforms.<platform>.tool_progress_filter. When global is off but filter whitelists tools, the queue stays active for those tools. Empty/malformed/unknown entries fail safe to the global mode.
+  tool_progress_filter: {}  # per-tool/category overrides: {terminal: off, read_file: off, skills: all, mcp: off, plugins: all}. Keys are exact tool names (case-insensitive, exact match wins) or categories skills/mcp/plugins; values are modes off/new/all/verbose/log. Aliases skill->skills, mcp_tools->mcp, plugin->plugins are canonicalized before global/platform merge (platform wins, duplicate alias spellings last-wins). Effective "log" goes only to the log sink, never chat progress; global "log" stays chat-silent for unoverridden tools and an all/new/verbose override shows only selected tools. Native Slack task cards use the same effective filter and hidden completions cannot resurrect a card. Live-status previews are also gated by the same filter (hidden tools show no preview); thinking and subagent failure notices are independent. Per-platform via display.platforms.<platform>.tool_progress_filter. Empty/malformed/unknown entries fail safe to global mode.
   tool_progress_command: false  # Enable /verbose slash command in messaging gateway
   focus_view: false       # CLI focus view (/focus) — reduced output, display-only
   platforms: {}           # Per-platform display overrides (see below)
@@ -2097,7 +2097,7 @@ Different platforms have different verbosity needs. Use `display.platforms` to s
 ```yaml
 display:
   tool_progress: all          # global default
-  tool_progress_filter: {}    # or e.g. {terminal: off, skills: all} — same per-tool/category filter as above, merged per platform (platform entries win)
+  tool_progress_filter: {}    # or e.g. {terminal: off, skills: all} — same per-tool/category filter as above, merged per platform (platform entries win; aliases skill->skills etc. canonicalized, last-wins)
   platforms:
     signal:
       tool_progress: 'off'    # Signal cannot currently display tool-progress bubbles
