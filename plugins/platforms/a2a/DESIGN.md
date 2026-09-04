@@ -67,7 +67,16 @@ Peers resolved from `config.yaml` → `a2a_agents`, or a direct URL.
   (returns `configId` + `createdAt`). On terminal transition the callback
   receives a v1.0 `StreamResponse` (`statusUpdate`) payload, HMAC-SHA256
   signed (`X-A2A-Signature`, secret `A2A_PUSH_SECRET` falling back to the
-  bearer token), with SSRF-guarded callback URLs.
+  bearer token), with SSRF-guarded callback URLs. Every intended
+  newly-published terminal state — `COMPLETED` (normal, forwarded,
+  late, loopback), `FAILED` (watchdog orphan, disconnect/shutdown,
+  processing failure), and `CANCELED` (`tasks/cancel` and deferred
+  cancellation) — makes exactly one best-effort `statusUpdate` callback
+  attempt when `newly_published=true` and a valid persisted callback URL
+  exists. Missing/invalid URL remains callback-free, duplicate terminal
+  replay makes no second callback, callback failure is best-effort and
+  never rolls back durable state, and no retry/replay/ACK is performed.
+  `tasks/cancel` does not abort the in-flight agent turn.
 
 ## v1.0 wire format notes
 - Task states / roles are SCREAMING_SNAKE_CASE (TASK_STATE_*, ROLE_*).

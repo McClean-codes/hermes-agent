@@ -286,6 +286,10 @@ class TaskRPCHandler:
         self._turns.reset(rec["context_id"])
         if _outcome.newly_published:
             self._resolve_task(task_id, protocol.STATE_CANCELED, "")
+            try:
+                self._send_push_notification(task_id, rec["context_id"], "", protocol.STATE_CANCELED)
+            except Exception:
+                pass
         rec = self.tasks.get(task_id, *self._scope_for_agent(agent)) or rec
         return protocol.jsonrpc_result(req_id, protocol.TaskStore.to_task(rec))
 
