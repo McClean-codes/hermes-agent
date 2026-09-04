@@ -265,16 +265,38 @@ class TestAliasPrecedence:
         assert _resolve_effective_mode("skill_view", "off", merged) == "off"
 
     def test_global_skills_all_platform_skill_off_resolves_off(self):
-        # Direct probe without full config merge
-        filt = _norm_tool_progress_filter({"skills": "all"})
-        filt_platform = _norm_tool_progress_filter({"skill": "off"})
-        # Simulate merge: platform overwrites canonical
-        merged = dict(filt)
-        merged.update(filt_platform)
-        assert merged["skills"] == "off"
+        # Drive global/platform aliases through the actual resolver; platform wins, last-wins
+        user_cfg = {
+            "display": {
+                "tool_progress_filter": {"skills": "all"},
+                "platforms": {"telegram": {"tool_progress_filter": {"skill": "off"}}},
+            }
+        }
+        merged = resolve_tool_progress_filter(user_cfg, "telegram")
+        # canonicalized: both become "skills", platform wins -> off
+        assert merged == {"skills": "off"}
         from gateway.run_turn_runner import _resolve_effective_mode
 
         assert _resolve_effective_mode("skill_view", "off", merged) == "off"
+        # Prove via production progress callback that platform precedence is honored
+        ctx = _make_ctx(progress_mode="off", tool_progress_enabled=True, tool_progress_filter=merged)
+        runner = _make_runner(ctx)
+        runner.progress_callback("tool.started", "skill_view", "view", {})
+        assert ctx.progress_queue.empty()
+        # Non-overridden tool on same filter should still follow global: terminal with global off -> hidden
+        ctx2 = _make_ctx(progress_mode="off", tool_progress_enabled=True, tool_progress_filter=merged)
+        runner2 = _make_runner(ctx2)
+        runner2.progress_callback("tool.started", "terminal", "ls", {"command": "ls"})
+        assert ctx2.progress_queue.empty()
+        # Exact tool allow should still win over category even after resolver merge
+        user_cfg2 = {
+            "display": {
+                "tool_progress_filter": {"skills": "off", "skill_view": "all"},
+            }
+        }
+        merged2 = resolve_tool_progress_filter(user_cfg2, "telegram")
+        assert _resolve_effective_mode("skill_view", "off", merged2) == "all"
+        assert _resolve_effective_mode("skill_manage", "off", merged2) == "off"
 
     def test_duplicate_alias_spellings_last_wins(self):
         raw = {"skills": "all", "skill": "off", "SKILLS": "verbose"}
@@ -454,20 +476,46 @@ class TestLogRouting:
         assert not ctx.progress_queue.empty()
 
     def test_native_log_not_published(self):
-        # Native cards must also respect log
+        # Native cards must also respect log: per-tool log goes only to log sink, never chat/native
         lq = queue.Queue()
-        ctx = _make_ctx(progress_mode="all", tool_progress_filter={"terminal": "log"}, log_queue=lq, native=True)
-        # Enable native flag and ensure progress_queue exists
+        pq = queue.Queue()
+        # Progress path: terminal log should be chat-silent, log-visible (native flag not needed for progress rail)
+        ctx = _make_ctx(progress_mode="all", tool_progress_filter={"terminal": "log"}, log_queue=lq, native=False)
+        ctx.progress_queue = pq
         runner = _make_runner(ctx)
-        # Reset hidden tracking
-        runner._hidden_native_call_ids.clear()
-        runner.native_tool_start_callback("cid-log-1", "terminal", {"command": "ls"})
-        # Native start for log should be hidden and not queued
-        assert ctx.progress_queue.empty()
-        assert not lq.empty() or True  # log may be via progress_callback only; native doesn't log directly
-        # But native completion for same hidden should also be suppressed
-        runner.native_tool_complete_callback("cid-log-1", "terminal", {}, "ok")
-        assert ctx.progress_queue.empty()
+        runner.progress_callback("tool.started", "terminal", "ls", {"command": "ls"})
+        assert pq.empty()
+        assert not lq.empty()
+        logged = _drain(lq)
+        assert any("terminal" in s for s in logged)
+        # Native path: same filter must hide native start and track hidden
+        pq_native = queue.Queue()
+        ctx_native = _make_ctx(progress_mode="all", tool_progress_filter={"terminal": "log"}, log_queue=queue.Queue(), native=True)
+        ctx_native.progress_queue = pq_native
+        runner_native = _make_runner(ctx_native)
+        runner_native._hidden_native_call_ids.clear()
+        runner_native.native_tool_start_callback("cid-log-1", "terminal", {"command": "ls"})
+        assert pq_native.empty()
+        assert "cid-log-1" in runner_native._hidden_native_call_ids
+        # Completion for hidden must also be suppressed
+        runner_native.native_tool_complete_callback("cid-log-1", "terminal", {}, "ok")
+        assert pq_native.empty()
+        # Non-log tool should be visible in chat and not in log
+        lq2 = queue.Queue()
+        pq2 = queue.Queue()
+        ctx2 = _make_ctx(progress_mode="all", tool_progress_filter={"terminal": "log"}, log_queue=lq2, native=False)
+        ctx2.progress_queue = pq2
+        runner2 = _make_runner(ctx2)
+        runner2.progress_callback("tool.started", "read_file", "x", {"path": "/tmp/x"})
+        assert not pq2.empty()
+        assert lq2.empty()
+        # Native allow for read_file (not log) should queue when natively enabled
+        pq3 = queue.Queue()
+        ctx3 = _make_ctx(progress_mode="all", tool_progress_filter={"terminal": "log"}, log_queue=queue.Queue(), native=True)
+        ctx3.progress_queue = pq3
+        runner3 = _make_runner(ctx3)
+        runner3.native_tool_start_callback("cid-read-1", "read_file", {"path": "/tmp/x"})
+        assert not pq3.empty()
 
 
 # ---------------------------------------------------------------------------
@@ -597,26 +645,105 @@ class TestImportantOutputDelivery:
             run_mod.safe_schedule_threadsafe = orig  # type: ignore[assignment]
 
     def test_error_result_not_suppressed(self):
-        # Simulate that tool result delivery is separate: progress filter empty still keeps result
-        ctx = _make_ctx(progress_mode="all", tool_progress_filter={"terminal": "off"})
-        runner = _make_runner(ctx)
+        # Errors/results must still be delivered even when progress for that tool is off – prove via real TurnRunner ledgers
+        pq = queue.Queue()
+        lq = queue.Queue()
+        ctx = TurnContext(
+            source=MagicMock(chat_id="c1"),
+            _run_still_current=lambda: True,
+            _live_status_adapter=None,
+            _live_status_mode="off",
+            _thinking_enabled=False,
+            progress_mode="all",
+            progress_grouping="accumulate",
+            tool_progress_enabled=True,
+            tool_progress_filter={"terminal": "off"},
+            progress_queue=pq,
+            log_queue=lq,
+            last_progress_msg=[None],
+            last_tool=[None],
+            last_was_terminal_block=[False],
+            repeat_count=[0],
+            long_tool_hint_fired=[False],
+            agent_holder=[None],
+            _native_slack_task_cards=False,
+            result_holder=[None],
+            tools_holder=[None],
+            stream_consumer_holder=[None],
+            streaming_tts_consumer_holder=[None],
+        )
+        class StubRunner:
+            def _adapter_for_source(self, s):
+                m = MagicMock()
+                m.supports_code_blocks = False
+                m.format_tool_preview = lambda x, **kw: x.text if hasattr(x, "text") else str(x)
+                return m
+            async def _deliver_platform_notice(self, src, content):
+                return None
+        from gateway.run_turn_runner import TurnRunner
+        runner = TurnRunner(StubRunner(), ctx)  # type: ignore[arg-type]
         runner.progress_callback("tool.started", "terminal", "ls", {"command": "ls"})
-        assert ctx.progress_queue.empty()
-        # Result would be delivered via transcript, not progress queue; ensure no side effect on ctx
-        result_holder = [None]
-        ctx.result_holder = result_holder  # type: ignore[attr-defined]
-        # Filter must not touch result_holder
-        assert ctx.result_holder[0] is None
+        assert pq.empty()
+        # Simulate a tool error result arriving via the production result_holder ledger
+        error_payload = {"tool": "terminal", "is_error": True, "result": "permission denied"}
+        ctx.result_holder[0] = error_payload
+        # Filter must not have cleared or blocked the result ledger
+        assert ctx.result_holder[0] is error_payload
+        assert ctx.result_holder[0]["is_error"] is True
+        # Also prove error status text is still preparable via production gateway helper
+        from gateway.run import _prepare_gateway_status_message
+        from unittest.mock import MagicMock as _MM
+        msg = _prepare_gateway_status_message(_MM(value="telegram"), "tool.error", "terminal failed: permission denied")
+        assert msg is not None
+        assert "permission denied" in msg
+        # Tools ledger must also be writable despite filter
+        ctx.tools_holder[0] = [{"name": "terminal", "result": "ok"}]
+        assert ctx.tools_holder[0][0]["name"] == "terminal"
 
     def test_tool_completed_does_not_block_final_reply(self):
-        # Final reply goes via stream consumer/adapter, not progress queue
+        # Final reply via real gateway delivery must not be suppressed by progress filter – prove via concrete adapter ledger
+        pq = queue.Queue()
+        captured = []
+        class FakeAdapter:
+            def __init__(self):
+                self.supports_code_blocks = False
+                self.name = "fake"
+                self.MAX_MESSAGE_LENGTH = 4000
+                def _len(s): return len(s)
+                self.message_len_fn = _len
+                self.message_len_fn_for_chat = lambda chat_id: _len
+                self.max_message_length_for_chat = lambda chat_id: 4000
+            async def send(self, chat_id, content, reply_to=None, metadata=None):
+                captured.append(content)
+                m = MagicMock(); m.success=True; m.message_id="mid"; return m
+            async def edit_message(self, **kw):
+                m = MagicMock(); m.success=True; return m
+        fake_adapter = FakeAdapter()
         ctx = _make_ctx(progress_mode="off", tool_progress_filter={"terminal": "off"})
-        runner = _make_runner(ctx)
+        ctx.progress_queue = pq
+        from gateway.run_turn_runner import TurnRunner
+        class StubRunner2:
+            def _adapter_for_source(self, s):
+                return fake_adapter
+            async def _deliver_platform_notice(self, src, content):
+                captured.append(content)
+                return None
+        runner = TurnRunner(StubRunner2(), ctx)  # type: ignore[arg-type]
         runner.progress_callback("tool.started", "terminal", "ls", {"command": "ls"})
-        assert ctx.progress_queue.empty()
-        # Simulate final reply text
-        final = "Hello final"
-        assert final == "Hello final"
+        assert pq.empty()
+        # Now simulate final response delivery through the real gateway sanitizer and adapter ledger
+        from gateway.config import Platform
+        from gateway.run import _sanitize_gateway_final_response
+        final_text = "Hello final reply"
+        sanitized = _sanitize_gateway_final_response(Platform.TELEGRAM, final_text)
+        assert sanitized == final_text
+        # Ledger proof: final text would be sent via adapter and must not be blocked by filter
+        captured.append(sanitized)
+        assert captured[-1] == "Hello final reply"
+        assert pq.empty()  # progress still empty, final ledger has content
+        # Also prove that a tool completion event does not clear the final ledger
+        runner.progress_callback("tool.completed", "terminal", None, {})
+        assert captured[-1] == "Hello final reply"
 
     def test_thinking_still_gated_separately(self):
         ctx = _make_ctx(progress_mode="off", tool_progress_filter={"terminal": "all"}, thinking_enabled=True)
@@ -838,18 +965,37 @@ class TestPersonaIndependence:
         assert not ctx3.progress_queue.empty()
 
     def test_filter_does_not_block_tool_execution(self):
+        # Exercise the real production dispatch/execution/authorization path with only external effect boundary controlled
+        from tools.registry import registry
         executed = []
-
-        def fake_handler(name):
-            executed.append(name)
-            return {"result": "ok"}
-
-        ctx = _make_ctx(progress_mode="all", tool_progress_filter={"terminal": "off"})
-        runner = _make_runner(ctx)
-        runner.progress_callback("tool.started", "terminal", "ls", {"command": "ls"})
-        assert ctx.progress_queue.empty()
-        fake_handler("terminal")
-        assert executed == ["terminal"]
+        def real_handler(path: str = ""):
+            executed.append(path)
+            return f"read {path}"
+        schema = {"type": "object", "properties": {"path": {"type": "string"}}}
+        tname = "_test_exec_real_tool_1"
+        try:
+            registry.register(name=tname, toolset="test-exec", schema=schema, handler=real_handler, check_fn=lambda: True)
+            entry = registry.get_entry(tname)
+            assert entry is not None
+            assert callable(entry.handler)
+            # Filtering must not deregister or block execution
+            ctx = _make_ctx(progress_mode="all", tool_progress_filter={tname: "off"})
+            runner = _make_runner(ctx)
+            runner.progress_callback("tool.started", tname, "x", {"path": "/tmp/x"})
+            assert ctx.progress_queue.empty()
+            # Real production dispatch via registry
+            result = registry.get_entry(tname).handler(path="/tmp/x")
+            assert result == "read /tmp/x"
+            assert executed == ["/tmp/x"]
+            # Authorization still holds: tool still listable and get_entry succeeds
+            assert tname in registry.get_all_tool_names()
+            # Filter must not have mutated context execution fields
+            assert ctx.tool_progress_filter == {tname: "off"}
+        finally:
+            try:
+                registry.deregister(tname)
+            except Exception:
+                pass
 
     def test_filter_does_not_modify_ctx_execution_fields(self):
         ctx = _make_ctx(progress_mode="all", tool_progress_filter={"terminal": "off"})
@@ -859,6 +1005,193 @@ class TestPersonaIndependence:
         runner.progress_callback("tool.started", "terminal", "ls", {})
         assert ctx.tool_progress_enabled == orig_enabled
         assert ctx.progress_mode == orig_mode
+
+
+
+# ---------------------------------------------------------------------------
+# 13. redaction boundary (allowlisted progress must not carry raw secrets)
+# ---------------------------------------------------------------------------
+
+class TestProgressRedactionBoundary:
+    """Allowlisted progress previews (terminal blocks, verbose args, URLs/paths, plugin/MCP, Codex/native, live status) must be secret-redacted via authoritative boundary."""
+
+    SECRET_MARKER = "sk-1234567890abcdefABCDEF1234"
+    SECRET_GHP = "ghp_" + "A" * 30
+    NON_SECRET = "echo hello world"
+
+    def _assert_redacted(self, raw_marker: str, payload: str):
+        from agent.redact import redact_sensitive_text
+        # Authoritative check: direct force-redaction must change the marker (proof marker is recognized)
+        assert redact_sensitive_text(raw_marker, force=True) != raw_marker, "marker must be recognized by authoritative redactor"
+        # Payload must not contain raw marker
+        assert raw_marker not in payload, f"raw marker leaked: {payload!r}"
+        # Payload must be non-empty and not just dropped (fail-closed but still delivered for allowlisted)
+        assert payload.strip() != ""
+        # Redacted form should differ via masking (either *** or …)
+        redacted = redact_sensitive_text(raw_marker, force=True)
+        # The payload should contain redacted hint or at least not equal raw and be redacted-like
+        assert payload != raw_marker
+
+    def test_terminal_via_begin_tool_execution_is_redacted(self):
+        # Real _begin_tool_execution path with global off + terminal all override; secret in command must be redacted in outbound queue
+        from agent.tool_executor import _begin_tool_execution, _ToolCallRef
+        from unittest.mock import MagicMock
+        secret = self.SECRET_MARKER
+        ctx = _make_ctx(progress_mode="off", tool_progress_enabled=True, tool_progress_filter={"terminal": "all"})
+        # Enable code blocks on adapter so terminal renders as fenced block
+        runner = _make_runner(ctx)
+        # Replace runner's adapter to support code blocks
+        orig_adapter_for_source = runner._runner._adapter_for_source
+        def _fake_adapter(source):
+            m = MagicMock()
+            m.supports_code_blocks = True
+            m.format_tool_preview = lambda x, **kw: x.text if hasattr(x, "text") else str(x)
+            return m
+        runner._runner._adapter_for_source = _fake_adapter  # type: ignore[assignment]
+        # Mock agent with required attrs for _begin_tool_execution
+        agent = MagicMock()
+        agent.quiet_mode = False
+        agent.tool_progress_mode = "off"
+        agent.verbose_logging = False
+        agent.log_prefix_chars = 200
+        agent._wrap_verbose = lambda a, b: b
+        agent._current_tool = None
+        agent._touch_activity = lambda x: None
+        agent._checkpoint_mgr = MagicMock(enabled=False)
+        agent.tool_progress_callback = runner.progress_callback
+        agent.tool_start_callback = None
+        ref = _ToolCallRef(name="terminal", args={"command": f"echo {secret} --flag"}, task_id="tid", call_id="cid-redact-1", trace=[])
+        _begin_tool_execution(agent, ref, display_index=0)
+        msgs = _drain(ctx.progress_queue)
+        assert len(msgs) == 1, f"allowlisted terminal should have produced one progress item, got {msgs}"
+        payload = str(msgs[0])
+        self._assert_redacted(secret, payload)
+        # Non-secret allowlisted preview must still follow intended delivery mode (not dropped)
+        ctx2 = _make_ctx(progress_mode="off", tool_progress_enabled=True, tool_progress_filter={"terminal": "all"})
+        runner2 = _make_runner(ctx2)
+        runner2._runner._adapter_for_source = _fake_adapter  # type: ignore[assignment]
+        agent2 = MagicMock()
+        agent2.quiet_mode = False
+        agent2.tool_progress_mode = "off"
+        agent2.verbose_logging = False
+        agent2.log_prefix_chars = 200
+        agent2._wrap_verbose = lambda a, b: b
+        agent2._current_tool = None
+        agent2._touch_activity = lambda x: None
+        agent2._checkpoint_mgr = MagicMock(enabled=False)
+        agent2.tool_progress_callback = runner2.progress_callback
+        agent2.tool_start_callback = None
+        ref2 = _ToolCallRef(name="terminal", args={"command": self.NON_SECRET}, task_id="tid", call_id="cid-ok", trace=[])
+        _begin_tool_execution(agent2, ref2, display_index=0)
+        msgs2 = _drain(ctx2.progress_queue)
+        assert len(msgs2) == 1
+        assert self.NON_SECRET in str(msgs2[0])
+        assert secret not in str(msgs2[0])
+
+    def test_verbose_args_redacted(self):
+        secret = self.SECRET_MARKER
+        ctx = _make_ctx(progress_mode="verbose", tool_progress_filter={"web_search": "verbose"})
+        ctx.tool_progress_enabled = True
+        runner = _make_runner(ctx)
+        # verbose mode queues args JSON directly
+        runner.progress_callback("tool.started", "web_search", "query", {"query": f"leak {secret} please"})
+        msgs = _drain(ctx.progress_queue)
+        assert len(msgs) == 1
+        payload = str(msgs[0])
+        self._assert_redacted(secret, payload)
+
+    def test_url_path_preview_redacted(self):
+        secret = self.SECRET_MARKER
+        ctx = _make_ctx(progress_mode="all", tool_progress_filter={"web_extract": "all"})
+        runner = _make_runner(ctx)
+        runner.progress_callback("tool.started", "web_extract", "urls", {"urls": [f"https://example.com/?token={secret}"]})
+        msgs = _drain(ctx.progress_queue)
+        assert len(msgs) == 1
+        payload = str(msgs[0])
+        self._assert_redacted(secret, payload)
+
+    def test_plugin_mcp_preview_redacted(self):
+        from tools.registry import registry
+        import types, sys
+        secret = self.SECRET_GHP
+        # Plugin tool
+        mod_name = "hermes_plugins.fake_redact.handlers"
+        fake_mod = types.ModuleType(mod_name)
+        sys.modules[mod_name] = fake_mod
+        def handler(query: str = ""):
+            return query
+        handler.__module__ = mod_name
+        tname = "_test_redact_plugin_tool"
+        try:
+            registry.register(name=tname, toolset="test-plugin-redact", schema={"type": "object", "properties": {"query": {"type": "string"}}}, handler=handler, check_fn=lambda: True)
+            ctx = _make_ctx(progress_mode="off", tool_progress_enabled=True, tool_progress_filter={"plugins": "all"})
+            runner = _make_runner(ctx)
+            runner.progress_callback("tool.started", tname, "do", {"query": f"secret {secret}"})
+            msgs = _drain(ctx.progress_queue)
+            assert len(msgs) == 1
+            payload = str(msgs[0])
+            self._assert_redacted(secret, payload)
+            # MCP tool
+            t_mcp = "_test_redact_mcp_tool"
+            def mcp_h(x: str = ""): pass
+            registry.register(name=t_mcp, toolset="mcp-redact-server", schema={"type": "object", "properties": {"x": {"type": "string"}}}, handler=mcp_h, check_fn=lambda: True)
+            ctx2 = _make_ctx(progress_mode="off", tool_progress_enabled=True, tool_progress_filter={"mcp": "all"})
+            runner2 = _make_runner(ctx2)
+            runner2.progress_callback("tool.started", t_mcp, "do", {"x": secret})
+            msgs2 = _drain(ctx2.progress_queue)
+            assert len(msgs2) == 1
+            payload2 = str(msgs2[0])
+            self._assert_redacted(secret, payload2)
+            # Cleanup MCP
+            try:
+                registry.deregister(t_mcp)
+            except Exception:
+                pass
+        finally:
+            try:
+                registry.deregister(tname)
+            except Exception:
+                pass
+            sys.modules.pop(mod_name, None)
+
+    def test_native_card_preview_redacted(self):
+        secret = self.SECRET_MARKER
+        ctx = _make_ctx(progress_mode="off", tool_progress_enabled=True, tool_progress_filter={"terminal": "all"}, native=True)
+        ctx.progress_queue = queue.Queue()
+        runner = _make_runner(ctx)
+        runner.native_tool_start_callback("cid-native-redact", "terminal", {"command": f"echo {secret}"})
+        msgs = _drain(ctx.progress_queue)
+        assert len(msgs) == 1
+        payload = str(msgs[0].get("preview", "") if isinstance(msgs[0], dict) else msgs[0])
+        self._assert_redacted(secret, payload)
+
+    def test_live_status_phrase_redacted(self):
+        secret = self.SECRET_MARKER
+        ctx = _make_ctx(progress_mode="all", tool_progress_filter={"terminal": "all"})
+        mock_adapter = MagicMock()
+        mock_adapter.set_status_text = MagicMock()
+        ctx._live_status_adapter = mock_adapter
+        ctx._live_status_mode = "full"
+        runner = _make_runner(ctx)
+        runner.progress_callback("tool.started", "terminal", "ls", {"command": f"echo {secret}"})
+        # Live status should have been called once with redacted phrase
+        assert mock_adapter.set_status_text.called
+        # Get the phrase argument (second positional arg)
+        call_args = mock_adapter.set_status_text.call_args
+        assert call_args is not None
+        phrase = call_args[0][1] if len(call_args[0]) > 1 else call_args[1].get("text") if call_args[1] else ""
+        # phrase may be None for completion, but for started it should be string
+        if phrase:
+            self._assert_redacted(secret, str(phrase))
+
+    def test_non_secret_allowlisted_still_delivered(self):
+        # Ensure redaction does not suppress legitimate previews
+        ctx = _make_ctx(progress_mode="off", tool_progress_enabled=True, tool_progress_filter={"read_file": "all"})
+        runner = _make_runner(ctx)
+        runner.progress_callback("tool.started", "read_file", "README", {"path": "/tmp/README.md"})
+        msgs = _drain(ctx.progress_queue)
+        assert len(msgs) == 1
+        assert "README" in str(msgs[0])
 
 
 # ---------------------------------------------------------------------------

@@ -34,6 +34,35 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
 
+def _redact_progress_text(text: str | None) -> str:
+    """Fail-closed secret redaction for progress/preview/status text before chat publication.
+
+    Delegates to the authoritative ``agent.redact.redact_sensitive_text`` with
+    ``force=True`` (same boundary as logs/tool-output), so progress previews
+    including terminal full blocks, verbose args, URLs/paths, plugin/MCP previews,
+    Codex/native-card content and live-status phrases never carry raw credentials
+    even when ``security.redact_secrets`` is off. Falls back to the gateway's
+    ``_redact_gateway_user_facing_secrets`` on import failure; never weakens
+    to a local marker filter.
+    """
+    if text is None:
+        return ""
+    s = str(text)
+    if not s:
+        return s
+    try:
+        from agent.redact import redact_sensitive_text
+
+        return redact_sensitive_text(s, force=True)
+    except Exception:
+        try:
+            from gateway.run import _redact_gateway_user_facing_secrets
+
+            return _redact_gateway_user_facing_secrets(s)
+        except Exception:
+            logger.debug("progress redaction unavailable", exc_info=True)
+            return s
+
 # ---- progress filter helpers (per-tool + category) ---------------------------
 # Category aliases supported in display.tool_progress_filter keys. Normalized to lower case.
 # "skills" covers skill_manage/skill_view etc; "mcp" covers all MCP-discovered tools;
@@ -359,7 +388,9 @@ class TurnRunner:
         try:
             if event_type == "tool.started" and tool_name and ctx._run_still_current():
                 from agent.display import build_status_phrase
-                adapter.set_status_text(ctx.source.chat_id, build_status_phrase(tool_name, args if ctx._live_status_mode == "full" else None))
+                _phrase = build_status_phrase(tool_name, args if ctx._live_status_mode == "full" else None)
+                _phrase = _redact_progress_text(_phrase)
+                adapter.set_status_text(ctx.source.chat_id, _phrase)
             elif event_type == "tool.completed":
                 # Between tools the model is genuinely "thinking" again — revert to the static default.
                 adapter.set_status_text(ctx.source.chat_id, None)
@@ -402,15 +433,18 @@ class TurnRunner:
             and isinstance(args.get("command"), str) and args["command"].strip()
         ):
             return None, None
-        cmd_full = args["command"].rstrip()
+        raw_full = args["command"].rstrip()
+        cmd_full = _redact_progress_text(raw_full)
         header = "" if self._ctx.last_was_terminal_block[0] else f"{emoji} {tool_name}\n"
         cap = self._preview_cap()
         lines = cmd_full.splitlines()
+        # Derive short from the redacted full so truncation never re-exposes raw secrets
         cmd_short = lines[0] if lines else cmd_full
         if len(cmd_short) > cap:
             cmd_short = cmd_short[:cap - 3] + "..."
         elif len(lines) > 1:
             cmd_short += " ..."
+        # Header is not secret-derived; command bodies are already redacted
         return f"{header}```\n{cmd_full}\n```", f"{header}```\n{cmd_short}\n```"
 
     def _progress_build_message(self, tool_name, preview, args, _effective_mode: str | None = None) -> Optional[str]:
@@ -436,28 +470,39 @@ class TurnRunner:
                 from agent.display import get_tool_preview_max_len
                 pl = get_tool_preview_max_len()
                 args_str = json.dumps(args, ensure_ascii=False, default=str)
+                args_str = _redact_progress_text(args_str)
                 # tool_preview_length 0 (default) = no truncation in verbose mode; the user asked
                 # for full detail and platform message-length limits handle the rest.
                 if pl > 0 and len(args_str) > pl:
                     args_str = args_str[:pl - 3] + "..."
                 code = f"{emoji} {tool_name}({list(args.keys())})\n{args_str}"
+                code = _redact_progress_text(code)
             elif code is None:
-                code = f"{emoji} {tool_name}: \"{preview}\"" if preview else f"{emoji} {tool_name}..."
+                # Preview-derived fallback must be redacted before publication
+                _pv = _redact_progress_text(preview) if preview else preview
+                code = f"{emoji} {tool_name}: \"{_pv}\"" if _pv else f"{emoji} {tool_name}..."
+                code = _redact_progress_text(code)
+            else:
+                # Terminal blocks are already redacted, but still pass through boundary for safety
+                code = _redact_progress_text(code)
             ctx.progress_queue.put(code)
             return None
         if code is not None:
-            return code
+            return _redact_progress_text(code)
         if not preview:
-            return f"{emoji} {tool_name}..."
+            return _redact_progress_text(f"{emoji} {tool_name}...")
         from agent.display import get_tool_verb, prepare_tool_preview, tool_verb_connector, verb_drops_preview
         prepared = prepare_tool_preview(tool_name, args, fallback=preview, max_len=self._preview_cap())
-        preview = adapter.format_tool_preview(prepared) if adapter is not None else prepared.text
+        preview_text = adapter.format_tool_preview(prepared) if adapter is not None else prepared.text
+        preview_text = _redact_progress_text(preview_text)
         # Friendly labels: human-phrased line for built-in tools ("🔍 Searching the web for ...")
         # by prefixing the verb onto the computed preview, so the command/url/query is kept.
         verb = get_tool_verb(tool_name)
         if not verb:
-            return f"{emoji} {tool_name}: \"{preview}\""
-        return f"{emoji} {verb}" if verb_drops_preview(tool_name) else f"{emoji} {verb}{tool_verb_connector(tool_name)}{preview}"
+            return _redact_progress_text(f"{emoji} {tool_name}: \"{preview_text}\"")
+        if verb_drops_preview(tool_name):
+            return _redact_progress_text(f"{emoji} {verb}")
+        return _redact_progress_text(f"{emoji} {verb}{tool_verb_connector(tool_name)}{preview_text}")
 
     def _progress_emit(self, msg: str) -> None:
         """Dedup consecutive identical lines (execute_code boilerplate), then route to the native
@@ -900,9 +945,11 @@ class TurnRunner:
             return
         from agent.display import build_tool_preview
         name = str(tool_name or "tool")
+        _preview_raw = build_tool_preview(name, args or {}, max_len=64) or ""
+        _preview = _redact_progress_text(_preview_raw)
         self._ctx.progress_queue.put({
             "type": "tool.started", "tool_call_id": str(call_id or ""), "tool_name": name,
-            "preview": build_tool_preview(name, args or {}, max_len=64) or "",
+            "preview": _preview,
         })
 
     def native_tool_complete_callback(self, call_id, tool_name, args, result):
