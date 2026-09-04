@@ -158,6 +158,43 @@ def _a2a_managed_loop(adapter,monkeypatch,*,timeout=5):
    try:raise BaseExceptionGroup("managed-loop body+cleanup",[body_exc,cleanup_exc])
    except NameError:raise AssertionError(f"body {body_exc!r} plus cleanup {cleanup_msg}") from body_exc
 
+def _manual_loop_drain(loop, timeout=2):
+    import asyncio as _amd
+    async def _drain():
+        import asyncio as _a2
+        try:
+            cur=_a2.current_task()
+        except:
+            cur=None
+        try:
+            tasks=[t for t in _a2.all_tasks(loop) if not t.done() and t is not cur]
+        except:
+            tasks=[]
+        for t in tasks:
+            try:
+                t.cancel()
+            except:
+                pass
+        if tasks:
+            try:
+                await _a2.gather(*tasks, return_exceptions=True)
+            except Exception as e:
+                raise AssertionError(f"manual drain gather {e}") from e
+        try:
+            await _a2.sleep(0)
+        except:
+            pass
+        try:
+            pend=[t for t in _a2.all_tasks(loop) if not t.done() and t is not cur]
+        except:
+            pend=[]
+        assert not pend, f"manual drain survivors {pend}"
+    try:
+        fut=_amd.run_coroutine_threadsafe(_drain(), loop)
+        fut.result(timeout=timeout)
+    except Exception as e:
+        raise AssertionError(f"manual drain failed {e}") from e
+
 # ---------------------------------------------------------------------------
 # 1. Legal Task schema
 # ---------------------------------------------------------------------------
@@ -2341,7 +2378,7 @@ def test_loopback_fire_and_forget_finalize_failure_is_clean(monkeypatch, tmp_pat
     # Watcher not resolved
     fut = adapter.tasks.watch(recs[0]["task_id"])
     assert fut is not None and not fut.done()
-    loop.call_soon_threadsafe(loop.stop); th.join(timeout=2); loop.close(); adapter._unregister_adapter()
+    _manual_loop_drain(loop); loop.call_soon_threadsafe(loop.stop); th.join(timeout=2); loop.close(); adapter._unregister_adapter()
 
 
 def test_loopback_terminal_rejection_is_routing_drop(monkeypatch, tmp_path):
@@ -2370,7 +2407,7 @@ def test_loopback_terminal_rejection_is_routing_drop(monkeypatch, tmp_path):
     assert not out.success and out.category=="routing"
     assert len([a for a in audit_calls if a[0]=="push_dropped"])==1
     assert [c for c in persist_calls if c[1]=="agent"]==[]
-    loop.call_soon_threadsafe(loop.stop); th.join(timeout=2); loop.close(); adapter._unregister_adapter()
+    _manual_loop_drain(loop); loop.call_soon_threadsafe(loop.stop); th.join(timeout=2); loop.close(); adapter._unregister_adapter()
 
 
 def test_loopback_want_reply_latches_success_before_best_effort_side_effects(monkeypatch, tmp_path):
@@ -3005,4 +3042,4 @@ def test_audit_write_failure_never_changes_latched_outcome_or_reaudits(monkeypat
         # Inbound may have been written, push not
         # We don't strictly check content, just that file exists and push not persisted as success
         pass
-    loop.call_soon_threadsafe(loop.stop); th.join(timeout=2); loop.close();adapter._unregister_adapter(); adapter2._unregister_adapter()
+    _manual_loop_drain(loop); loop.call_soon_threadsafe(loop.stop); th.join(timeout=2); loop.close();adapter._unregister_adapter(); adapter2._unregister_adapter()
