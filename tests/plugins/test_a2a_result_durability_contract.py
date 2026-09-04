@@ -482,6 +482,7 @@ def test_working_publish_precedes_local_and_routed_dispatch(monkeypatch, tmp_pat
         assert adapter.tasks.get(tid_pre) is None
         audit_calls.clear()
         push_calls.clear()
+        make_push_tracker(adapter)
         set_push_calls = assert_no_set_push(adapter)
         # prevent real dispatch side effects but allow publish to succeed
         adapter._agents = {"": {"local": True}}
@@ -576,6 +577,7 @@ def test_working_publish_precedes_local_and_routed_dispatch(monkeypatch, tmp_pat
         monkeypatch.setattr("plugins.platforms.a2a.adapter._task_ledger_path", lambda p=ledger: p)
         audit_calls.clear()
         push_calls.clear()
+        make_push_tracker(adapter)
         set_push_calls = assert_no_set_push(adapter)
         adapter._agents = {"": {"local": True}}
         adapter._loop = mock.Mock()
@@ -672,7 +674,7 @@ def test_working_publish_precedes_local_and_routed_dispatch(monkeypatch, tmp_pat
         dispatched.append("forward")
         return "reply", protocol.STATE_COMPLETED
     monkeypatch.setattr(adapter, "_forward_to_profile", fake_forward)
-    adapter._agents = {"dev": {"profile": "dev", "tenant": "dev"}}
+    adapter._agents = {"dev": {"profile": "dev", "tenant": "dev", "local": False}}
     # pick agent dev
     agent = adapter._agents["dev"]
     order = []
@@ -692,7 +694,9 @@ def test_working_publish_precedes_local_and_routed_dispatch(monkeypatch, tmp_pat
         assert False
     # For routed, terminal should be returned, pending None
     assert terminal is not None
-    assert dispatched == ["forward"] or order  # at least forward was called after publish
+    assert dispatched == ["forward"]
+    assert order == [protocol.STATE_WORKING, protocol.STATE_COMPLETED]
+    assert terminal["status"]["state"] == protocol.STATE_COMPLETED
     # Check ledger for routed case still has push fields
     data = json.loads(ledger.read_text())
     rec = None
@@ -1131,6 +1135,20 @@ def test_watchdog_only_exposes_successfully_published_failures(monkeypatch, tmp_
             assert data["t-w1"]["state"] in (protocol.STATE_FAILED, protocol.STATE_WORKING)
     except Exception:
         pass
+    # F1 cross-store ledger preservation: unrelated task from another TaskStore survives watchdog orphan handling (no memory-snapshot persist overwrite)
+    ledger_cross = tmp_path / "ledger_cross_f1.json"
+    monkeypatch.setattr("plugins.platforms.a2a.a2a_persistence._task_ledger_path", lambda: ledger_cross)
+    monkeypatch.setattr("plugins.platforms.a2a.adapter._task_ledger_path", lambda: ledger_cross)
+    store_a = TaskStore()
+    store_b = TaskStore()
+    rec_a = {"task_id": "task-a", "context_id": "ctx-a", "peer": "p1", "agent_slug": "", "tenant": "", "state": protocol.STATE_WORKING, "reply": "", "created_at": time.time(), "created_iso": protocol.now_iso(), "push_url": "", "push_config_id": ""}
+    rec_b = {"task_id": "task-b", "context_id": "ctx-b", "peer": "p1", "agent_slug": "", "tenant": "", "state": protocol.STATE_WORKING, "reply": "", "created_at": time.time(), "created_iso": protocol.now_iso(), "push_url": "", "push_config_id": ""}
+    store_a.publish_durable(ledger_cross, "task-a", rec_a)
+    store_b.publish_durable(ledger_cross, "task-b", rec_b)
+    assert set(json.loads(ledger_cross.read_text()).keys()) == {"task-a", "task-b"}
+    store_a._tasks["task-a"]["created_at"] = time.time() - 400
+    failed_cross = store_a.fail_orphans(timeout_seconds=300)
+    assert "task-b" in json.loads(ledger_cross.read_text())
 
 # ---------------------------------------------------------------------------
 # 18. Shutdown durability

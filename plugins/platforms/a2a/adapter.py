@@ -668,7 +668,10 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
                             pass
                         if not order:
                             self._pending_order.pop(ctx, None)
-                # Metrics/audit for successful shutdown terminalization could be added here if desired
+                try:
+                    self._send_push_notification(tid, ctx, "[agent shutting down]", protocol.STATE_FAILED)
+                except Exception:
+                    pass
             else:
                 logger.error("A2A: failed to durably publish FAILED on disconnect for task %s: %s — leaving WORKING", tid, outcome.error)
                 # Leave pending and task at prior WORKING for restart recovery; do not resolve Future with terminal
@@ -698,6 +701,11 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
                     outcome = self.tasks.publish_durable(_task_ledger_path(), tid, cand)
                     if not outcome.published:
                         logger.error("A2A: disconnect orphan durable publish failed for %s: %s", tid, outcome.error)
+                    elif outcome.newly_published:
+                        try:
+                            self._send_push_notification(tid, cand.get("context_id", ""), "[agent shutting down]", protocol.STATE_FAILED)
+                        except Exception:
+                            pass
                 except Exception as exc:
                     logger.error("A2A: disconnect orphan publish exception for %s: %s", tid, exc, exc_info=True)
         except Exception:
@@ -710,10 +718,15 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
             try:
                 failed = self.tasks.fail_orphans(_ORPHAN_TIMEOUT)
                 if failed:
-                    _try_persist_task_ledger(self.tasks, _task_ledger_path(), f"watchdog {failed}")
                     for tid in failed:
                         logger.warning("A2A: orphaned task %s marked failed (timeout %ds)", tid, _ORPHAN_TIMEOUT)
                         protocol.metrics.tasks_failed += 1
+                        try:
+                            rec = self.tasks.get(tid)
+                            if rec is not None:
+                                self._send_push_notification(tid, rec.get("context_id", ""), rec.get("reply", ""), rec.get("state", ""))
+                        except Exception:
+                            pass
             except Exception:
                 logger.debug("A2A: watchdog error", exc_info=True)
 
