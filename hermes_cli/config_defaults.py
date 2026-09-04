@@ -743,10 +743,15 @@ DEFAULT_CONFIG = {
 
     # Agent identity emoji shown on message acknowledgment and completion.
     # Platforms that support reactions display this emoji while processing.
-    # Can be overridden per-platform under discord.persona_emoji, etc.
+    # Per-platform override: ``platforms.discord.persona_emoji`` (or legacy
+    # ``discord.persona_emoji``) takes precedence over this global default;
+    # falls back to ``\"👀\"`` when both are absent/empty.
     "persona_emoji": "",
     # Swap the active reaction emoji to reflect the current tool call.
-    # Can be overridden per-platform under discord.dynamic_reactions, etc.
+    # Per-platform override: ``platforms.discord.dynamic_reactions`` (or
+    # ``discord.dynamic_reactions``) takes precedence over the global default.
+    # When absent, the global value applies; ``false`` (including the quoted
+    # string ``"false"``) disables swapping and keeps the persona only.
     "dynamic_reactions": True,
 
     "display": {
@@ -1411,6 +1416,17 @@ DEFAULT_CONFIG = {
             "max_dispatches": 10,  # cap on recovered messages dispatched per reconnect
         },
         "reactions": True,  # add 👀/✅/❌ reactions to messages during processing
+        # Persona reaction emoji; overrides the global ``persona_emoji`` when set.
+        # Resolved via ``platforms.discord.persona_emoji`` (or ``discord.persona_emoji``)
+        # with precedence over the global default; empty/absent falls back to global or ``👀``.
+        "persona_emoji": "",
+        # Swap reaction per tool call; overrides global ``dynamic_reactions``.
+        # ``false`` (including string ``"false"``) keeps persona only; cooldown still applies as hysteresis.
+        "dynamic_reactions": True,
+        # Heuristic cooldown seconds between reaction swaps (default 1.0s, 4× the documented
+        # Discord 0.25s bucket). This is a local hysteresis to reduce 429s/reflow jitter,
+        # not a provider rate-limit guarantee.
+        "reaction_cooldown": 1.0,
         # Gateway transport health probe: inspects the WebSocket's ready/open/heartbeat state (never
         # REST) as proof events still arrive. Any value 0 disables it.
         "websocket_liveness_interval_seconds": 15,

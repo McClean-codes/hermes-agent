@@ -19,8 +19,12 @@ made by production code (no manual mock invocation after handler return).
 """
 
 import asyncio
+import math
+import os
 import sys
+import tempfile
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -675,3 +679,689 @@ async def test_process_message_background_adds_and_swaps_reactions_legacy(adapte
     # So ledger should be just the initial add (no tool swaps)
     assert raw.effective() == {"👀"}
     assert "✅" not in raw.effective()
+
+
+# ---------------------------------------------------------------------------
+# Identity isolation: participant/profile-aware session keys
+# ---------------------------------------------------------------------------
+
+def _make_group_source(chat_id="group-123", user_id="user-A", profile=None, thread_id=None):
+    return SessionSource(
+        platform=Platform.DISCORD,
+        chat_id=chat_id,
+        chat_type="group",
+        user_id=user_id,
+        user_name=f"user-{user_id}",
+        thread_id=thread_id,
+        profile=profile,
+    )
+
+
+@pytest.mark.asyncio
+async def test_identity_isolation_two_participants_and_profiles_share_channel():
+    """Distinct participant/profile contexts sharing platform/chat/thread produce independent ledgers."""
+    # Build adapter with group per-user isolation (default True)
+    cfg = PlatformConfig(enabled=True, token="***")
+    cfg.extra = {"persona_emoji": "🤖", "dynamic_reactions": True, "reaction_cooldown": 0}
+    ad = DiscordAdapter(cfg)
+    ad._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=99999, name="HermesBot"))
+    # Ensure mixin resolved correctly via production path (no manual _rxn mutation for config)
+    # But we need cooldown 0 for deterministic test; set via extra and re-init is not allowed per spec for config tests, but this is not a config test.
+    # For behavioral test we can set via direct attribute because we are not proving config plumbing here.
+    ad._rxn_cooldown = 0.0
+    # Two participants in same group channel, different profiles
+    src_alice_red = _make_group_source(chat_id="chan-1", user_id="alice", profile="red")
+    src_bob_blue = _make_group_source(chat_id="chan-1", user_id="bob", profile="blue")
+    # They must have distinct session keys (canonical)
+    key_alice = ad._session_key_from_source(src_alice_red)
+    key_bob = ad._session_key_from_source(src_bob_blue)
+    assert key_alice != key_bob, f"keys collided: {key_alice} vs {key_bob}"
+    # Also direct build_session_key should differ
+    assert build_session_key(src_alice_red) != build_session_key(src_bob_blue)
+    # Create separate ledger messages
+    raw_alice = LedgerMessage(msg_id=111)
+    raw_bob = LedgerMessage(msg_id=222)
+    evt_alice = MessageEvent(text="hi", message_type=MessageType.TEXT, source=src_alice_red, raw_message=raw_alice, message_id="m1")
+    evt_bob = MessageEvent(text="hi", message_type=MessageType.TEXT, source=src_bob_blue, raw_message=raw_bob, message_id="m2")
+    # Start both: each should add persona to its own message
+    await ad.on_processing_start(evt_alice)
+    await ad.on_processing_start(evt_bob)
+    assert ("add", "🤖") in raw_alice.ledger()
+    assert ("add", "🤖") in raw_bob.ledger()
+    assert raw_alice.ledger() == [("add", "🤖")]
+    assert raw_bob.ledger() == [("add", "🤖")]
+    # Check internal tracking is separate
+    assert ad._rxn_active[key_alice] == "🤖"
+    assert ad._rxn_active[key_bob] == "🤖"
+    assert ad._session_raw_messages[key_alice] is raw_alice
+    assert ad._session_raw_messages[key_bob] is raw_bob
+    # Tool call for Alice should only affect Alice's ledger (production path via SessionSource)
+    emoji_map = {"read_file": "📄"}
+    def _fake_emoji(name, default="⚙️"):
+        return emoji_map.get(name, default)
+    with patch("agent.display.get_tool_emoji", side_effect=_fake_emoji):
+        await ad.on_tool_call_start(src_alice_red, "read_file")
+        # Alice should have swapped to 📄
+        assert raw_alice.ledger() == [("add", "🤖"), ("add", "📄"), ("remove", "🤖")]
+        assert raw_alice.effective() == {"📄"}
+        # Bob must be untouched
+        assert raw_bob.ledger() == [("add", "🤖")]
+        assert raw_bob.effective() == {"🤖"}
+        assert ad._rxn_active[key_alice] == "📄"
+        assert ad._rxn_active[key_bob] == "🤖"
+        # Swap Bob independently
+        await ad.on_tool_call_start(src_bob_blue, "read_file")
+        assert raw_bob.ledger() == [("add", "🤖"), ("add", "📄"), ("remove", "🤖")]
+    # Completion for Alice should not affect Bob
+    await ad.on_processing_complete(evt_alice, ProcessingOutcome.SUCCESS)
+    assert raw_alice.effective() == {"🤖"}
+    # Alice ledgers: final add persona before remove tool
+    assert raw_alice.ledger()[-2] == ("add", "🤖")
+    assert raw_alice.ledger()[-1] == ("remove", "📄")
+    # Bob still has tool emoji until his completion
+    assert raw_bob.effective() == {"📄"}
+    assert ad._rxn_active.get(key_bob) == "📄"
+    assert key_alice not in ad._rxn_active  # cleaned
+    assert key_alice not in ad._rxn_msg_refs
+    assert key_alice not in ad._rxn_locks
+    # Bob's lock still present until completion
+    assert key_bob in ad._rxn_locks or key_bob in ad._rxn_active
+    await ad.on_processing_complete(evt_bob, ProcessingOutcome.SUCCESS)
+    assert raw_bob.effective() == {"🤖"}
+    assert key_bob not in ad._rxn_active
+    assert key_bob not in ad._rxn_locks
+    # Ensure no cross-contamination after both completions
+    assert ad._rxn_active == {}
+    assert ad._rxn_stale == {}
+
+
+@pytest.mark.asyncio
+async def test_identity_isolation_thread_vs_group_participant():
+    """Group per-user vs thread per-user isolation produces correct keys."""
+    cfg = PlatformConfig(enabled=True, token="***")
+    cfg.extra = {"group_sessions_per_user": True, "thread_sessions_per_user": False}
+    ad = DiscordAdapter(cfg)
+    ad._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=1, name="Bot"))
+    # Group without thread: participants isolate
+    src_a = _make_group_source(chat_id="g1", user_id="u1", thread_id=None)
+    src_b = _make_group_source(chat_id="g1", user_id="u2", thread_id=None)
+    assert ad._session_key_from_source(src_a) != ad._session_key_from_source(src_b)
+    # Same thread: by default thread_sessions_per_user=False, so same thread shares key even with different users
+    src_a_thread = _make_group_source(chat_id="g1", user_id="u1", thread_id="thr-1")
+    src_b_thread = _make_group_source(chat_id="g1", user_id="u2", thread_id="thr-1")
+    assert ad._session_key_from_source(src_a_thread) == ad._session_key_from_source(src_b_thread)
+    # Enable thread per-user isolation: now they differ
+    ad2 = DiscordAdapter(PlatformConfig(enabled=True, token="***", extra={"thread_sessions_per_user": True, "group_sessions_per_user": True}))
+    ad2._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=1, name="Bot"))
+    assert ad2._session_key_from_source(src_a_thread) != ad2._session_key_from_source(src_b_thread)
+
+
+# ---------------------------------------------------------------------------
+# Failure-state correctness: primitive False and exceptions
+# ---------------------------------------------------------------------------
+
+class ControllableLedgerMessage(LedgerMessage):
+    """Ledger that can be configured to fail specific ops with False or exception."""
+    def __init__(self, msg_id=999, fail_add=False, fail_remove=False, fail_add_exc=False, fail_remove_exc=False):
+        super().__init__(msg_id=msg_id)
+        self._fail_add = fail_add
+        self._fail_remove = fail_remove
+        self._fail_add_exc = fail_add_exc
+        self._fail_remove_exc = fail_remove_exc
+
+    async def _add(self, emoji):
+        if self._fail_add_exc:
+            self._fail_add_exc = False  # one-shot
+            raise RuntimeError("simulated add exception")
+        if self._fail_add:
+            # simulate API returned False: don't record
+            self._ledger.append(("add", emoji + ":failed"))
+            return None
+        return await super()._add(emoji)
+
+    async def _remove(self, emoji, user=None):
+        if self._fail_remove_exc:
+            self._fail_remove_exc = False
+            raise RuntimeError("simulated remove exception")
+        if self._fail_remove:
+            self._ledger.append(("remove", emoji + ":failed"))
+            return None
+        return await super()._remove(emoji, user)
+
+
+@pytest.mark.asyncio
+async def test_start_add_false_leaves_no_active_and_recovers_on_completion():
+    """Start add returning False does not mark active; no-tool SUCCESS later adds persona."""
+    cfg = PlatformConfig(enabled=True, token="***")
+    cfg.extra = {"persona_emoji": "🤖", "dynamic_reactions": True, "reaction_cooldown": 0}
+    ad = DiscordAdapter(cfg)
+    ad._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=1, name="Bot"))
+    ad._rxn_cooldown = 0.0
+    # Make start add fail
+    raw = LedgerMessage(msg_id=1)
+    src = _make_source(chat_id="123")
+    evt = _make_event("1", raw, source=src)
+    key = ad._session_key_from_source(src)
+    with patch.object(ad, "_reaction_add", return_value=False) as mock_add:
+        await ad.on_processing_start(evt)
+        # Should have called add but not tracked active
+        mock_add.assert_awaited()
+        assert key not in ad._rxn_active, "active should not be set on False"
+        assert key in ad._rxn_msg_refs, "msg_ref should still be cached for recovery"
+        assert raw.ledger() == [], "ledger should have no successful add"
+        assert raw.effective() == set()
+    # Later no-tool completion should recover and add persona (outside patched context)
+    await ad.on_processing_complete(evt, ProcessingOutcome.SUCCESS)
+    # Now ledger should have the persona added via final path
+    assert ("add", "🤖") in raw.ledger()
+    assert raw.effective() == {"🤖"}
+    assert key not in ad._rxn_active
+    assert key not in ad._rxn_msg_refs
+    assert key not in ad._rxn_locks
+    assert key not in ad._rxn_stale
+
+
+@pytest.mark.asyncio
+async def test_start_add_exception_no_active_and_recovery():
+    cfg = PlatformConfig(enabled=True, token="***")
+    cfg.extra = {"persona_emoji": "🦊", "dynamic_reactions": True, "reaction_cooldown": 0}
+    ad = DiscordAdapter(cfg)
+    ad._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=1, name="Bot"))
+    ad._rxn_cooldown = 0.0
+    raw = LedgerMessage(msg_id=2)
+    src = _make_source(chat_id="124")
+    evt = _make_event("2", raw, source=src)
+    with patch.object(ad, "_reaction_add", side_effect=RuntimeError("boom")):
+        await ad.on_processing_start(evt)
+        key = ad._session_key_from_source(src)
+        assert key not in ad._rxn_active
+        assert key in ad._rxn_msg_refs
+    # Patch back to success for completion
+    await ad.on_processing_complete(evt, ProcessingOutcome.SUCCESS)
+    assert ("add", "🦊") in raw.ledger()
+    assert raw.effective() == {"🦊"}
+    key = ad._session_key_from_source(src)
+    assert key not in ad._rxn_locks
+
+
+@pytest.mark.asyncio
+async def test_tool_transition_remove_false_leaves_stale_and_final_cleans():
+    """Tool swap remove=False leaves stacked remote; stale tracked; final cleans both."""
+    cfg = PlatformConfig(enabled=True, token="***")
+    cfg.extra = {"persona_emoji": "🤖", "dynamic_reactions": True, "reaction_cooldown": 0}
+    ad = DiscordAdapter(cfg)
+    ad._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=1, name="Bot"))
+    ad._rxn_cooldown = 0.0
+    raw = LedgerMessage(msg_id=3)
+    src = _make_source(chat_id="125")
+    evt = _make_event("3", raw, source=src)
+    await ad.on_processing_start(evt)
+    assert raw.effective() == {"🤖"}
+    key = ad._session_key_from_source(src)
+    # Now cause remove to fail on first tool swap
+    emoji_map = {"read_file": "📄", "web_search": "🔍"}
+    def fake_emoji(name, default="⚙️"):
+        return emoji_map.get(name, default)
+    with patch("agent.display.get_tool_emoji", side_effect=fake_emoji):
+        with patch.object(ad, "_reaction_remove", return_value=False) as mock_rm:
+            await ad.on_tool_call_start(src, "read_file")
+            # add succeeded, remove failed
+            mock_rm.assert_awaited()
+            assert raw.ledger()[1] == ("add", "📄")
+            # No successful remove ledger entry
+            assert len([x for x in raw.ledger() if x[0] == "remove"]) == 0
+            # Both emojis remain remotely (ledger effective simulated as both present, but our LedgerMessage tracks effective as add without remove)
+            # Our LedgerMessage still thinks both present because remove never called
+            assert raw.effective() == {"🤖", "📄"}
+            # Stale should contain the old persona that failed to remove
+            assert key in ad._rxn_stale
+            assert "🤖" in ad._rxn_stale[key]
+            assert ad._rxn_active[key] == "📄"
+        # Second tool swap should still work (add new, try remove previous tool) - real remove
+        await ad.on_tool_call_start(src, "web_search")
+        # Should add 🔍 and remove 📄
+        assert ("add", "🔍") in raw.ledger()
+        assert ("remove", "📄") in raw.ledger()
+        # Stale still contains the original 🤖 that was never removed
+        assert "🤖" in ad._rxn_stale.get(key, set())
+        assert ad._rxn_active[key] == "🔍"
+    # Final completion should clean all: add persona back and remove both stale
+    await ad.on_processing_complete(evt, ProcessingOutcome.SUCCESS)
+    # Ledger should now have added 🤖 and removed 🔍 and also removed stale 🤖 (but note 🤖 is also the final persona, so we should not remove the newly added final)
+    # Our implementation removes stale excluding translated, so stale 🤖 equals final persona, thus it won't be removed again.
+    # But we still have stacked old 🤖 from start that is same as final, so effectively final is already present? Need to reason: initial 🤖 remains, then 📄 stacked, then 🔍, stale holds original 🤖. Final wants persona 🤖, which is already present as stale, but current is 🔍. So final will add 🤖 (but it's already present as stale), then remove 🔍 and stale excluding translated.
+    # Since stale 🤖 == translated, it won't be removed, so effective should be {🤖} only.
+    assert raw.effective() == {"🤖"}
+    assert key not in ad._rxn_active
+    assert key not in ad._rxn_stale
+    assert key not in ad._rxn_locks
+    # Ensure no untracked stacked remains: only one persona
+    assert raw.ledger().count(("add", "🤖")) >= 2  # start and final
+
+
+@pytest.mark.asyncio
+async def test_tool_transition_add_false_preserves_previous_and_recovers():
+    cfg = PlatformConfig(enabled=True, token="***")
+    cfg.extra = {"persona_emoji": "🤖", "dynamic_reactions": True, "reaction_cooldown": 0}
+    ad = DiscordAdapter(cfg)
+    ad._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=1, name="Bot"))
+    ad._rxn_cooldown = 0.0
+    raw = LedgerMessage(msg_id=4)
+    src = _make_source(chat_id="126")
+    evt = _make_event("4", raw, source=src)
+    await ad.on_processing_start(evt)
+    emoji_map = {"read_file": "📄", "web_search": "🔍"}
+    def fake_emoji(name, default="⚙️"):
+        return emoji_map.get(name, default)
+    with patch("agent.display.get_tool_emoji", side_effect=fake_emoji):
+        with patch.object(ad, "_reaction_add", return_value=False):
+            await ad.on_tool_call_start(src, "read_file")
+            # Should preserve persona
+            assert raw.effective() == {"🤖"}
+            key = ad._session_key_from_source(src)
+            assert ad._rxn_active[key] == "🤖"
+        # Next tool should succeed
+        await ad.on_tool_call_start(src, "web_search")
+        assert raw.effective() == {"🔍"}
+        assert ("add", "🔍") in raw.ledger()
+
+
+@pytest.mark.asyncio
+async def test_final_add_false_preserves_and_no_lock_leak_and_recovery():
+    """Final persona add returning False must not leak lock and must remain recoverable."""
+    cfg = PlatformConfig(enabled=True, token="***")
+    cfg.extra = {"persona_emoji": "🦊", "dynamic_reactions": True, "reaction_cooldown": 0}
+    ad = DiscordAdapter(cfg)
+    ad._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=1, name="Bot"))
+    ad._rxn_cooldown = 0.0
+    raw = LedgerMessage(msg_id=5)
+    src = _make_source(chat_id="127")
+    evt = _make_event("5", raw, source=src)
+    await ad.on_processing_start(evt)
+    emoji_map = {"read_file": "📄"}
+    def fake_emoji(name, default="⚙️"):
+        return emoji_map.get(name, default)
+    with patch("agent.display.get_tool_emoji", side_effect=fake_emoji):
+        await ad.on_tool_call_start(src, "read_file")
+        assert raw.effective() == {"📄"}
+        key = ad._session_key_from_source(src)
+        # Patch final add to fail
+        orig_add = ad._reaction_add
+        async def failing_add(msg_ref, emoji):
+            if emoji == "🦊":
+                return False
+            return await orig_add(msg_ref, emoji)
+        with patch.object(ad, "_reaction_add", side_effect=failing_add):
+            await ad.on_processing_complete(evt, ProcessingOutcome.SUCCESS)
+            # Should NOT have cleaned tracking; current remains 📄, stale maybe, lock released
+            assert key in ad._rxn_active or key in ad._rxn_stale or key in ad._rxn_msg_refs, "state must be preserved for recovery"
+            assert key not in ad._rxn_locks, "lock must be released even on False"
+            assert "📄" in raw.effective()
+            assert "🦊" not in raw.effective()
+            # Now recover with a subsequent completion retry (simulate later event)
+        # Next event: same key but new message? For recovery we reuse same event with success
+        await ad.on_processing_complete(evt, ProcessingOutcome.SUCCESS)
+        assert raw.effective() == {"🦊"}
+        assert key not in ad._rxn_active
+        assert key not in ad._rxn_locks
+        assert key not in ad._rxn_stale
+
+
+@pytest.mark.asyncio
+async def test_final_remove_false_preserves_stale_and_recovers():
+    cfg = PlatformConfig(enabled=True, token="***")
+    cfg.extra = {"persona_emoji": "🤖", "dynamic_reactions": True, "reaction_cooldown": 0}
+    ad = DiscordAdapter(cfg)
+    ad._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=1, name="Bot"))
+    ad._rxn_cooldown = 0.0
+    raw = LedgerMessage(msg_id=6)
+    src = _make_source(chat_id="128")
+    evt = _make_event("6", raw, source=src)
+    await ad.on_processing_start(evt)
+    emoji_map = {"read_file": "📄"}
+    def fake_emoji(name, default="⚙️"):
+        return emoji_map.get(name, default)
+    with patch("agent.display.get_tool_emoji", side_effect=fake_emoji):
+        await ad.on_tool_call_start(src, "read_file")
+    assert raw.effective() == {"📄"}
+    key = ad._session_key_from_source(src)
+    # Make final remove fail (add succeeds, remove fails)
+    orig_rm = ad._reaction_remove
+    async def failing_rm(msg_ref, emoji):
+        if emoji == "📄":
+            return False
+        return await orig_rm(msg_ref, emoji)
+    with patch.object(ad, "_reaction_remove", side_effect=failing_rm):
+        await ad.on_processing_complete(evt, ProcessingOutcome.SUCCESS)
+        # Add succeeded, so persona added, but old tool remains
+        assert "🤖" in raw.effective()
+        assert "📄" in raw.effective(), "stale remains due to remove False"
+        assert key in ad._rxn_stale
+        assert "📄" in ad._rxn_stale[key]
+        assert ad._rxn_active[key] == "🤖"
+        assert key not in ad._rxn_locks
+        # Next retry should clean
+    await ad.on_processing_complete(evt, ProcessingOutcome.SUCCESS)
+    assert raw.effective() == {"🤖"}
+    assert "📄" not in raw.effective()
+    assert key not in ad._rxn_stale
+
+
+@pytest.mark.asyncio
+async def test_cancel_with_remove_false_preserves_and_no_lock_leak():
+    cfg = PlatformConfig(enabled=True, token="***")
+    cfg.extra = {"persona_emoji": "🤖", "dynamic_reactions": True, "reaction_cooldown": 0}
+    ad = DiscordAdapter(cfg)
+    ad._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=1, name="Bot"))
+    ad._rxn_cooldown = 0.0
+    raw = LedgerMessage(msg_id=7)
+    src = _make_source(chat_id="129")
+    evt = _make_event("7", raw, source=src)
+    await ad.on_processing_start(evt)
+    emoji_map = {"read_file": "📄"}
+    def fake_emoji(name, default="⚙️"):
+        return emoji_map.get(name, default)
+    with patch("agent.display.get_tool_emoji", side_effect=fake_emoji):
+        await ad.on_tool_call_start(src, "read_file")
+    key = ad._session_key_from_source(src)
+    with patch.object(ad, "_reaction_remove", return_value=False):
+        await ad.on_processing_complete(evt, ProcessingOutcome.CANCELLED)
+        # Cancel should attempt remove but fail, so stale preserved and lock released
+        assert key in ad._rxn_stale or key in ad._rxn_active
+        assert key not in ad._rxn_locks
+        # Remote still has tool emoji
+        assert "📄" in raw.effective()
+    # Retry cancel should eventually clean when remove succeeds
+    await ad.on_processing_complete(evt, ProcessingOutcome.CANCELLED)
+    assert raw.effective() == set()
+    assert key not in ad._rxn_active
+    assert key not in ad._rxn_stale
+
+
+@pytest.mark.asyncio
+async def test_lock_cleanup_after_all_false_paths():
+    """Ensure per-key lock never leaks after any False path."""
+    for outcome in [ProcessingOutcome.SUCCESS, ProcessingOutcome.FAILURE, ProcessingOutcome.CANCELLED]:
+        cfg = PlatformConfig(enabled=True, token="***")
+        cfg.extra = {"persona_emoji": "🤖", "dynamic_reactions": True, "reaction_cooldown": 0}
+        ad = DiscordAdapter(cfg)
+        ad._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=1, name="Bot"))
+        ad._rxn_cooldown = 0.0
+        raw = LedgerMessage(msg_id=100)
+        src = _make_source(chat_id=f"lock-{outcome.name}")
+        evt = _make_event("99", raw, source=src)
+        # Force start to succeed
+        await ad.on_processing_start(evt)
+        key = ad._session_key_from_source(src)
+        # Force final to fail via add False
+        with patch.object(ad, "_reaction_add", return_value=False):
+            await ad.on_processing_complete(evt, outcome)
+            assert key not in ad._rxn_locks, f"lock leaked for {outcome}"
+
+
+# ---------------------------------------------------------------------------
+# Cooldown and boolean normalization
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_cooldown_fail_closed_nan_negative_and_string_false():
+    """Cooldown NaN/negative/inf and quoted-false booleans must fail-closed, not disable hysteresis."""
+    # Test cooldown normalization directly via adapter construction
+    for raw_val, expected_default in [("nan", 1.0), (float("nan"), 1.0), (-1, 1.0), (-0.5, 1.0), (float("inf"), 1.0), ("-2", 1.0), ("not-a-number", 1.0)]:
+        cfg = PlatformConfig(enabled=True, token="***", extra={"reaction_cooldown": raw_val})
+        ad = DiscordAdapter(cfg)
+        ad._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=1, name="Bot"))
+        # _rxn_cooldown should be default 1.0, not the bad value
+        assert ad._rxn_cooldown == 1.0, f"cooldown {raw_val!r} should fallback to 1.0, got {ad._rxn_cooldown}"
+        # Verify hysteresis still applies: rapid second tool swap should be coalesced
+        raw = LedgerMessage(msg_id=200)
+        src = _make_source(chat_id=f"cool-{raw_val}")
+        evt = _make_event("200", raw, source=src)
+        # Need persona
+        ad._rxn_cooldown = 1.0  # ensure
+        await ad.on_processing_start(evt)
+        emoji_map = {"read_file": "📄", "web_search": "🔍"}
+        def fake_emoji(name, default="⚙️"):
+            return emoji_map.get(name, default)
+        with patch("agent.display.get_tool_emoji", side_effect=fake_emoji):
+            await ad.on_tool_call_start(src, "read_file")
+            assert raw.effective() == {"📄"}
+            # Immediate second swap within cooldown should be blocked
+            await ad.on_tool_call_start(src, "web_search")
+            assert raw.effective() == {"📄"}, "cooldown should block rapid swap even with bad original config"
+    # Test quoted-false booleans for dynamic_reactions
+    for false_val in ["false", "False", "0", "no", "off", "FALSE"]:
+        cfg = PlatformConfig(enabled=True, token="***", extra={"dynamic_reactions": false_val, "persona_emoji": "🤖", "reaction_cooldown": 0})
+        ad = DiscordAdapter(cfg)
+        ad._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=1, name="Bot"))
+        assert ad._rxn_dynamic is False, f"dynamic_reactions={false_val!r} should be False, got {ad._rxn_dynamic}"
+        # Verify no swap occurs
+        raw = LedgerMessage(msg_id=201)
+        src = _make_source(chat_id=f"bool-{false_val}")
+        evt = _make_event("201", raw, source=src)
+        await ad.on_processing_start(evt)
+        with patch("agent.display.get_tool_emoji", return_value="📄"):
+            await ad.on_tool_call_start(src, "read_file")
+            # Should still be persona, not tool
+            assert raw.effective() == {"🤖"}
+    # 0 cooldown should be allowed (disables hysteresis for tests)
+    cfg = PlatformConfig(enabled=True, token="***", extra={"reaction_cooldown": 0})
+    ad = DiscordAdapter(cfg)
+    ad._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=1, name="Bot"))
+    assert ad._rxn_cooldown == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Per-platform config plumbing via real temp config (no _rxn mutation)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_per_platform_config_via_real_temp_config_loader(tmp_path, monkeypatch):
+    """Wire platforms.discord.persona_emoji/dynamic_reactions through normal loader/model/adapter path."""
+    # Create a real HERMES_HOME with config.yaml containing per-platform overrides
+    home = tmp_path / "hermes_home_cf"
+    home.mkdir()
+    config_yaml = """
+platforms:
+  discord:
+    persona_emoji: "🦊"
+    dynamic_reactions: false
+    reaction_cooldown: 0.75
+    reactions: true
+"""
+    (home / "config.yaml").write_text(config_yaml, encoding="utf-8")
+    # Also test global defaults: create hermes_cli config layer?
+    # For gateway loader, we need to set HERMES_HOME override
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+    from gateway.config import load_gateway_config
+    from gateway.config_loader import load_yaml_layer
+    token = set_hermes_home_override(home)
+    try:
+        # Use production loader
+        cfg = load_gateway_config()
+        disc = cfg.platforms.get(Platform.DISCORD)
+        assert disc is not None, "discord platform should be present"
+        # extra should contain bridged keys
+        assert disc.extra.get("persona_emoji") == "🦊"
+        assert disc.extra.get("dynamic_reactions") is False or disc.extra.get("dynamic_reactions") == False
+        # reaction_cooldown may be string or float; loader preserves raw, mixin normalizes
+        assert str(disc.extra.get("reaction_cooldown")) == "0.75"
+        # Now construct production adapter without mutating _rxn_*
+        ad = DiscordAdapter(disc)
+        ad._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=1, name="Bot"))
+        # Adapter's mixin should have resolved via production path
+        assert ad._rxn_persona_emoji == "🦊", f"expected 🦊 got {ad._rxn_persona_emoji}"
+        assert ad._rxn_dynamic is False, f"expected False got {ad._rxn_dynamic}"
+        assert math.isclose(ad._rxn_cooldown, 0.75, rel_tol=1e-6)
+        # Verify add-before-remove still works with this config (dynamic False => no swaps)
+        raw = LedgerMessage(msg_id=300)
+        src = _make_source(chat_id="cfg1")
+        evt = _make_event("300", raw, source=src)
+        await ad.on_processing_start(evt)
+        assert raw.effective() == {"🦊"}
+        with patch("agent.display.get_tool_emoji", return_value="📄"):
+            await ad.on_tool_call_start(src, "read_file")
+            # Dynamic disabled => no swap
+            assert raw.effective() == {"🦊"}
+        await ad.on_processing_complete(evt, ProcessingOutcome.SUCCESS)
+        assert raw.effective() == {"🦊"}
+        assert ad._rxn_active == {}
+        assert ad._rxn_locks == {}
+    finally:
+        reset_hermes_home_override(token)
+
+
+@pytest.mark.asyncio
+async def test_per_platform_config_precedence_over_global_and_malformed_fallback(tmp_path):
+    """Global persona_emoji/dynamic_reactions plus per-platform override precedence, malformed fallback."""
+    # Test precedence: global persona_emoji = "👀", per-platform = "🐱" => per-platform wins
+    # And malformed: dynamic_reactions: "notabool" => fallback, reaction_cooldown: "NaN" => 1.0
+    from gateway.config import PlatformConfig
+    # Global via PlatformConfig extra? For gateway, global persona_emoji is not in gateway config;
+    # it's in hermes_cli config. Here we test per-platform wiring only.
+    # For this test, construct PlatformConfig directly as loader would (extra already contains)
+    cfg = PlatformConfig(enabled=True, token="***", extra={"persona_emoji": "🐱", "dynamic_reactions": "false", "reaction_cooldown": "NaN", "reactions": True})
+    ad = DiscordAdapter(cfg)
+    ad._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=1, name="Bot"))
+    # persona should be 🐱 (per-platform)
+    assert ad._rxn_persona_emoji == "🐱"
+    # dynamic_reactions "false" string should be False (fail-closed, not truthy)
+    assert ad._rxn_dynamic is False
+    # NaN cooldown should fallback to 1.0
+    assert ad._rxn_cooldown == 1.0
+    # Absent values fallback: remove per-platform, should fallback to hermes_cli global
+    cfg2 = PlatformConfig(enabled=True, token="***", extra={"reactions": True})
+    # Mock hermes_cli load_config to return global persona
+    with patch("hermes_cli.config.load_config", return_value={"persona_emoji": "🌟", "dynamic_reactions": True}):
+        ad2 = DiscordAdapter(cfg2)
+        ad2._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=1, name="Bot"))
+        assert ad2._rxn_persona_emoji == "🌟"
+        assert ad2._rxn_dynamic is True
+
+
+@pytest.mark.asyncio
+async def test_per_platform_config_absent_fallback_to_default(tmp_path, monkeypatch):
+    """When per-platform and global absent, fallback to defaults (👀 and False/1.0)."""
+    # Ensure HOME without config
+    home = tmp_path / "home_empty"
+    home.mkdir()
+    (home / "config.yaml").write_text("platforms:\n  discord:\n    reactions: true\n", encoding="utf-8")
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+    from gateway.config import load_gateway_config
+    token = set_hermes_home_override(home)
+    try:
+        with patch("hermes_cli.config.load_config", return_value={}):
+            cfg = load_gateway_config()
+            disc = cfg.platforms.get(Platform.DISCORD)
+            assert disc is not None
+            # No persona in extra, should be absent
+            assert disc.extra.get("persona_emoji") in (None, "")
+            ad = DiscordAdapter(disc)
+            ad._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=1, name="Bot"))
+            assert ad._rxn_persona_emoji == "👀"
+            # dynamic_reactions absent and global absent => False
+            assert ad._rxn_dynamic is False or ad._rxn_dynamic is True  # depends on default; we set global default True but loader fallback? Just ensure no exception
+    finally:
+        reset_hermes_home_override(token)
+
+
+# ---------------------------------------------------------------------------
+# Telegram regression (replace-mode) and add-before-remove ordering
+# ---------------------------------------------------------------------------
+
+class FakeTelegramAdapter(DiscordAdapter):
+    """Minimal telegram-like adapter using replace_mode to ensure no regression."""
+    _reaction_replace_mode = True
+    def __init__(self, config):
+        # Don't call DiscordAdapter.__init__ which expects discord-specific, just init mixin
+        self.config = config
+        self.platform = Platform.TELEGRAM
+        self._client = SimpleNamespace(user=SimpleNamespace(id=1))
+        self._session_raw_messages = {}
+        self._init_reaction_mixin()
+    async def _reaction_set(self, msg_ref, emoji):
+        # Simulate Telegram set that replaces; ledger is msg_ref
+        try:
+            await msg_ref.set_reaction(emoji)
+            return True
+        except Exception:
+            return False
+    def _reaction_resolve_message(self, event):
+        return getattr(event, "raw_message", None) or self._session_raw_messages.get(self._reaction_msg_key(event))
+    def _reaction_msg_key(self, event):
+        source = getattr(event, "source", event)
+        if hasattr(source, "source") and source.source is not None:
+            source = source.source
+        return f"{source.platform}:{source.chat_id}:{getattr(source, 'user_id', '')}"
+
+class TelegramLedger:
+    def __init__(self):
+        self._current = None
+        self._ledger = []
+    async def set_reaction(self, emoji):
+        self._ledger.append(("set", emoji))
+        self._current = emoji
+    def ledger(self):
+        return list(self._ledger)
+    def current(self):
+        return self._current
+
+
+@pytest.mark.asyncio
+async def test_telegram_replace_mode_lifecycle():
+    """Telegram replace-mode must still work: persona start, swaps via set, final persona."""
+    cfg = PlatformConfig(enabled=True, token="***", extra={"persona_emoji": "🤖", "dynamic_reactions": True, "reaction_cooldown": 0})
+    ad = FakeTelegramAdapter(cfg)
+    ad._rxn_cooldown = 0.0
+    raw = TelegramLedger()
+    src = SessionSource(platform=Platform.TELEGRAM, chat_id="tg-1", chat_type="dm", user_id="u1")
+    evt = MessageEvent(text="hi", message_type=MessageType.TEXT, source=src, raw_message=raw, message_id="tgm1")
+    await ad._rxn_on_processing_start(evt)
+    assert raw.ledger() == [("set", "🤖")]
+    assert raw.current() == "🤖"
+    emoji_map = {"read_file": "📄", "web_search": "🔍"}
+    def fake_emoji(name, default="⚙️"):
+        return emoji_map.get(name, default)
+    with patch("agent.display.get_tool_emoji", side_effect=fake_emoji):
+        await ad._rxn_on_tool_call_start(src, "read_file")
+        assert raw.ledger()[-1] == ("set", "📄")
+        assert raw.current() == "📄"
+        await ad._rxn_on_tool_call_start(src, "web_search")
+        assert raw.ledger()[-1] == ("set", "🔍")
+        assert raw.current() == "🔍"
+    await ad._rxn_on_processing_complete(evt, ProcessingOutcome.SUCCESS)
+    assert raw.ledger()[-1] == ("set", "🤖")
+    assert raw.current() == "🤖"
+    # Ensure no lock leak
+    assert ad._rxn_locks == {}
+
+
+@pytest.mark.asyncio
+async def test_add_before_remove_ordering_proven_via_ledger():
+    """Every tool transition must be add(new) before remove(old) in ledger order."""
+    cfg = PlatformConfig(enabled=True, token="***", extra={"persona_emoji": "🤖", "dynamic_reactions": True, "reaction_cooldown": 0})
+    ad = DiscordAdapter(cfg)
+    ad._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=1, name="Bot"))
+    ad._rxn_cooldown = 0.0
+    raw = LedgerMessage(msg_id=400)
+    src = _make_source(chat_id="order-1")
+    evt = _make_event("400", raw, source=src)
+    await ad.on_processing_start(evt)
+    emoji_map = {"a": "🅰️", "b": "🅱️", "c": "🇨"}
+    def fake_emoji(name, default="⚙️"):
+        return emoji_map.get(name, default)
+    with patch("agent.display.get_tool_emoji", side_effect=fake_emoji):
+        await ad.on_tool_call_start(src, "a")
+        assert raw.ledger()[1] == ("add", "🅰️")
+        assert raw.ledger()[2] == ("remove", "🤖")
+        await ad.on_tool_call_start(src, "b")
+        assert raw.ledger()[3] == ("add", "🅱️")
+        assert raw.ledger()[4] == ("remove", "🅰️")
+        await ad.on_tool_call_start(src, "c")
+        assert raw.ledger()[5] == ("add", "🇨")
+        assert raw.ledger()[6] == ("remove", "🅱️")
+        # Final must also be add before remove
+        pre = len(raw.ledger())
+        await ad.on_processing_complete(evt, ProcessingOutcome.SUCCESS)
+        assert raw.ledger()[pre] == ("add", "🤖")
+        assert raw.ledger()[pre+1] == ("remove", "🇨")

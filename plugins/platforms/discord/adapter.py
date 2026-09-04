@@ -2749,13 +2749,105 @@ class DiscordAdapter(DynamicReactionMixin, BasePlatformAdapter):
 
     def _reactions_enabled(self) -> bool:
         """Check if message reactions are enabled via config/env."""
-        return os.getenv("DISCORD_REACTIONS", "true").lower() not in ("false", "0", "no") and self.config.extra.get("reactions", True)
+        # Normalize env var fail-closed: "false"/"0"/"no"/"off" disables
+        raw_env = os.getenv("DISCORD_REACTIONS", "true")
+        if isinstance(raw_env, str) and raw_env.strip().lower() in ("false", "0", "no", "off"):
+            return False
+        # Normalize config.extra.reactions with the same fail-closed rule
+        extra_val = self.config.extra.get("reactions", True) if isinstance(getattr(self.config, "extra", None), dict) else True
+        if isinstance(extra_val, str):
+            if extra_val.strip().lower() in ("false", "0", "no", "off"):
+                return False
+            if extra_val.strip().lower() in ("true", "1", "yes", "on", ""):
+                # empty string treated as not set -> fallback true
+                return True if extra_val.strip().lower() != "" else True
+            # unrecognized string: fail-closed to default true? but log?
+            return True
+        if isinstance(extra_val, bool):
+            return extra_val
+        return bool(extra_val) if extra_val is not None else True
 
     def _session_key_from_source(self, source) -> str:
-        """Derive a stable session key from a SessionSource or MessageEvent."""
-        if hasattr(source, "source") and source.source is not None:
-            source = source.source
-        return f"{source.platform}:{source.chat_id}:{source.thread_id or ''}"
+        """Derive a canonical, participant- and profile-aware session key.
+
+        Uses :func:`gateway.session.build_session_key` so distinct users or
+        multiplex profiles sharing a channel do not collide on
+        ``_session_raw_messages`` / ``_rxn_*`` state. Preserves the stable
+        active message identity across ``on_processing_start``,
+        ``on_tool_call_start`` and ``on_processing_complete`` by returning
+        the same key for the triggering ``MessageEvent`` and the
+        ``SessionSource`` passed to tool callbacks.
+        """
+        # Unwrap MessageEvent -> SessionSource
+        if hasattr(source, "source") and getattr(source, "source", None) is not None:
+            try:
+                # Prefer the adapter's canonical event key when given an event,
+                # so profile multiplexing stays in sync with the agent runner.
+                from gateway.session import build_session_key as _build
+
+                # Try the base-class helper which already handles group/thread
+                # isolation flags and profile namespace.
+                try:
+                    return self._event_session_key(source)  # type: ignore[arg-type]
+                except Exception:
+                    # Fallback to direct build with source.source
+                    src = source.source
+                    extra = getattr(getattr(self, "config", None), "extra", {}) or {}
+                    def _norm_bool(v, default):
+                        if isinstance(v, bool):
+                            return v
+                        if isinstance(v, str):
+                            t = v.strip().lower()
+                            if t in ("1", "true", "yes", "on"):
+                                return True
+                            if t in ("0", "false", "no", "off", ""):
+                                return False
+                            return default
+                        if v is None:
+                            return default
+                        return bool(v)
+                    g = _norm_bool(extra.get("group_sessions_per_user", True), True)
+                    t = _norm_bool(extra.get("thread_sessions_per_user", False), False)
+                    profile = None
+                    try:
+                        profile = self._session_key_profile(src)
+                    except Exception:
+                        profile = getattr(src, "profile", None)
+                    return _build(src, group_sessions_per_user=g, thread_sessions_per_user=t, profile=profile)
+            except Exception:
+                source = source.source
+        # Now ``source`` should be a SessionSource-like
+        try:
+            from gateway.session import build_session_key as _build
+
+            extra = getattr(getattr(self, "config", None), "extra", {}) or {}
+            def _norm_bool2(v, default):
+                if isinstance(v, bool):
+                    return v
+                if isinstance(v, str):
+                    t = v.strip().lower()
+                    if t in ("1", "true", "yes", "on"):
+                        return True
+                    if t in ("0", "false", "no", "off", ""):
+                        return False
+                    return default
+                if v is None:
+                    return default
+                return bool(v)
+            g2 = _norm_bool2(extra.get("group_sessions_per_user", True), True)
+            t2 = _norm_bool2(extra.get("thread_sessions_per_user", False), False)
+            profile2 = None
+            try:
+                profile2 = self._session_key_profile(source)
+            except Exception:
+                profile2 = getattr(source, "profile", None)
+            return _build(source, group_sessions_per_user=g2, thread_sessions_per_user=t2, profile=profile2)
+        except Exception:
+            # Absolute fallback: include participant and profile to avoid collision
+            try:
+                return f"{getattr(source, 'platform', '')}:{getattr(source, 'chat_id', '')}:{getattr(source, 'thread_id', '') or ''}:{getattr(source, 'user_id', '') or ''}:{getattr(source, 'profile', '') or ''}"
+            except Exception:
+                return str(getattr(source, "chat_id", ""))
 
     async def _reaction_add(self, msg_ref, emoji):
         """Add an emoji reaction to a Discord message."""

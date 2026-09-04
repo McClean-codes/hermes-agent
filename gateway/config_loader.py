@@ -186,6 +186,7 @@ def _str_keyed(value: Any) -> Any:
 
 
 _TELEGRAM = frozenset({Platform.TELEGRAM})
+_DISCORD = frozenset({Platform.DISCORD})
 _DISCORD_SLACK = frozenset({Platform.DISCORD, Platform.SLACK})
 
 def _plain(*keys: str) -> tuple:
@@ -211,6 +212,9 @@ _SHARED_KEYS: tuple = (
     ("channel_skill_bindings", _DISCORD_SLACK, None),
     ("channel_prompts", None, _str_keyed),
     *_plain("gateway_restart_notification", "typing_indicator", "typing_status_text"),
+    ("persona_emoji", _DISCORD, None),
+    ("dynamic_reactions", _DISCORD, None),
+    ("reaction_cooldown", _DISCORD, None),
 )
 
 # Top-level port/host/secret bridged into ``extra`` for adapters that read them from config.extra
