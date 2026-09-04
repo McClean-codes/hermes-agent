@@ -71,8 +71,8 @@ def isolated_hermes_home(tmp_path, monkeypatch):
     for key in [
         "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "OPENROUTER_API_KEY",
         "ZAI_API_KEY", "DEEPSEEK_API_KEY", "ANTHROPIC_TOKEN",
-        "CLAUDE_CODE_OAUTH_TOKEN", "OPENCODE_GO_API_KEY",
-        "OPENCODE_GO_API_KEY2", "OPENCODE_GO_API_KEY3", "OPENCODE_GO_API_KEY4",
+        "CLAUDE_CODE_OAUTH_TOKEN", "PROVIDER_API_KEY",
+        "PROVIDER_API_KEY_2", "PROVIDER_API_KEY_3", "PROVIDER_API_KEY_4",
         "OPENAI_BASE_URL",
     ]:
         monkeypatch.delenv(key, raising=False)
@@ -97,18 +97,18 @@ class TestSeedFromEnvRespectsExistingPoolEntries:
     """Regression: env-source entries already in auth.json must be seeded."""
 
     def test_second_env_source_entry_seeded_from_env(self, isolated_hermes_home):
-        """An env:OPENCODE_GO_API_KEY2 entry already in the pool gets
+        """An env:PROVIDER_API_KEY_2 entry already in the pool gets
         populated when the env var is set, even though the registry only
-        declares the primary OPENCODE_GO_API_KEY."""
+        declares the primary PROVIDER_API_KEY."""
         from agent.credential_pool import PooledCredential, _seed_from_env
 
         _write_env_file(
             isolated_hermes_home,
-            OPENCODE_GO_API_KEY=SYN_PRIMARY,
-            OPENCODE_GO_API_KEY2=SYN_SECONDARY,
+            PROVIDER_API_KEY=SYN_PRIMARY,
+            PROVIDER_API_KEY_2=SYN_SECONDARY,
         )
 
-        pconfig = _make_pconfig("opencode-go", ["OPENCODE_GO_API_KEY"])
+        pconfig = _make_pconfig("opencode-go", ["PROVIDER_API_KEY"])
 
         secondary = PooledCredential(
             provider="opencode-go",
@@ -116,7 +116,7 @@ class TestSeedFromEnvRespectsExistingPoolEntries:
             label="secondary",
             auth_type="api_key",
             priority=1,
-            source="env:OPENCODE_GO_API_KEY2",
+            source="env:PROVIDER_API_KEY_2",
             access_token="",
         )
         entries = [secondary]
@@ -128,10 +128,10 @@ class TestSeedFromEnvRespectsExistingPoolEntries:
             changed, active_sources = _seed_from_env("opencode-go", entries)
 
         assert changed is True
-        assert "env:OPENCODE_GO_API_KEY" in active_sources
-        assert "env:OPENCODE_GO_API_KEY2" in active_sources
+        assert "env:PROVIDER_API_KEY" in active_sources
+        assert "env:PROVIDER_API_KEY_2" in active_sources
 
-        populated = next((e for e in entries if e.source == "env:OPENCODE_GO_API_KEY2"), None)
+        populated = next((e for e in entries if e.source == "env:PROVIDER_API_KEY_2"), None)
         assert populated is not None, "secondary entry was dropped from pool"
         assert populated.access_token == SYN_SECONDARY
 
@@ -142,26 +142,26 @@ class TestSeedFromEnvRespectsExistingPoolEntries:
 
         _write_env_file(
             isolated_hermes_home,
-            OPENCODE_GO_API_KEY=SYN_PRIMARY,
-            OPENCODE_GO_API_KEY2=SYN_SECONDARY,
-            OPENCODE_GO_API_KEY3=SYN_TERTIARY,
+            PROVIDER_API_KEY=SYN_PRIMARY,
+            PROVIDER_API_KEY_2=SYN_SECONDARY,
+            PROVIDER_API_KEY_3=SYN_TERTIARY,
         )
-        pconfig = _make_pconfig("opencode-go", ["OPENCODE_GO_API_KEY"])
+        pconfig = _make_pconfig("opencode-go", ["PROVIDER_API_KEY"])
 
         # Three pre-existing rows on disk, all empty before seeding
-        e1 = PooledCredential(provider="opencode-go", id="pri1", label="primary", auth_type="api_key", priority=0, source="env:OPENCODE_GO_API_KEY", access_token="")
-        e2 = PooledCredential(provider="opencode-go", id="sec2", label="secondary", auth_type="api_key", priority=1, source="env:OPENCODE_GO_API_KEY2", access_token="")
-        e3 = PooledCredential(provider="opencode-go", id="ter3", label="tertiary", auth_type="api_key", priority=2, source="env:OPENCODE_GO_API_KEY3", access_token="")
+        e1 = PooledCredential(provider="opencode-go", id="pri1", label="primary", auth_type="api_key", priority=0, source="env:PROVIDER_API_KEY", access_token="")
+        e2 = PooledCredential(provider="opencode-go", id="sec2", label="secondary", auth_type="api_key", priority=1, source="env:PROVIDER_API_KEY_2", access_token="")
+        e3 = PooledCredential(provider="opencode-go", id="ter3", label="tertiary", auth_type="api_key", priority=2, source="env:PROVIDER_API_KEY_3", access_token="")
         entries = [e1, e2, e3]
 
         with patch("agent.credential_pool.PROVIDER_REGISTRY", {"opencode-go": pconfig}):
             changed, active_sources = _seed_from_env("opencode-go", entries)
 
         assert changed is True
-        assert "env:OPENCODE_GO_API_KEY" in active_sources
-        assert "env:OPENCODE_GO_API_KEY2" in active_sources
-        assert "env:OPENCODE_GO_API_KEY3" in active_sources
-        for src, expected in [("env:OPENCODE_GO_API_KEY", SYN_PRIMARY), ("env:OPENCODE_GO_API_KEY2", SYN_SECONDARY), ("env:OPENCODE_GO_API_KEY3", SYN_TERTIARY)]:
+        assert "env:PROVIDER_API_KEY" in active_sources
+        assert "env:PROVIDER_API_KEY_2" in active_sources
+        assert "env:PROVIDER_API_KEY_3" in active_sources
+        for src, expected in [("env:PROVIDER_API_KEY", SYN_PRIMARY), ("env:PROVIDER_API_KEY_2", SYN_SECONDARY), ("env:PROVIDER_API_KEY_3", SYN_TERTIARY)]:
             ent = next((e for e in entries if e.source == src), None)
             assert ent is not None, f"missing {src}"
             assert ent.access_token == expected
@@ -178,14 +178,14 @@ class TestSeedFromEnvRespectsExistingPoolEntries:
         invalidate_env_cache()
 
         # Write .env with three synthetic keys
-        _write_env_file(home, OPENCODE_GO_API_KEY=SYN_PRIMARY, OPENCODE_GO_API_KEY2=SYN_SECONDARY, OPENCODE_GO_API_KEY3=SYN_TERTIARY)
+        _write_env_file(home, PROVIDER_API_KEY=SYN_PRIMARY, PROVIDER_API_KEY_2=SYN_SECONDARY, PROVIDER_API_KEY_3=SYN_TERTIARY)
 
         # Pre-create auth.json with three empty env-source rows on disk
         _write_auth(home, {
             "opencode-go": [
-                {"id": "pri1", "label": "primary", "auth_type": "api_key", "priority": 0, "source": "env:OPENCODE_GO_API_KEY", "access_token": ""},
-                {"id": "sec2", "label": "secondary", "auth_type": "api_key", "priority": 1, "source": "env:OPENCODE_GO_API_KEY2", "access_token": ""},
-                {"id": "ter3", "label": "tertiary", "auth_type": "api_key", "priority": 2, "source": "env:OPENCODE_GO_API_KEY3", "access_token": ""},
+                {"id": "pri1", "label": "primary", "auth_type": "api_key", "priority": 0, "source": "env:PROVIDER_API_KEY", "access_token": ""},
+                {"id": "sec2", "label": "secondary", "auth_type": "api_key", "priority": 1, "source": "env:PROVIDER_API_KEY_2", "access_token": ""},
+                {"id": "ter3", "label": "tertiary", "auth_type": "api_key", "priority": 2, "source": "env:PROVIDER_API_KEY_3", "access_token": ""},
             ]
         })
 
@@ -201,7 +201,7 @@ class TestSeedFromEnvRespectsExistingPoolEntries:
         available = [e for e in entries if e.runtime_api_key]
         assert len(available) == 3, f"expected 3 available, got {[e.source for e in available]!r}"
         sources = {e.source for e in available}
-        assert sources == {"env:OPENCODE_GO_API_KEY", "env:OPENCODE_GO_API_KEY2", "env:OPENCODE_GO_API_KEY3"}
+        assert sources == {"env:PROVIDER_API_KEY", "env:PROVIDER_API_KEY_2", "env:PROVIDER_API_KEY_3"}
         tokens = {e.runtime_api_key for e in available}
         assert SYN_PRIMARY in tokens and SYN_SECONDARY in tokens and SYN_TERTIARY in tokens
 
@@ -236,9 +236,9 @@ class TestSeedFromEnvRespectsExistingPoolEntries:
         invalidate_env_cache()
 
         # Part A: .env file path works (no monkeypatched env needed)
-        _write_env_file(home, OPENCODE_GO_API_KEY2=SYN_SECONDARY)
-        pconfig = _make_pconfig("opencode-go", ["OPENCODE_GO_API_KEY"])
-        e = PooledCredential(provider="opencode-go", id="sec2", label="secondary", auth_type="api_key", priority=1, source="env:OPENCODE_GO_API_KEY2", access_token="")
+        _write_env_file(home, PROVIDER_API_KEY_2=SYN_SECONDARY)
+        pconfig = _make_pconfig("opencode-go", ["PROVIDER_API_KEY"])
+        e = PooledCredential(provider="opencode-go", id="sec2", label="secondary", auth_type="api_key", priority=1, source="env:PROVIDER_API_KEY_2", access_token="")
         entries = [e]
         with patch("agent.credential_pool.PROVIDER_REGISTRY", {"opencode-go": pconfig}):
             changed, _ = _seed_from_env("opencode-go", entries)
@@ -250,19 +250,19 @@ class TestSeedFromEnvRespectsExistingPoolEntries:
         # Start clean: remove .env, clear os.environ var
         (home / ".env").write_text("", encoding="utf-8")
         invalidate_env_cache()
-        monkeypatch.delenv("OPENCODE_GO_API_KEY2", raising=False)
+        monkeypatch.delenv("PROVIDER_API_KEY_2", raising=False)
         # Ensure .env does not contain the key, and os.environ does not either
-        assert get_secret("OPENCODE_GO_API_KEY2", "") in ("", None)  # no scope yet, no env -> empty (multiplex inactive atm)
+        assert get_secret("PROVIDER_API_KEY_2", "") in ("", None)  # no scope yet, no env -> empty (multiplex inactive atm)
         # Activate multiplex and install a scope that DOES contain the key
         set_multiplex_active(True)
-        scope = {"OPENCODE_GO_API_KEY2": SYN_SECONDARY, "OPENCODE_GO_API_KEY": SYN_PRIMARY}
+        scope = {"PROVIDER_API_KEY_2": SYN_SECONDARY, "PROVIDER_API_KEY": SYN_PRIMARY}
         tok = set_secret_scope(scope)
         try:
             # Now get_env_prefer_dotenv should resolve via scope
             from agent.credential_pool import get_env_prefer_dotenv
-            assert get_env_prefer_dotenv("OPENCODE_GO_API_KEY2") == SYN_SECONDARY
+            assert get_env_prefer_dotenv("PROVIDER_API_KEY_2") == SYN_SECONDARY
             # Seed again with fresh entry (existing token empty)
-            e2 = PooledCredential(provider="opencode-go", id="sec2b", label="secondary", auth_type="api_key", priority=1, source="env:OPENCODE_GO_API_KEY2", access_token="")
+            e2 = PooledCredential(provider="opencode-go", id="sec2b", label="secondary", auth_type="api_key", priority=1, source="env:PROVIDER_API_KEY_2", access_token="")
             entries2 = [e2]
             with patch("agent.credential_pool.PROVIDER_REGISTRY", {"opencode-go": pconfig}):
                 changed2, _ = _seed_from_env("opencode-go", entries2)
@@ -279,60 +279,60 @@ class TestSeedFromEnvRespectsExistingPoolEntries:
         # This proves we route through get_secret, not raw os.environ.get.
         _write_env_file(home, **{})  # empty .env
         # Put the secret ONLY in real os.environ (bypass the scope)
-        os.environ["OPENCODE_GO_API_KEY2"] = SYN_EXTRA
+        os.environ["PROVIDER_API_KEY_2"] = SYN_EXTRA
         set_multiplex_active(True)
-        tok2 = set_secret_scope({"OPENCODE_GO_API_KEY": SYN_PRIMARY})  # scope lacks KEY2
+        tok2 = set_secret_scope({"PROVIDER_API_KEY": SYN_PRIMARY})  # scope lacks KEY2
         try:
             from agent.credential_pool import get_env_prefer_dotenv
             # Should NOT see the os.environ value because multiplex-active + scope miss is fail-closed
-            resolved = get_env_prefer_dotenv("OPENCODE_GO_API_KEY2")
+            resolved = get_env_prefer_dotenv("PROVIDER_API_KEY_2")
             assert resolved == "" or resolved is None or resolved == "", f"expected empty, got {resolved!r} — direct os.environ bypass!"
-            e3 = PooledCredential(provider="opencode-go", id="sec3", label="secondary", auth_type="api_key", priority=1, source="env:OPENCODE_GO_API_KEY2", access_token="")
+            e3 = PooledCredential(provider="opencode-go", id="sec3", label="secondary", auth_type="api_key", priority=1, source="env:PROVIDER_API_KEY_2", access_token="")
             entries3 = [e3]
             with patch("agent.credential_pool.PROVIDER_REGISTRY", {"opencode-go": pconfig}):
                 changed3, active3 = _seed_from_env("opencode-go", entries3)
             # Secondary must remain empty — proves no direct os.environ bypass.
             # Primary may be seeded (it is in scope) even when secondary is not.
-            assert "env:OPENCODE_GO_API_KEY2" not in active3, f"secondary should not be in active_sources, got {active3!r}"
+            assert "env:PROVIDER_API_KEY_2" not in active3, f"secondary should not be in active_sources, got {active3!r}"
             # Find secondary entry — it should still be empty
-            sec_entry = next((e for e in entries3 if e.source == "env:OPENCODE_GO_API_KEY2"), None)
+            sec_entry = next((e for e in entries3 if e.source == "env:PROVIDER_API_KEY_2"), None)
             assert sec_entry is not None
             assert sec_entry.access_token == "", f"secondary leaked via os.environ bypass: {sec_entry.access_token!r}"
         finally:
             reset_secret_scope(tok2)
             set_multiplex_active(False)
-            os.environ.pop("OPENCODE_GO_API_KEY2", None)
+            os.environ.pop("PROVIDER_API_KEY_2", None)
             invalidate_env_cache()
 
     def test_duplicate_registry_source_rows_do_not_multiply(self, isolated_hermes_home):
         """If the registry declares a VAR and the pool also has it, no duplicate is created."""
         from agent.credential_pool import PooledCredential, _seed_from_env
-        _write_env_file(isolated_hermes_home, OPENCODE_GO_API_KEY=SYN_PRIMARY, OPENCODE_GO_API_KEY2=SYN_SECONDARY)
-        pconfig = _make_pconfig("opencode-go", ["OPENCODE_GO_API_KEY"])
-        existing = PooledCredential(provider="opencode-go", id="prim1234", label="primary", auth_type="api_key", priority=0, source="env:OPENCODE_GO_API_KEY", access_token="")
-        e2 = PooledCredential(provider="opencode-go", id="sec1234", label="secondary", auth_type="api_key", priority=1, source="env:OPENCODE_GO_API_KEY2", access_token="")
+        _write_env_file(isolated_hermes_home, PROVIDER_API_KEY=SYN_PRIMARY, PROVIDER_API_KEY_2=SYN_SECONDARY)
+        pconfig = _make_pconfig("opencode-go", ["PROVIDER_API_KEY"])
+        existing = PooledCredential(provider="opencode-go", id="prim1234", label="primary", auth_type="api_key", priority=0, source="env:PROVIDER_API_KEY", access_token="")
+        e2 = PooledCredential(provider="opencode-go", id="sec1234", label="secondary", auth_type="api_key", priority=1, source="env:PROVIDER_API_KEY_2", access_token="")
         # Also add a duplicate of the secondary source (simulating a corrupted pool with two same-source rows)
-        dup = PooledCredential(provider="opencode-go", id="dup999", label="duplicate-secondary", auth_type="api_key", priority=2, source="env:OPENCODE_GO_API_KEY2", access_token="")
+        dup = PooledCredential(provider="opencode-go", id="dup999", label="duplicate-secondary", auth_type="api_key", priority=2, source="env:PROVIDER_API_KEY_2", access_token="")
         entries = [existing, e2, dup]
         with patch("agent.credential_pool.PROVIDER_REGISTRY", {"opencode-go": pconfig}):
             changed, active_sources = _seed_from_env("opencode-go", entries)
         assert changed is True
-        assert "env:OPENCODE_GO_API_KEY" in active_sources
-        assert "env:OPENCODE_GO_API_KEY2" in active_sources
-        # No extra env var entries — env:OPENCODE_GO_API_KEY2 appears once in active_sources
+        assert "env:PROVIDER_API_KEY" in active_sources
+        assert "env:PROVIDER_API_KEY_2" in active_sources
+        # No extra env var entries — env:PROVIDER_API_KEY_2 appears once in active_sources
         # and the pool should have been de-duplicated to one entry per source by _upsert logic.
         # Count entries per source after seeding
         deduped_sources = [e.source for e in entries]
         # _upsert_entry de-duplicates same-source rows, keeping first; second duplicate should have been removed on first upsert that touched that source
         # So we expect at most 2 entries (primary + secondary), not 3
-        assert deduped_sources.count("env:OPENCODE_GO_API_KEY2") == 1, f"duplicate source not deduped: {deduped_sources!r}"
-        assert deduped_sources.count("env:OPENCODE_GO_API_KEY") == 1
+        assert deduped_sources.count("env:PROVIDER_API_KEY_2") == 1, f"duplicate source not deduped: {deduped_sources!r}"
+        assert deduped_sources.count("env:PROVIDER_API_KEY") == 1
 
     def test_manual_source_entry_not_touched_by_seed(self, isolated_hermes_home):
         """Manual entries in auth.json must not be re-seeded from env vars."""
         from agent.credential_pool import PooledCredential, _seed_from_env
-        _write_env_file(isolated_hermes_home, OPENCODE_GO_API_KEY=SYN_PRIMARY)
-        pconfig = _make_pconfig("opencode-go", ["OPENCODE_GO_API_KEY"])
+        _write_env_file(isolated_hermes_home, PROVIDER_API_KEY=SYN_PRIMARY)
+        pconfig = _make_pconfig("opencode-go", ["PROVIDER_API_KEY"])
         manual = PooledCredential(provider="opencode-go", id="man1234", label="manual", auth_type="api_key", priority=0, source="manual", access_token=SYN_MANUAL)
         entries = [manual]
         with patch("agent.credential_pool.PROVIDER_REGISTRY", {"opencode-go": pconfig}):
@@ -344,13 +344,13 @@ class TestSeedFromEnvRespectsExistingPoolEntries:
     def test_env_source_entry_with_no_env_value_unchanged(self, isolated_hermes_home):
         """An env-source entry whose env var is unset stays empty and unavailable."""
         from agent.credential_pool import PooledCredential, _seed_from_env
-        pconfig = _make_pconfig("opencode-go", ["OPENCODE_GO_API_KEY"])
-        secondary = PooledCredential(provider="opencode-go", id="sec1234", label="secondary", auth_type="api_key", priority=1, source="env:OPENCODE_GO_API_KEY2", access_token="")
+        pconfig = _make_pconfig("opencode-go", ["PROVIDER_API_KEY"])
+        secondary = PooledCredential(provider="opencode-go", id="sec1234", label="secondary", auth_type="api_key", priority=1, source="env:PROVIDER_API_KEY_2", access_token="")
         entries = [secondary]
         with patch("agent.credential_pool.PROVIDER_REGISTRY", {"opencode-go": pconfig}):
             changed, _ = _seed_from_env("opencode-go", entries)
         assert changed is False
-        populated = next((e for e in entries if e.source == "env:OPENCODE_GO_API_KEY2"), None)
+        populated = next((e for e in entries if e.source == "env:PROVIDER_API_KEY_2"), None)
         assert populated is not None
         assert populated.access_token == ""
         # Also verify it is considered unavailable (filtered by _available_entries)
@@ -366,12 +366,12 @@ class TestSeedFromEnvRespectsExistingPoolEntries:
         monkeypatch.setenv("HERMES_HOME", str(home))
         from hermes_cli.config import invalidate_env_cache
         invalidate_env_cache()
-        _write_env_file(home, OPENCODE_GO_API_KEY=SYN_PRIMARY, OPENCODE_GO_API_KEY2=SYN_SECONDARY, OPENCODE_GO_API_KEY3=SYN_TERTIARY)
+        _write_env_file(home, PROVIDER_API_KEY=SYN_PRIMARY, PROVIDER_API_KEY_2=SYN_SECONDARY, PROVIDER_API_KEY_3=SYN_TERTIARY)
         _write_auth(home, {
             "opencode-go": [
-                {"id": "pri1", "label": "primary", "auth_type": "api_key", "priority": 0, "source": "env:OPENCODE_GO_API_KEY", "access_token": ""},
-                {"id": "sec2", "label": "secondary", "auth_type": "api_key", "priority": 1, "source": "env:OPENCODE_GO_API_KEY2", "access_token": ""},
-                {"id": "ter3", "label": "tertiary", "auth_type": "api_key", "priority": 2, "source": "env:OPENCODE_GO_API_KEY3", "access_token": ""},
+                {"id": "pri1", "label": "primary", "auth_type": "api_key", "priority": 0, "source": "env:PROVIDER_API_KEY", "access_token": ""},
+                {"id": "sec2", "label": "secondary", "auth_type": "api_key", "priority": 1, "source": "env:PROVIDER_API_KEY_2", "access_token": ""},
+                {"id": "ter3", "label": "tertiary", "auth_type": "api_key", "priority": 2, "source": "env:PROVIDER_API_KEY_3", "access_token": ""},
             ]
         })
         # Also test dedup + manual mix in same file — manual should keep its token on disk (it is not borrowed)
@@ -403,25 +403,25 @@ class TestSeedFromEnvRespectsExistingPoolEntries:
     def test_no_pool_entries_unchanged_behavior(self, isolated_hermes_home):
         """If auth.json has no env-source entries, behavior matches pre-fix (only registry tuple)."""
         from agent.credential_pool import _seed_from_env
-        _write_env_file(isolated_hermes_home, OPENCODE_GO_API_KEY=SYN_PRIMARY)
-        pconfig = _make_pconfig("opencode-go", ["OPENCODE_GO_API_KEY"])
+        _write_env_file(isolated_hermes_home, PROVIDER_API_KEY=SYN_PRIMARY)
+        pconfig = _make_pconfig("opencode-go", ["PROVIDER_API_KEY"])
         with patch("agent.credential_pool.PROVIDER_REGISTRY", {"opencode-go": pconfig}):
             changed, active_sources = _seed_from_env("opencode-go", [])
         assert changed is True
-        assert "env:OPENCODE_GO_API_KEY" in active_sources
-        assert "env:OPENCODE_GO_API_KEY2" not in active_sources
+        assert "env:PROVIDER_API_KEY" in active_sources
+        assert "env:PROVIDER_API_KEY_2" not in active_sources
 
     def test_env_var_name_extraction_handles_empty_suffix(self, isolated_hermes_home):
         """A malformed source 'env:' with empty var name must not be treated as env var."""
         from agent.credential_pool import PooledCredential, _seed_from_env
-        _write_env_file(isolated_hermes_home, OPENCODE_GO_API_KEY=SYN_PRIMARY)
-        pconfig = _make_pconfig("opencode-go", ["OPENCODE_GO_API_KEY"])
+        _write_env_file(isolated_hermes_home, PROVIDER_API_KEY=SYN_PRIMARY)
+        pconfig = _make_pconfig("opencode-go", ["PROVIDER_API_KEY"])
         malformed = PooledCredential(provider="opencode-go", id="bad1", label="bad", auth_type="api_key", priority=0, source="env:", access_token="")
         entries = [malformed]
         with patch("agent.credential_pool.PROVIDER_REGISTRY", {"opencode-go": pconfig}):
             changed, active_sources = _seed_from_env("opencode-go", entries)
         # Should still seed the registry var, but not crash or add empty env var
-        assert "env:OPENCODE_GO_API_KEY" in active_sources
+        assert "env:PROVIDER_API_KEY" in active_sources
         assert "" not in active_sources
         assert "env:" not in active_sources
         # Malformed entry stays empty

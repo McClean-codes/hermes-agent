@@ -2658,7 +2658,7 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
         env_vars = ["ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"]
 
     # Also seed any env-source pool entries already on disk that aren't in
-    # the registry's tuple. A user can put `source: env:OPENCODE_GO_API_KEY2`
+    # the registry's tuple. A user can put `source: env:PROVIDER_API_KEY_2`
     # in auth.json expecting it to be picked up from the environment; the
     # registry only declares the primary env var, so this loop fills the
     # gap and keeps multi-key rotation working without per-provider code.
