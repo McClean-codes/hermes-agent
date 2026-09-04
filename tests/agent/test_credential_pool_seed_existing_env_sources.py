@@ -68,14 +68,18 @@ def isolated_hermes_home(tmp_path, monkeypatch):
     from hermes_cli.config import invalidate_env_cache
     invalidate_env_cache()
     # Ensure the credential-shaped envs from conftest are blank (they are by default)
+    # Clear generic placeholders explicitly; also clear any remaining
+    # credential-shaped variables via bounded suffix/pattern without naming providers.
     for key in [
-        "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "OPENROUTER_API_KEY",
-        "ZAI_API_KEY", "DEEPSEEK_API_KEY", "ANTHROPIC_TOKEN",
-        "CLAUDE_CODE_OAUTH_TOKEN", "PROVIDER_API_KEY",
-        "PROVIDER_API_KEY_2", "PROVIDER_API_KEY_3", "PROVIDER_API_KEY_4",
-        "OPENAI_BASE_URL",
+        "PROVIDER_API_KEY",
+        "PROVIDER_API_KEY_2",
+        "PROVIDER_API_KEY_3",
+        "PROVIDER_API_KEY_4",
     ]:
         monkeypatch.delenv(key, raising=False)
+    for key in list(os.environ.keys()):
+        if "_API_KEY" in key or key.endswith("_TOKEN") or key.endswith("_BASE_URL"):
+            monkeypatch.delenv(key, raising=False)
     # Guarantee no stray secret scope from prior test
     try:
         from agent.secret_scope import set_secret_scope, set_multiplex_active
