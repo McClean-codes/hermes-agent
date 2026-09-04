@@ -61,7 +61,7 @@ def _redact_progress_text(text: str | None) -> str:
             return _redact_gateway_user_facing_secrets(s)
         except Exception:
             logger.debug("progress redaction unavailable", exc_info=True)
-            return s
+            return "[REDACTED]"
 
 # ---- progress filter helpers (per-tool + category) ---------------------------
 # Category aliases supported in display.tool_progress_filter keys. Normalized to lower case.

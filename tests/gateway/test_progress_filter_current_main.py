@@ -645,7 +645,7 @@ class TestImportantOutputDelivery:
             run_mod.safe_schedule_threadsafe = orig  # type: ignore[assignment]
 
     def test_error_result_not_suppressed(self):
-        # Errors/results must still be delivered even when progress for that tool is off – prove via real TurnRunner ledgers
+        # Errors/results must still be delivered even when progress for that tool is off – via real TurnRunner terminalization
         pq = queue.Queue()
         lq = queue.Queue()
         ctx = TurnContext(
@@ -683,67 +683,74 @@ class TestImportantOutputDelivery:
         from gateway.run_turn_runner import TurnRunner
         runner = TurnRunner(StubRunner(), ctx)  # type: ignore[arg-type]
         runner.progress_callback("tool.started", "terminal", "ls", {"command": "ls"})
-        assert pq.empty()
-        # Simulate a tool error result arriving via the production result_holder ledger
-        error_payload = {"tool": "terminal", "is_error": True, "result": "permission denied"}
-        ctx.result_holder[0] = error_payload
-        # Filter must not have cleared or blocked the result ledger
+        assert pq.empty(), "filtered progress must not appear"
+        # Deliver error via the authoritative TurnRunner terminalization seam (not direct holder assignment)
+        error_payload = {"tool": "terminal", "is_error": True, "result": "permission denied", "final_response": "error: permission denied", "failed": True, "messages": [], "api_calls": 0}
+        runner._finish_stream_consumer(error_payload, agent_history=[], stream_consumer=None)
         assert ctx.result_holder[0] is error_payload
         assert ctx.result_holder[0]["is_error"] is True
-        # Also prove error status text is still preparable via production gateway helper
+        assert "permission denied" in ctx.result_holder[0]["result"]
+        assert pq.empty(), "progress queue must stay empty after error terminalization"
+        # Error notice path still preparable via production helper
         from gateway.run import _prepare_gateway_status_message
         from unittest.mock import MagicMock as _MM
         msg = _prepare_gateway_status_message(_MM(value="telegram"), "tool.error", "terminal failed: permission denied")
         assert msg is not None
         assert "permission denied" in msg
-        # Tools ledger must also be writable despite filter
-        ctx.tools_holder[0] = [{"name": "terminal", "result": "ok"}]
-        assert ctx.tools_holder[0][0]["name"] == "terminal"
 
     def test_tool_completed_does_not_block_final_reply(self):
-        # Final reply via real gateway delivery must not be suppressed by progress filter – prove via concrete adapter ledger
+        # Final reply via production gateway terminalization must not be suppressed by progress filter
         pq = queue.Queue()
-        captured = []
-        class FakeAdapter:
-            def __init__(self):
-                self.supports_code_blocks = False
-                self.name = "fake"
-                self.MAX_MESSAGE_LENGTH = 4000
-                def _len(s): return len(s)
-                self.message_len_fn = _len
-                self.message_len_fn_for_chat = lambda chat_id: _len
-                self.max_message_length_for_chat = lambda chat_id: 4000
-            async def send(self, chat_id, content, reply_to=None, metadata=None):
-                captured.append(content)
-                m = MagicMock(); m.success=True; m.message_id="mid"; return m
-            async def edit_message(self, **kw):
-                m = MagicMock(); m.success=True; return m
-        fake_adapter = FakeAdapter()
-        ctx = _make_ctx(progress_mode="off", tool_progress_filter={"terminal": "off"})
-        ctx.progress_queue = pq
+        ctx = TurnContext(
+            source=MagicMock(chat_id="c1"),
+            _run_still_current=lambda: True,
+            _live_status_adapter=None,
+            _live_status_mode="off",
+            _thinking_enabled=False,
+            progress_mode="off",
+            progress_grouping="accumulate",
+            tool_progress_enabled=False,
+            tool_progress_filter={"terminal": "off"},
+            progress_queue=pq,
+            log_queue=None,
+            last_progress_msg=[None],
+            last_tool=[None],
+            last_was_terminal_block=[False],
+            repeat_count=[0],
+            long_tool_hint_fired=[False],
+            agent_holder=[None],
+            _native_slack_task_cards=False,
+            result_holder=[None],
+            tools_holder=[None],
+            stream_consumer_holder=[None],
+            streaming_tts_consumer_holder=[None],
+        )
         from gateway.run_turn_runner import TurnRunner
-        class StubRunner2:
-            def _adapter_for_source(self, s):
-                return fake_adapter
-            async def _deliver_platform_notice(self, src, content):
-                captured.append(content)
-                return None
-        runner = TurnRunner(StubRunner2(), ctx)  # type: ignore[arg-type]
-        runner.progress_callback("tool.started", "terminal", "ls", {"command": "ls"})
-        assert pq.empty()
-        # Now simulate final response delivery through the real gateway sanitizer and adapter ledger
         from gateway.config import Platform
         from gateway.run import _sanitize_gateway_final_response
+
+        class StubRunner:
+            def _adapter_for_source(self, s):
+                m = MagicMock()
+                m.supports_code_blocks = False
+                m.format_tool_preview = lambda x, **kw: x.text if hasattr(x, "text") else str(x)
+                return m
+
+        runner = TurnRunner(StubRunner(), ctx)  # type: ignore[arg-type]
+        runner.progress_callback("tool.started", "terminal", "ls", {"command": "ls"})
+        assert pq.empty(), "progress for filtered tool must be suppressed"
         final_text = "Hello final reply"
         sanitized = _sanitize_gateway_final_response(Platform.TELEGRAM, final_text)
         assert sanitized == final_text
-        # Ledger proof: final text would be sent via adapter and must not be blocked by filter
-        captured.append(sanitized)
-        assert captured[-1] == "Hello final reply"
-        assert pq.empty()  # progress still empty, final ledger has content
-        # Also prove that a tool completion event does not clear the final ledger
+        # Deliver final via the authoritative TurnRunner terminalization seam (not manual ledger append)
+        result = {"final_response": sanitized, "messages": [], "failed": False, "completed": True, "api_calls": 0}
+        runner._finish_stream_consumer(result, agent_history=[], stream_consumer=None)
+        assert ctx.result_holder[0] is result
+        assert ctx.result_holder[0]["final_response"] == "Hello final reply"
+        assert pq.empty(), "progress must stay empty after final delivery"
         runner.progress_callback("tool.completed", "terminal", None, {})
-        assert captured[-1] == "Hello final reply"
+        assert ctx.result_holder[0]["final_response"] == "Hello final reply", "tool completion must not clear final ledger"
+        assert pq.empty()
 
     def test_thinking_still_gated_separately(self):
         ctx = _make_ctx(progress_mode="off", tool_progress_filter={"terminal": "all"}, thinking_enabled=True)
@@ -1192,6 +1199,34 @@ class TestProgressRedactionBoundary:
         msgs = _drain(ctx.progress_queue)
         assert len(msgs) == 1
         assert "README" in str(msgs[0])
+
+    def test_redaction_fail_closed_when_both_paths_raise(self):
+        # Fail-closed: when authoritative and fallback redactors both raise, outbound must be safe placeholder, never raw
+        raw = "ghp_" + "A" * 30  # 34-char credential-shaped marker as in Sherlock probe
+        from agent.redact import redact_sensitive_text
+        assert redact_sensitive_text(raw, force=True) != raw, "marker must be recognized"
+        ctx = _make_ctx(progress_mode="all", tool_progress_filter={"terminal": "all"})
+        runner = _make_runner(ctx)
+        # Force both redact paths to fail through the real _redact_progress_text / production progress path
+        with patch("agent.redact.redact_sensitive_text", side_effect=RuntimeError("authoritative fail")):
+            with patch("gateway.run._redact_gateway_user_facing_secrets", side_effect=RuntimeError("fallback fail")):
+                runner.progress_callback("tool.started", "terminal", raw, {"command": f"echo {raw} --flag"})
+                msgs = _drain(ctx.progress_queue)
+                assert len(msgs) == 1, f"allowlisted must still produce safe placeholder when redaction fails, got {msgs}"
+                payload = str(msgs[0])
+                assert raw not in payload, f"raw marker leaked in fail-closed path: {payload!r}"
+                assert payload.strip() != ""
+                assert payload != raw
+                # Safe placeholder must be present and must not contain raw
+                assert "[REDACTED]" in payload or "redacted" in payload.lower()
+        # Non-secret allowlisted positive still delivers via intended mode (without forced failure)
+        ctx2 = _make_ctx(progress_mode="all", tool_progress_filter={"terminal": "all"})
+        runner2 = _make_runner(ctx2)
+        runner2.progress_callback("tool.started", "terminal", "hello", {"command": "echo hello world"})
+        msgs2 = _drain(ctx2.progress_queue)
+        assert len(msgs2) == 1
+        assert "hello" in str(msgs2[0]).lower()
+        assert raw not in str(msgs2[0])
 
 
 # ---------------------------------------------------------------------------
