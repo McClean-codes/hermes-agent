@@ -700,7 +700,7 @@ class TestImportantOutputDelivery:
 
     @pytest.mark.asyncio
     async def test_tool_completed_does_not_block_final_reply(self):
-        # Final reply via production gateway delivery must not be suppressed by progress filter
+        # Final reply via production gateway message-handling path to adapter send boundary must not be suppressed
         pq = queue.Queue()
         lq = queue.Queue()
         ctx = TurnContext(
@@ -728,11 +728,12 @@ class TestImportantOutputDelivery:
             streaming_tts_consumer_holder=[None],
         )
         from gateway.run_turn_runner import TurnRunner
-        from gateway.config import Platform, GatewayConfig
+        from gateway.config import Platform, GatewayConfig, PlatformConfig
         from gateway.run import _sanitize_gateway_final_response
-        from gateway.session import SessionSource, SessionEntry
-        from gateway.platforms.base import MessageEvent
-        from datetime import datetime
+        from gateway.session import SessionSource, SessionEntry, build_session_key
+        from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
+        from datetime import datetime, timedelta
+        import os
 
         class StubRunner:
             def _adapter_for_source(self, s):
@@ -746,54 +747,70 @@ class TestImportantOutputDelivery:
         assert pq.empty(), "progress for filtered tool must be suppressed"
         assert lq.empty(), "log rail must stay empty for filtered start"
 
-        # Production gateway final delivery via GatewayTurnMixin with only adapter send controlled
+        # Production gateway final delivery via full message-handling path with only adapter send controlled
         from gateway.run import GatewayRunner
 
         ledger: list[str] = []
-        fake_adapter = MagicMock()
-        fake_adapter.supports_code_blocks = False
-        fake_adapter.format_tool_preview = lambda x, **kw: x.text if hasattr(x, "text") else str(x)
-        fake_adapter._streaming_tts_turn_completed = lambda *a, **kw: False
-        fake_adapter.supports_status_text = False
-        fake_adapter.native_task_cards_enabled = MagicMock(return_value=False)
-        fake_adapter.send = AsyncMock(side_effect=lambda chat_id, content, **kw: ledger.append(content) or MagicMock(success=True))
-        fake_adapter.send_stream_frame = AsyncMock(return_value=True)
-        fake_adapter.edit_message = AsyncMock(return_value=True)
 
-        config = GatewayConfig()
+        class _CaptureTelegramAdapter(BasePlatformAdapter):
+            def __init__(self):
+                super().__init__(PlatformConfig(enabled=True, token="fake-token"), Platform.TELEGRAM)
+
+            async def connect(self, *, is_reconnect: bool = False) -> bool:
+                return True
+
+            async def disconnect(self) -> None:
+                return None
+
+            async def send(self, chat_id, content, reply_to=None, metadata=None):
+                ledger.append(content)
+                return SendResult(success=True, message_id="tg-1")
+
+            async def send_typing(self, chat_id, metadata=None):
+                return None
+
+            async def get_chat_info(self, chat_id):
+                return {"id": chat_id}
+
+        fake_adapter = _CaptureTelegramAdapter()
+        _orig_send = fake_adapter.send
+        fake_adapter.send = AsyncMock(side_effect=_orig_send)
+
+        config = GatewayConfig(platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake-token")})
         gw = object.__new__(GatewayRunner)
         gw.config = config
         gw.adapters = {Platform.TELEGRAM: fake_adapter}
+        gw._voice_mode = {}
         gw._running_agents = {}
         gw._running_agents_ts = {}
         gw._pending_messages = {}
         gw._pending_approvals = {}
         gw._is_user_authorized = lambda _source: True
         gw._set_session_env = lambda _context: None
-        gw._handle_active_session_busy_message = AsyncMock(return_value=False)
+        gw._clear_session_env = lambda _tokens: None
+        gw._is_user_authorized_for_source = lambda _s, **kw: True
         gw._session_db = MagicMock()
-        gw._recover_telegram_topic_thread_id = lambda _source: None
-        gw._cache_session_source = lambda _key, _source: None
-        gw._is_session_run_current = lambda _key, _gen: True
-        gw._begin_session_run_generation = lambda _key: 1
-        gw._reply_anchor_for_event = lambda _event: None
-        gw._get_guild_id = lambda _event: None
-        gw._should_send_voice_reply = lambda *_a, **_kw: False
+        gw._session_db.get_telegram_topic_binding = AsyncMock(return_value=None)
+        gw._session_db.get_compression_tip = AsyncMock(return_value=None)
         gw.hooks = MagicMock()
         gw.hooks.emit = AsyncMock()
-        gw.session_store = MagicMock()
-        gw.session_store.get_or_create_session.return_value = SessionEntry(
+        now = datetime.now()
+        session_entry = SessionEntry(
             session_key="agent:main:telegram:group:-1001:12345",
             session_id="sess-final-1",
-            created_at=datetime.now(),
-            updated_at=datetime.now(),
+            created_at=now - timedelta(seconds=10),
+            updated_at=now,
             platform=Platform.TELEGRAM,
             chat_type="group",
         )
+        gw.session_store = MagicMock()
+        gw.session_store.get_or_create_session.return_value = session_entry
         gw.session_store.load_transcript.return_value = []
+        gw.session_store.has_any_sessions.return_value = True
+        gw.session_store.rewrite_transcript = MagicMock()
         gw.session_store.append_to_transcript = AsyncMock()
-        gw.session_store.has_platform_message_id.return_value = False
         gw.session_store.update_session = AsyncMock()
+        gw.session_store.has_platform_message_id = MagicMock(return_value=False)
         gw.session_store._save = AsyncMock()
         gw.session_store._record_gateway_session_peer = AsyncMock()
         gw._adapter_for_source = lambda source: fake_adapter
@@ -826,30 +843,56 @@ class TestImportantOutputDelivery:
             source=SessionSource(platform=Platform.TELEGRAM, chat_id="-1001", chat_type="group", user_id="12345"),
             message_id="msg-final-1",
         )
-        source = event.source
-        session_entry = gw.session_store.get_or_create_session.return_value
-        session_key = "agent:main:telegram:group:-1001:12345"
-        run_generation = 1
-        agent_messages = mock_agent_result["messages"]
-        delivered = await gw._hmwa_deliver_turn_response(
-            event, source, session_entry, session_key, run_generation,
-            mock_agent_result, agent_messages, sanitized, "", False,
-        )
-        assert delivered == "Hello final reply"
-        delivery_ledger = [delivered] if delivered is not None else ledger
-        assert len(delivery_ledger) == 1
-        assert delivery_ledger[0] == "Hello final reply"
-        assert pq.empty(), "progress must stay empty after final delivery"
-        assert lq.empty(), "log must stay empty after final delivery"
-        runner.progress_callback("tool.completed", "terminal", None, {})
-        assert pq.empty(), "progress must stay empty after tool.completed"
-        assert delivery_ledger == ["Hello final reply"], "tool completion must not duplicate or clear final"
-        delivered2 = await gw._hmwa_deliver_turn_response(
-            event, source, session_entry, session_key, run_generation,
-            mock_agent_result, agent_messages, sanitized, "", False,
-        )
-        assert delivered2 == "Hello final reply"
-        assert delivery_ledger == ["Hello final reply"]
+
+        gw._turn_leases = None
+        gw._session_sources = {}
+        gw._session_sources_max = 512
+        gw._is_session_running = lambda k: False
+        gw._evict_idle_stale_agent = lambda k: None
+        gw._evict_reaped_agent = lambda k: None
+        gw._persist_active_agents = lambda: None
+        gw._is_session_run_current = lambda k, gen: True
+        gw._begin_session_run_generation = lambda k: 1
+        gw._reply_anchor_for_event = lambda e: None
+        gw._get_guild_id = lambda e: None
+        gw._should_send_voice_reply = lambda *a, **kw: False
+        gw._thread_metadata_for_source = lambda s, anchor=None: None
+        gw._event_session_key = lambda e: build_session_key(e.source)
+        gw._event_thread_metadata = lambda e, s: None
+
+        fake_adapter.set_message_handler(gw._handle_message)
+        fake_adapter._keep_typing = lambda *a, **kw: asyncio.Event().wait()
+
+        _orig_home = os.environ.get("TELEGRAM_HOME_CHANNEL")
+        os.environ["TELEGRAM_HOME_CHANNEL"] = "-1001"
+        try:
+            await fake_adapter._process_message_background(event, build_session_key(event.source))
+
+            assert ledger == ["Hello final reply"], f"ledger was {ledger}"
+            assert fake_adapter.send.call_count == 1
+            # Tie ledger payload to the actual send call argument
+            _called = None
+            if fake_adapter.send.call_args is not None:
+                _a, _kw = fake_adapter.send.call_args
+                if len(_a) >= 2:
+                    _called = _a[1]
+                else:
+                    _called = _kw.get("content")
+            assert _called == "Hello final reply"
+            assert ledger[0] == _called
+
+            assert pq.empty(), "progress must stay empty after final delivery"
+            assert lq.empty(), "log must stay empty after final delivery"
+
+            runner.progress_callback("tool.completed", "terminal", None, {})
+            assert pq.empty(), "progress must stay empty after tool.completed"
+            assert ledger == ["Hello final reply"], "tool completion must not duplicate or clear final"
+            assert fake_adapter.send.call_count == 1, "tool.completed must not trigger extra send"
+        finally:
+            if _orig_home is None:
+                os.environ.pop("TELEGRAM_HOME_CHANNEL", None)
+            else:
+                os.environ["TELEGRAM_HOME_CHANNEL"] = _orig_home
 
     def test_thinking_still_gated_separately(self):
         ctx = _make_ctx(progress_mode="off", tool_progress_filter={"terminal": "all"}, thinking_enabled=True)
