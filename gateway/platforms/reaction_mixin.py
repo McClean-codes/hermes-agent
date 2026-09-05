@@ -119,6 +119,11 @@ class DynamicReactionMixin:
         self._rxn_last_swap: Dict[Hashable, float] = {}
         # Per-message lock to serialize reaction swaps (prevents stacking)
         self._rxn_locks: Dict[Hashable, asyncio.Lock] = {}
+        # Retained unconfirmed terminal authority: keys where terminal
+        # completion/cancellation removal was unconfirmed (False/exception).
+        # While retained, a new same-key start must not overwrite authority
+        # before the old remote mutation is reconciled (fail-closed).
+        self._rxn_retained: set = set()
 
         # Resolve config once
         self._rxn_persona_emoji: str = self._rxn_resolve_persona_emoji()
@@ -228,12 +233,19 @@ class DynamicReactionMixin:
             key = self._reaction_msg_key(event)
         except Exception:
             key = None
+        # Fail-closed: if a prior terminal removal is unconfirmed for this key,
+        # reject the new same-key start before any remote mutation, preserving
+        # the old authority/reference for later public reconciliation.
+        if key is not None and key in getattr(self, "_rxn_retained", set()):
+            logger.debug("reaction start deferred for retained key %s", key)
+            return False
         if not self._rxn_reactions_enabled():
             if key is not None:
                 self._rxn_active.pop(key, None)
                 self._rxn_msg_refs.pop(key, None)
                 self._rxn_last_swap.pop(key, None)
                 self._rxn_locks.pop(key, None)
+                getattr(self, "_rxn_retained", set()).discard(key)
             return False
 
         msg_ref = self._reaction_resolve_message(event)
@@ -243,6 +255,7 @@ class DynamicReactionMixin:
                 self._rxn_msg_refs.pop(key, None)
                 self._rxn_last_swap.pop(key, None)
                 self._rxn_locks.pop(key, None)
+                getattr(self, "_rxn_retained", set()).discard(key)
             return False
         if key is None:
             return False
@@ -262,6 +275,7 @@ class DynamicReactionMixin:
                 self._rxn_msg_refs.pop(key, None)
                 self._rxn_last_swap.pop(key, None)
                 self._rxn_locks.pop(key, None)
+                getattr(self, "_rxn_retained", set()).discard(key)
                 return False
         except Exception as e:
             logger.debug("reaction start add failed (%s): %s", translated, e)
@@ -269,6 +283,7 @@ class DynamicReactionMixin:
             self._rxn_msg_refs.pop(key, None)
             self._rxn_last_swap.pop(key, None)
             self._rxn_locks.pop(key, None)
+            getattr(self, "_rxn_retained", set()).discard(key)
             return False
 
         self._rxn_active[key] = translated
@@ -363,6 +378,7 @@ class DynamicReactionMixin:
                 self._rxn_active.pop(key, None)
                 self._rxn_msg_refs.pop(key, None)
                 self._rxn_last_swap.pop(key, None)
+                getattr(self, "_rxn_retained", set()).discard(key)
             self._rxn_locks.pop(key, None)
             return
 
@@ -387,6 +403,7 @@ class DynamicReactionMixin:
                 self._rxn_msg_refs.pop(key, None)
                 self._rxn_last_swap.pop(key, None)
                 self._rxn_locks.pop(key, None)
+                getattr(self, "_rxn_retained", set()).discard(key)
                 return
 
             # Import here to avoid circular imports at module level
@@ -400,14 +417,17 @@ class DynamicReactionMixin:
                             ok = await self._reaction_remove(msg_ref, current)
                         except Exception as e:
                             logger.debug("cancel cleanup remove failed (%s): %s", current, e)
+                            getattr(self, "_rxn_retained", set()).add(key)
                             return
                         if not ok:
                             logger.debug("cancel cleanup remove failed (%s): unconfirmed removal", current)
+                            getattr(self, "_rxn_retained", set()).add(key)
                             return
                 self._rxn_active.pop(key, None)
                 self._rxn_msg_refs.pop(key, None)
                 self._rxn_last_swap.pop(key, None)
                 self._rxn_locks.pop(key, None)
+                getattr(self, "_rxn_retained", set()).discard(key)
                 return
 
             if outcome == ProcessingOutcome.SUCCESS:
@@ -424,6 +444,7 @@ class DynamicReactionMixin:
                 self._rxn_msg_refs.pop(key, None)
                 self._rxn_last_swap.pop(key, None)
                 self._rxn_locks.pop(key, None)
+                getattr(self, "_rxn_retained", set()).discard(key)
                 return
 
             try:
@@ -431,11 +452,13 @@ class DynamicReactionMixin:
                     ok = await self._reaction_set(msg_ref, translated)
                     if not ok:
                         logger.debug("reaction complete set failed (%s -> %s): unconfirmed", current, translated)
+                        getattr(self, "_rxn_retained", set()).add(key)
                         return
                 else:
                     ok = await self._reaction_add(msg_ref, translated)
                     if not ok:
                         logger.debug("reaction complete add failed (%s -> %s): unconfirmed", current, translated)
+                        getattr(self, "_rxn_retained", set()).add(key)
                         return
                     if current and current != translated:
                         remove_ok = await self._reaction_remove(msg_ref, current)
@@ -445,14 +468,17 @@ class DynamicReactionMixin:
                                 current,
                                 translated,
                             )
+                            getattr(self, "_rxn_retained", set()).add(key)
                             return
             except Exception as e:
                 logger.debug("reaction complete swap failed (%s -> %s): %s", current, translated, e)
+                getattr(self, "_rxn_retained", set()).add(key)
                 return
 
             self._rxn_active.pop(key, None)
             self._rxn_msg_refs.pop(key, None)
             self._rxn_last_swap.pop(key, None)
+            getattr(self, "_rxn_retained", set()).discard(key)
 
         # Clean up lock outside the lock itself
         self._rxn_locks.pop(key, None)

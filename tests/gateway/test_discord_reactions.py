@@ -1795,3 +1795,200 @@ async def test_terminal_cancellation_removal_exception_retains_authority():
     await ad.on_processing_complete(src, ProcessingOutcome.CANCELLED)
     assert raw.effective() == set()
     assert key not in ad._rxn_active
+
+
+# ---------------------------------------------------------------------------
+# Same-key after unconfirmed terminal removal — public ledger regressions
+# RXN-REMOVE-003: retained authority must not be overwritten by new start
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_same_key_after_success_removal_false_defers_new_start_and_retains_old():
+    """SUCCESS with removal False retains old; same-key new start must not add and old remains reachable for retry."""
+    cfg = PlatformConfig(enabled=True, token="***")
+    cfg.extra = {"persona_emoji": "🤖", "dynamic_reactions": True, "reaction_cooldown": 0}
+    ad = DiscordAdapter(cfg)
+    ad._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=99999, name="HermesBot"))
+    ad._rxn_cooldown = 0.0
+
+    src = SessionSource(platform=Platform.DISCORD, chat_id="same-success-false", chat_type="dm", user_id="42")
+    raw_old = LedgerMessage(msg_id=93001)
+    evt_old = _make_event("93001", raw_old, source=src)
+    await ad.on_processing_start(evt_old)
+    assert raw_old.ledger() == [("add", "🤖")]
+    assert raw_old.effective() == {"🤖"}
+    with patch("agent.display.get_tool_emoji", return_value="📄"):
+        await ad.on_tool_call_start(src, "read_file")
+    assert raw_old.ledger() == [("add", "🤖"), ("add", "📄"), ("remove", "🤖")]
+    assert raw_old.effective() == {"📄"}
+    key = ad._reaction_msg_key(src)
+
+    # Force terminal SUCCESS removal to be unconfirmed (remove returns False)
+    orig_remove = ad._reaction_remove
+    ad._reaction_remove = AsyncMock(return_value=False)
+    await ad.on_processing_complete(src, ProcessingOutcome.SUCCESS)
+    # Public ledger: persona added but tool not removed => stacked
+    assert raw_old.ledger() == [("add", "🤖"), ("add", "📄"), ("remove", "🤖"), ("add", "🤖")]
+    assert raw_old.effective() == {"🤖", "📄"}
+    # Supplemental: authority retained for later reconciliation, not silently replaced
+    assert key in ad._rxn_active
+    assert key in ad._rxn_msg_refs
+    assert ad._rxn_msg_refs.get(key) is raw_old
+    assert key in getattr(ad, "_rxn_retained", set())
+
+    # Attempt subsequent same-key start on a new message (different raw, same key)
+    raw_new = LedgerMessage(msg_id=93002)
+    evt_new = _make_event("93002", raw_new, source=src)
+    # Even though provider would succeed, the new start must be deferred before any remote add
+    await ad.on_processing_start(evt_new)
+    # Public ledger: new message must have no remote add/set
+    assert raw_new.ledger() == []
+    assert raw_new.effective() == set()
+    # Old remote must remain stacked/effective and reachable
+    assert raw_old.ledger() == [("add", "🤖"), ("add", "📄"), ("remove", "🤖"), ("add", "🤖")]
+    assert raw_old.effective() == {"🤖", "📄"}
+    assert key in ad._rxn_active
+    assert ad._rxn_msg_refs.get(key) is raw_old
+    assert key in getattr(ad, "_rxn_retained", set())
+    # New message's completion must not affect old (no authority for new)
+    await ad.on_processing_complete(evt_new, ProcessingOutcome.SUCCESS)
+    assert raw_old.effective() == {"🤖", "📄"}
+    assert raw_new.ledger() == []
+    assert key in ad._rxn_active
+
+    # Later public reconciliation for the retained old lifecycle with successful provider
+    ad._reaction_remove = orig_remove
+    ad._rxn_cooldown = 0.0
+    await ad.on_processing_complete(src, ProcessingOutcome.SUCCESS)
+    # Old remote must clean correctly: only persona remains
+    assert raw_old.effective() == {"🤖"}
+    # Tracking cleared, retained cleared
+    assert key not in ad._rxn_active
+    assert key not in ad._rxn_msg_refs
+    assert key not in getattr(ad, "_rxn_retained", set())
+    # New message still untouched
+    assert raw_new.ledger() == []
+
+
+@pytest.mark.asyncio
+async def test_same_key_after_success_removal_exception_defers_new_start_and_retains_old():
+    """SUCCESS with removal exception retains old; same-key new start must not overwrite."""
+    cfg = PlatformConfig(enabled=True, token="***")
+    cfg.extra = {"persona_emoji": "🤖", "dynamic_reactions": True, "reaction_cooldown": 0}
+    ad = DiscordAdapter(cfg)
+    ad._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=99999, name="HermesBot"))
+    ad._rxn_cooldown = 0.0
+
+    src = SessionSource(platform=Platform.DISCORD, chat_id="same-success-exc", chat_type="dm", user_id="42")
+    raw_old = LedgerMessage(msg_id=93011)
+    evt_old = _make_event("93011", raw_old, source=src)
+    await ad.on_processing_start(evt_old)
+    with patch("agent.display.get_tool_emoji", return_value="📄"):
+        await ad.on_tool_call_start(src, "read_file")
+    assert raw_old.effective() == {"📄"}
+    key = ad._reaction_msg_key(src)
+
+    orig_remove = ad._reaction_remove
+    ad._reaction_remove = AsyncMock(side_effect=RuntimeError("boom"))
+    await ad.on_processing_complete(src, ProcessingOutcome.SUCCESS)
+    assert raw_old.ledger() == [("add", "🤖"), ("add", "📄"), ("remove", "🤖"), ("add", "🤖")]
+    assert raw_old.effective() == {"🤖", "📄"}
+    assert key in ad._rxn_active
+    assert key in getattr(ad, "_rxn_retained", set())
+
+    raw_new = LedgerMessage(msg_id=93012)
+    evt_new = _make_event("93012", raw_new, source=src)
+    await ad.on_processing_start(evt_new)
+    assert raw_new.ledger() == []
+    assert raw_old.effective() == {"🤖", "📄"}
+    assert ad._rxn_msg_refs.get(key) is raw_old
+
+    ad._reaction_remove = orig_remove
+    await ad.on_processing_complete(src, ProcessingOutcome.SUCCESS)
+    assert raw_old.effective() == {"🤖"}
+    assert key not in ad._rxn_active
+    assert key not in getattr(ad, "_rxn_retained", set())
+    assert raw_new.ledger() == []
+
+
+@pytest.mark.asyncio
+async def test_same_key_after_cancelled_removal_false_defers_new_start_and_retains_old():
+    """CANCELLED with removal False retains old; same-key new start must not add and old remains reachable."""
+    cfg = PlatformConfig(enabled=True, token="***")
+    cfg.extra = {"persona_emoji": "🤖", "dynamic_reactions": True, "reaction_cooldown": 0}
+    ad = DiscordAdapter(cfg)
+    ad._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=99999, name="HermesBot"))
+    ad._rxn_cooldown = 0.0
+
+    src = SessionSource(platform=Platform.DISCORD, chat_id="same-cancel-false", chat_type="dm", user_id="42")
+    raw_old = LedgerMessage(msg_id=93021)
+    evt_old = _make_event("93021", raw_old, source=src)
+    await ad.on_processing_start(evt_old)
+    with patch("agent.display.get_tool_emoji", return_value="📄"):
+        await ad.on_tool_call_start(src, "read_file")
+    assert raw_old.effective() == {"📄"}
+    key = ad._reaction_msg_key(src)
+
+    orig_remove = ad._reaction_remove
+    ad._reaction_remove = AsyncMock(return_value=False)
+    await ad.on_processing_complete(src, ProcessingOutcome.CANCELLED)
+    # CANCELLED should not add, ledger unchanged except no removal
+    assert raw_old.ledger() == [("add", "🤖"), ("add", "📄"), ("remove", "🤖")]
+    assert raw_old.effective() == {"📄"}
+    assert key in ad._rxn_active
+    assert key in getattr(ad, "_rxn_retained", set())
+
+    raw_new = LedgerMessage(msg_id=93022)
+    evt_new = _make_event("93022", raw_new, source=src)
+    await ad.on_processing_start(evt_new)
+    assert raw_new.ledger() == []
+    assert raw_old.effective() == {"📄"}
+    assert ad._rxn_msg_refs.get(key) is raw_old
+
+    ad._reaction_remove = orig_remove
+    await ad.on_processing_complete(src, ProcessingOutcome.CANCELLED)
+    assert raw_old.effective() == set()
+    assert key not in ad._rxn_active
+    assert key not in getattr(ad, "_rxn_retained", set())
+    assert raw_new.ledger() == []
+
+
+@pytest.mark.asyncio
+async def test_same_key_after_cancelled_removal_exception_defers_new_start_and_retains_old():
+    """CANCELLED with removal exception retains old; same-key new start must not overwrite."""
+    cfg = PlatformConfig(enabled=True, token="***")
+    cfg.extra = {"persona_emoji": "🤖", "dynamic_reactions": True, "reaction_cooldown": 0}
+    ad = DiscordAdapter(cfg)
+    ad._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=99999, name="HermesBot"))
+    ad._rxn_cooldown = 0.0
+
+    src = SessionSource(platform=Platform.DISCORD, chat_id="same-cancel-exc", chat_type="dm", user_id="42")
+    raw_old = LedgerMessage(msg_id=93031)
+    evt_old = _make_event("93031", raw_old, source=src)
+    await ad.on_processing_start(evt_old)
+    with patch("agent.display.get_tool_emoji", return_value="📄"):
+        await ad.on_tool_call_start(src, "read_file")
+    assert raw_old.effective() == {"📄"}
+    key = ad._reaction_msg_key(src)
+
+    orig_remove = ad._reaction_remove
+    ad._reaction_remove = AsyncMock(side_effect=RuntimeError("transport"))
+    await ad.on_processing_complete(src, ProcessingOutcome.CANCELLED)
+    assert raw_old.ledger() == [("add", "🤖"), ("add", "📄"), ("remove", "🤖")]
+    assert raw_old.effective() == {"📄"}
+    assert key in ad._rxn_active
+    assert key in getattr(ad, "_rxn_retained", set())
+
+    raw_new = LedgerMessage(msg_id=93032)
+    evt_new = _make_event("93032", raw_new, source=src)
+    await ad.on_processing_start(evt_new)
+    assert raw_new.ledger() == []
+    assert raw_old.effective() == {"📄"}
+    assert ad._rxn_msg_refs.get(key) is raw_old
+
+    ad._reaction_remove = orig_remove
+    await ad.on_processing_complete(src, ProcessingOutcome.CANCELLED)
+    assert raw_old.effective() == set()
+    assert key not in ad._rxn_active
+    assert key not in getattr(ad, "_rxn_retained", set())
+    assert raw_new.ledger() == []
