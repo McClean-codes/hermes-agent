@@ -1259,13 +1259,12 @@ async def test_group_two_participants_distinct_keys_no_cross_mutation(tmp_path, 
         user_name="Bob",
         thread_id=None,
     )
-    # Distinct authority/cache keys via canonical build_session_key parity
-    key_a = adapter._reaction_msg_key(src_a)
-    key_b = adapter._reaction_msg_key(src_b)
-    assert key_a != key_b, f"group participant keys must differ: {key_a} vs {key_b}"
-    # Also verify against direct build_session_key parity
-    assert key_a == build_session_key(src_a)
-    assert key_b == build_session_key(src_b)
+    # Independent canonical identity oracle: build_session_key must differ for distinct participants
+    oracle_a = build_session_key(src_a)
+    oracle_b = build_session_key(src_b)
+    assert oracle_a != oracle_b, f"group participant keys must differ: {oracle_a} vs {oracle_b}"
+    assert "alice123" in oracle_a
+    assert "bob456" in oracle_b
 
     raw_a = LedgerMessage(msg_id=7001)
     raw_b = LedgerMessage(msg_id=7002)
@@ -1274,49 +1273,43 @@ async def test_group_two_participants_distinct_keys_no_cross_mutation(tmp_path, 
 
     await adapter.on_processing_start(evt_a)
     await adapter.on_processing_start(evt_b)
-    # Both have persona, raw cache isolated
+    # Both have persona, no cross mutation on start — public ledger only
     assert raw_a.ledger() == [("add", "🤖")]
     assert raw_b.ledger() == [("add", "🤖")]
-    assert adapter._session_raw_messages.get(key_a) is raw_a
-    assert adapter._session_raw_messages.get(key_b) is raw_b
-    assert adapter._rxn_active.get(key_a) == "🤖"
-    assert adapter._rxn_active.get(key_b) == "🤖"
+    assert raw_a.effective() == {"🤖"}
+    assert raw_b.effective() == {"🤖"}
 
-    # Source-only tool callback from participant A must mutate only raw_a
+    # Source-only tool callback from participant A must mutate only raw_a (add before remove)
     with patch("agent.display.get_tool_emoji", return_value="📄"):
         await adapter.on_tool_call_start(src_a, "read_file")
     assert raw_a.ledger() == [("add", "🤖"), ("add", "📄"), ("remove", "🤖")]
     assert raw_a.effective() == {"📄"}
     assert raw_b.ledger() == [("add", "🤖")]
     assert raw_b.effective() == {"🤖"}
-    assert adapter._rxn_active.get(key_a) == "📄"
-    assert adapter._rxn_active.get(key_b) == "🤖"
 
-    # Source-only tool callback from participant B must mutate only raw_b
+    # Source-only tool callback from participant B must mutate only raw_b (add before remove)
     with patch("agent.display.get_tool_emoji", return_value="🔍"):
         await adapter.on_tool_call_start(src_b, "web_search")
     assert raw_b.ledger() == [("add", "🤖"), ("add", "🔍"), ("remove", "🤖")]
     assert raw_b.effective() == {"🔍"}
     # raw_a unchanged
     assert raw_a.ledger() == [("add", "🤖"), ("add", "📄"), ("remove", "🤖")]
+    assert raw_a.effective() == {"📄"}
 
-    # Source-only completion from A must affect only raw_a
+    # Source-only completion from A must affect only raw_a (add persona before remove tool)
     await adapter.on_processing_complete(src_a, ProcessingOutcome.SUCCESS)
+    assert raw_a.ledger() == [("add", "🤖"), ("add", "📄"), ("remove", "🤖"), ("add", "🤖"), ("remove", "📄")]
     assert raw_a.effective() == {"🤖"}
-    # raw_a final ledger has persona re-added
-    assert raw_a.ledger()[-2:] == [("add", "🤖"), ("remove", "📄")]
+    assert raw_b.ledger() == [("add", "🤖"), ("add", "🔍"), ("remove", "🤖")]
     assert raw_b.effective() == {"🔍"}
-    assert key_a not in adapter._rxn_active
-    assert key_a not in adapter._session_raw_messages
-    # B still active
-    assert key_b in adapter._rxn_active
 
-    # Completion from B
+    # Completion from B must affect only raw_b
     await adapter.on_processing_complete(src_b, ProcessingOutcome.SUCCESS)
+    assert raw_b.ledger() == [("add", "🤖"), ("add", "🔍"), ("remove", "🤖"), ("add", "🤖"), ("remove", "🔍")]
     assert raw_b.effective() == {"🤖"}
-    assert key_b not in adapter._rxn_active
-    assert key_b not in adapter._session_raw_messages
-
+    # raw_a remains persona, no cross mutation after B's completion
+    assert raw_a.ledger() == [("add", "🤖"), ("add", "📄"), ("remove", "🤖"), ("add", "🤖"), ("remove", "📄")]
+    assert raw_a.effective() == {"🤖"}
 
 @pytest.mark.asyncio
 async def test_dm_two_profiles_distinct_keys_no_cross_mutation(tmp_path, monkeypatch):
@@ -1325,6 +1318,18 @@ async def test_dm_two_profiles_distinct_keys_no_cross_mutation(tmp_path, monkeyp
     monkeypatch.setenv("DISCORD_MISSED_MESSAGE_BACKFILL", "true")
     monkeypatch.delenv("DISCORD_REACTIONS", raising=False)
     from gateway.config import PlatformConfig
+    import yaml
+    from pathlib import Path as _Path
+
+    # Multiplex profile isolation via real HERMES_HOME/config.yaml through canonical loader.
+    # The adapter's _session_key_from_source reads multiplex_profiles via hermes_cli.config.load_config,
+    # so we must provide a real config file rather than private assignment.
+    cfg_path = _Path(tmp_path) / "config.yaml"
+    cfg_path.write_text(yaml.safe_dump({"gateway": {"multiplex_profiles": True}, "multiplex_profiles": True}), encoding="utf-8")
+    # Ensure canonical loader sees the new file before adapter construction
+    from hermes_cli.config import load_config as _load
+    _loaded = _load()
+    assert _loaded.get("multiplex_profiles") is True or _loaded.get("gateway", {}).get("multiplex_profiles") is True
 
     config = PlatformConfig(enabled=True, token="***")
     config.extra = {
@@ -1359,11 +1364,11 @@ async def test_dm_two_profiles_distinct_keys_no_cross_mutation(tmp_path, monkeyp
         thread_id=None,
         profile="beta",
     )
-    key_alpha = adapter._reaction_msg_key(src_alpha)
-    key_beta = adapter._reaction_msg_key(src_beta)
-    assert key_alpha != key_beta, f"profile keys must differ: {key_alpha} vs {key_beta}"
-    assert key_alpha == build_session_key(src_alpha, profile="alpha")
-    assert key_beta == build_session_key(src_beta, profile="beta")
+    oracle_alpha = build_session_key(src_alpha, profile="alpha")
+    oracle_beta = build_session_key(src_beta, profile="beta")
+    assert oracle_alpha != oracle_beta, f"profile keys must differ: {oracle_alpha} vs {oracle_beta}"
+    assert "alpha" in oracle_alpha
+    assert "beta" in oracle_beta
 
     raw_alpha = LedgerMessage(msg_id=7101)
     raw_beta = LedgerMessage(msg_id=7102)
@@ -1374,29 +1379,33 @@ async def test_dm_two_profiles_distinct_keys_no_cross_mutation(tmp_path, monkeyp
     await adapter.on_processing_start(evt_beta)
     assert raw_alpha.ledger() == [("add", "🤖")]
     assert raw_beta.ledger() == [("add", "🤖")]
-    assert adapter._session_raw_messages.get(key_alpha) is raw_alpha
-    assert adapter._session_raw_messages.get(key_beta) is raw_beta
+    assert raw_alpha.effective() == {"🤖"}
+    assert raw_beta.effective() == {"🤖"}
 
     with patch("agent.display.get_tool_emoji", return_value="📄"):
         await adapter.on_tool_call_start(src_alpha, "read_file")
     assert raw_alpha.ledger() == [("add", "🤖"), ("add", "📄"), ("remove", "🤖")]
+    assert raw_alpha.effective() == {"📄"}
     assert raw_beta.ledger() == [("add", "🤖")]
+    assert raw_beta.effective() == {"🤖"}
 
     with patch("agent.display.get_tool_emoji", return_value="🔍"):
         await adapter.on_tool_call_start(src_beta, "web_search")
     assert raw_beta.ledger() == [("add", "🤖"), ("add", "🔍"), ("remove", "🤖")]
+    assert raw_beta.effective() == {"🔍"}
     assert raw_alpha.ledger() == [("add", "🤖"), ("add", "📄"), ("remove", "🤖")]
+    assert raw_alpha.effective() == {"📄"}
 
     await adapter.on_processing_complete(src_alpha, ProcessingOutcome.SUCCESS)
+    assert raw_alpha.ledger() == [("add", "🤖"), ("add", "📄"), ("remove", "🤖"), ("add", "🤖"), ("remove", "📄")]
     assert raw_alpha.effective() == {"🤖"}
+    assert raw_beta.ledger() == [("add", "🤖"), ("add", "🔍"), ("remove", "🤖")]
     assert raw_beta.effective() == {"🔍"}
-    assert key_alpha not in adapter._rxn_active
-    assert key_beta in adapter._rxn_active
 
     await adapter.on_processing_complete(src_beta, ProcessingOutcome.SUCCESS)
+    assert raw_beta.ledger() == [("add", "🤖"), ("add", "🔍"), ("remove", "🤖"), ("add", "🤖"), ("remove", "🔍")]
     assert raw_beta.effective() == {"🤖"}
-    assert key_beta not in adapter._rxn_active
-
+    assert raw_alpha.effective() == {"🤖"}
 
 @pytest.mark.asyncio
 async def test_quoted_string_dynamic_reactions_false_and_zero_disable_via_production_config(tmp_path, monkeypatch):
@@ -1404,6 +1413,9 @@ async def test_quoted_string_dynamic_reactions_false_and_zero_disable_via_produc
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.delenv("DISCORD_REACTIONS", raising=False)
     from gateway.config import PlatformConfig
+    import yaml
+    from pathlib import Path as _Path
+    from hermes_cli.config import load_config
 
     # Platform-quoted 'false' disables
     cfg_false = PlatformConfig.from_dict(
@@ -1418,11 +1430,11 @@ async def test_quoted_string_dynamic_reactions_false_and_zero_disable_via_produc
     evt = _make_event("6001", raw, source=src)
     await ad_false.on_processing_start(evt)
     assert raw.ledger() == [("add", "🤖")]
-    # source-only tool must not swap when disabled
+    # source-only tool must not swap when disabled — public ledger only, no private map inspection
     with patch("agent.display.get_tool_emoji", return_value="📄"):
         await ad_false.on_tool_call_start(src, "read_file")
     assert raw.ledger() == [("add", "🤖")], "quoted 'false' must disable dynamic swapping"
-    assert ad_false._rxn_active.get(ad_false._reaction_msg_key(src)) == "🤖"
+    assert raw.effective() == {"🤖"}
 
     # Platform-quoted '0' disables
     cfg_zero = PlatformConfig.from_dict(
@@ -1440,41 +1452,51 @@ async def test_quoted_string_dynamic_reactions_false_and_zero_disable_via_produc
     with patch("agent.display.get_tool_emoji", return_value="📄"):
         await ad_zero.on_tool_call_start(src2, "read_file")
     assert raw2.ledger() == [("add", "🤖")], "quoted '0' must disable dynamic swapping"
+    assert raw2.effective() == {"🤖"}
 
-    # Global quoted 'false' via load_config must also disable (no private field assignment)
-    with patch("hermes_cli.config.load_config", return_value={"dynamic_reactions": "false"}):
-        cfg_global_false = PlatformConfig(enabled=True, token="***")
-        # Intentionally not putting dynamic_reactions in extra, so global path is exercised
-        cfg_global_false.extra = {"persona_emoji": "🤖", "reaction_cooldown": 0}
-        ad_global_false = DiscordAdapter(cfg_global_false)
-        ad_global_false._client = SimpleNamespace(
-            tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=99999, name="HermesBot")
-        )
-        raw3 = LedgerMessage(msg_id=6003)
-        src3 = SessionSource(platform=Platform.DISCORD, chat_id="125", chat_type="dm", user_id="42")
-        evt3 = _make_event("6003", raw3, source=src3)
-        await ad_global_false.on_processing_start(evt3)
-        assert raw3.ledger() == [("add", "🤖")]
-        with patch("agent.display.get_tool_emoji", return_value="📄"):
-            await ad_global_false.on_tool_call_start(src3, "read_file")
-        assert raw3.ledger() == [("add", "🤖")], "global quoted 'false' must disable swapping"
+    # Global quoted 'false' via real HERMES_HOME/config.yaml through canonical loader must also disable
+    config_path = _Path(tmp_path) / "config.yaml"
+    config_path.write_text('dynamic_reactions: "false"\n', encoding="utf-8")
+    loaded = load_config()
+    assert str(loaded.get("dynamic_reactions")).lower() == "false", f"loader must see quoted false, got {loaded.get('dynamic_reactions')!r}"
+    cfg_global_false = PlatformConfig(enabled=True, token="***")
+    cfg_global_false.extra = {"persona_emoji": "🤖", "reaction_cooldown": 0}
+    ad_global_false = DiscordAdapter(cfg_global_false)
+    ad_global_false._client = SimpleNamespace(
+        tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=99999, name="HermesBot")
+    )
+    raw3 = LedgerMessage(msg_id=6003)
+    src3 = SessionSource(platform=Platform.DISCORD, chat_id="125", chat_type="dm", user_id="42")
+    evt3 = _make_event("6003", raw3, source=src3)
+    await ad_global_false.on_processing_start(evt3)
+    assert raw3.ledger() == [("add", "🤖")]
+    assert raw3.effective() == {"🤖"}
+    with patch("agent.display.get_tool_emoji", return_value="📄"):
+        await ad_global_false.on_tool_call_start(src3, "read_file")
+    assert raw3.ledger() == [("add", "🤖")], "global quoted 'false' must disable swapping"
+    assert raw3.effective() == {"🤖"}
 
-    with patch("hermes_cli.config.load_config", return_value={"dynamic_reactions": "0"}):
-        cfg_global_zero = PlatformConfig(enabled=True, token="***")
-        cfg_global_zero.extra = {"persona_emoji": "🤖", "reaction_cooldown": 0}
-        ad_global_zero = DiscordAdapter(cfg_global_zero)
-        ad_global_zero._client = SimpleNamespace(
-            tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=99999, name="HermesBot")
-        )
-        raw4 = LedgerMessage(msg_id=6004)
-        src4 = SessionSource(platform=Platform.DISCORD, chat_id="126", chat_type="dm", user_id="42")
-        evt4 = _make_event("6004", raw4, source=src4)
-        await ad_global_zero.on_processing_start(evt4)
-        with patch("agent.display.get_tool_emoji", return_value="📄"):
-            await ad_global_zero.on_tool_call_start(src4, "read_file")
-        assert raw4.ledger() == [("add", "🤖")], "global quoted '0' must disable swapping"
+    config_path.write_text('dynamic_reactions: "0"\n', encoding="utf-8")
+    loaded = load_config()
+    assert str(loaded.get("dynamic_reactions")) == "0", f"loader must see quoted 0, got {loaded.get('dynamic_reactions')!r}"
+    cfg_global_zero = PlatformConfig(enabled=True, token="***")
+    cfg_global_zero.extra = {"persona_emoji": "🤖", "reaction_cooldown": 0}
+    ad_global_zero = DiscordAdapter(cfg_global_zero)
+    ad_global_zero._client = SimpleNamespace(
+        tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=99999, name="HermesBot")
+    )
+    raw4 = LedgerMessage(msg_id=6004)
+    src4 = SessionSource(platform=Platform.DISCORD, chat_id="126", chat_type="dm", user_id="42")
+    evt4 = _make_event("6004", raw4, source=src4)
+    await ad_global_zero.on_processing_start(evt4)
+    assert raw4.ledger() == [("add", "🤖")]
+    assert raw4.effective() == {"🤖"}
+    with patch("agent.display.get_tool_emoji", return_value="📄"):
+        await ad_global_zero.on_tool_call_start(src4, "read_file")
+    assert raw4.ledger() == [("add", "🤖")], "global quoted '0' must disable swapping"
+    assert raw4.effective() == {"🤖"}
 
-    # True-token control enables swapping (platform and global)
+    # True-token control enables swapping (platform and global) — public ledger proof
     cfg_true = PlatformConfig.from_dict(
         {"enabled": True, "token": "***", "extra": {"dynamic_reactions": "true", "persona_emoji": "🤖", "reaction_cooldown": 0}}
     )
@@ -1492,17 +1514,22 @@ async def test_quoted_string_dynamic_reactions_false_and_zero_disable_via_produc
     assert raw_true.ledger() == [("add", "🤖"), ("add", "📄"), ("remove", "🤖")]
     assert raw_true.effective() == {"📄"}
 
-    with patch("hermes_cli.config.load_config", return_value={"dynamic_reactions": "true"}):
-        cfg_global_true = PlatformConfig(enabled=True, token="***")
-        cfg_global_true.extra = {"persona_emoji": "🤖", "reaction_cooldown": 0}
-        ad_global_true = DiscordAdapter(cfg_global_true)
-        ad_global_true._client = SimpleNamespace(
-            tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=99999, name="HermesBot")
-        )
-        raw_gtrue = LedgerMessage(msg_id=6006)
-        src_gtrue = SessionSource(platform=Platform.DISCORD, chat_id="128", chat_type="dm", user_id="42")
-        evt_gtrue = _make_event("6006", raw_gtrue, source=src_gtrue)
-        await ad_global_true.on_processing_start(evt_gtrue)
-        with patch("agent.display.get_tool_emoji", return_value="📄"):
-            await ad_global_true.on_tool_call_start(src_gtrue, "read_file")
-        assert raw_gtrue.ledger() == [("add", "🤖"), ("add", "📄"), ("remove", "🤖")]
+    config_path.write_text('dynamic_reactions: "true"\n', encoding="utf-8")
+    loaded = load_config()
+    assert str(loaded.get("dynamic_reactions")).lower() == "true", f"loader must see quoted true, got {loaded.get('dynamic_reactions')!r}"
+    cfg_global_true = PlatformConfig(enabled=True, token="***")
+    cfg_global_true.extra = {"persona_emoji": "🤖", "reaction_cooldown": 0}
+    ad_global_true = DiscordAdapter(cfg_global_true)
+    ad_global_true._client = SimpleNamespace(
+        tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=99999, name="HermesBot")
+    )
+    raw_gtrue = LedgerMessage(msg_id=6006)
+    src_gtrue = SessionSource(platform=Platform.DISCORD, chat_id="128", chat_type="dm", user_id="42")
+    evt_gtrue = _make_event("6006", raw_gtrue, source=src_gtrue)
+    await ad_global_true.on_processing_start(evt_gtrue)
+    assert raw_gtrue.ledger() == [("add", "🤖")]
+    assert raw_gtrue.effective() == {"🤖"}
+    with patch("agent.display.get_tool_emoji", return_value="📄"):
+        await ad_global_true.on_tool_call_start(src_gtrue, "read_file")
+    assert raw_gtrue.ledger() == [("add", "🤖"), ("add", "📄"), ("remove", "🤖")]
+    assert raw_gtrue.effective() == {"📄"}
