@@ -3573,9 +3573,18 @@ class GatewayTurnMixin:
         """Edit the stream consumer's message in place with ``content``; on success mark
         ``response["already_sent"]`` and log ``ok``. ``fail_result`` (None = trust the call) logs a
         returned failure as ``(session, error)``; ``fail_exc`` logs an exception as ``(session, exc)``."""
+        # SEC-PF-STREAMED-FINAL-EDIT-EGRESS — strict URL-aware fail-closed sanitization
+        # after complete final assembly and before every adapter edit/update effect.
+        # Hostile opaque userinfo/query credentials must never reach the ledger.
+        try:
+            from gateway.run import _sanitize_gateway_final_response
+
+            sanitized_content = _sanitize_gateway_final_response(source.platform, content)
+        except Exception:
+            sanitized_content = "[REDACTED]"
         try:
             _res = await _sc.adapter.edit_message(
-                chat_id=source.chat_id, message_id=_sc.message_id, content=content, finalize=True,
+                chat_id=source.chat_id, message_id=_sc.message_id, content=sanitized_content, finalize=True,
             )
         except Exception as _edit_err:
             logger.warning(fail_exc, _sk, _edit_err)

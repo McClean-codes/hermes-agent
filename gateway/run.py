@@ -4429,6 +4429,24 @@ class GatewayRunner(
             _intentional_silence,
         )
 
+    # SEC-PF-STREAMED-FINAL-EDIT-EGRESS — strict sanitization after complete
+    # final assembly and before every adapter edit/update effect. This override
+    # ensures the streamed final/edit/update reconciliation path cannot bypass
+    # the same strict URL-aware fail-closed sanitizer that protects ordinary
+    # send/retry/fallback. Benign URLs survive; opaque userinfo/query
+    # credentials are masked; both-layer failure yields exact [REDACTED].
+    async def _run_agent_edit_streamed_message(
+        self, _sc, source, response, content, *, _sk, ok, fail_result, fail_exc,
+    ):  # type: ignore[override]
+        try:
+            sanitized_content = _sanitize_gateway_final_response(source.platform, content)
+        except Exception:
+            logger.debug("streamed edit sanitization failed", exc_info=True)
+            sanitized_content = "[REDACTED]"
+        return await super()._run_agent_edit_streamed_message(  # type: ignore[misc]
+            _sc, source, response, sanitized_content, _sk=_sk, ok=ok, fail_result=fail_result, fail_exc=fail_exc,
+        )
+
     async def _handle_message_with_agent(
         self, event, source, _quick_key: str, run_generation: int
     ):  # type: ignore[override]
