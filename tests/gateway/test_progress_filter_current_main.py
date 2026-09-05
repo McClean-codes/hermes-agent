@@ -4467,8 +4467,8 @@ class TestNativeEnabledFinalDelivery:
                     await asyncio.sleep(0.4)
                     assert fake_adapter.send.call_count == prev_send, "tool.completed produced duplicate final send"
                     assert len(ledger) == prev_ledger_len
-                    assert len(native_ledger) == prev_native_len or len(native_ledger) == prev_native_len + 1 or len(native_ledger) >= 1
-                    assert fake_adapter.send_native_task_card_progress.call_count == prev_native or fake_adapter.send_native_task_card_progress.call_count == prev_native + 1  # type: ignore[attr-defined]
+                    assert len(native_ledger) == prev_native_len
+                    assert fake_adapter.send_native_task_card_progress.call_count == prev_native  # type: ignore[attr-defined]
             finally:
                 if _orig_home is None:
                     os.environ.pop("SLACK_HOME_CHANNEL", None)
