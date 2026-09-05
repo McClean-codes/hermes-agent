@@ -2229,3 +2229,444 @@ async def test_rejected_completion_authority_binding_cancelled_exception():
     assert key not in ad._rxn_active
     assert key not in getattr(ad, "_rxn_retained", set())
     assert raw_new.ledger() == []
+
+
+# ---------------------------------------------------------------------------
+# Strict raw lifecycle authority — same-ID and missing-capability regressions
+# ---------------------------------------------------------------------------
+
+class _MissingCapMessage:
+    """Distinct raw object lacking add_reaction capability for Raven bypass repro."""
+    def __init__(self, msg_id):
+        self.id = msg_id
+        self._ledger = []
+        self._effective = set()
+    def ledger(self):
+        return list(self._ledger)
+    def effective(self):
+        return set(self._effective)
+
+
+@pytest.mark.asyncio
+async def test_strict_same_id_success_false():
+    """SUCCESS false: same-ID distinct raw must not mutate old while failing and after recovery; original retry reconciles."""
+    cfg = PlatformConfig(enabled=True, token="***")
+    cfg.extra = {"persona_emoji": "🤖", "dynamic_reactions": True, "reaction_cooldown": 0}
+    ad = DiscordAdapter(cfg)
+    ad._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=99999, name="HermesBot"))
+    ad._rxn_cooldown = 0.0
+    src = SessionSource(platform=Platform.DISCORD, chat_id="strict-same-success-false", chat_type="dm", user_id="42")
+    raw_old = LedgerMessage(msg_id=96101)
+    evt_old = _make_event("96101", raw_old, source=src)
+    await ad.on_processing_start(evt_old)
+    assert raw_old.ledger() == [("add", "🤖")]
+    with patch("agent.display.get_tool_emoji", return_value="📄"):
+        await ad.on_tool_call_start(src, "read_file")
+    assert raw_old.ledger() == [("add", "🤖"), ("add", "📄"), ("remove", "🤖")]
+    assert raw_old.effective() == {"📄"}
+    key = ad._reaction_msg_key(src)
+    orig_remove = ad._reaction_remove
+    orig_add = ad._reaction_add
+    ad._reaction_remove = AsyncMock(return_value=False)
+    await ad.on_processing_complete(evt_old, ProcessingOutcome.SUCCESS)
+    assert raw_old.ledger() == [("add", "🤖"), ("add", "📄"), ("remove", "🤖"), ("add", "🤖")]
+    assert raw_old.effective() == {"🤖", "📄"}
+    assert key in ad._rxn_active
+    assert ad._rxn_msg_refs.get(key) is raw_old
+    assert key in getattr(ad, "_rxn_retained", set())
+    raw_new = LedgerMessage(msg_id=96101)
+    assert raw_new is not raw_old
+    assert str(raw_new.id) == str(raw_old.id)
+    evt_new = _make_event("96101", raw_new, source=src)
+    await ad.on_processing_start(evt_new)
+    assert raw_new.ledger() == []
+    assert raw_new.effective() == set()
+    assert ad._rxn_msg_refs.get(key) is raw_old
+    snapshot = list(raw_old.ledger())
+    await ad.on_processing_complete(evt_new, ProcessingOutcome.SUCCESS)
+    assert raw_old.ledger() == snapshot, "same-ID rejected SUCCESS while still failing must not mutate old"
+    assert raw_new.ledger() == []
+    assert raw_new.effective() == set()
+    assert key in ad._rxn_active
+    assert ad._rxn_msg_refs.get(key) is raw_old
+    assert key in getattr(ad, "_rxn_retained", set())
+    ad._reaction_remove = orig_remove
+    ad._reaction_add = orig_add
+    snapshot2 = list(raw_old.ledger())
+    await ad.on_processing_complete(evt_new, ProcessingOutcome.SUCCESS)
+    assert raw_old.ledger() == snapshot2, "same-ID rejected SUCCESS after recovery must not mutate old"
+    assert raw_new.ledger() == []
+    assert raw_new.effective() == set()
+    assert key in ad._rxn_active
+    assert ad._rxn_msg_refs.get(key) is raw_old
+    assert key in getattr(ad, "_rxn_retained", set())
+    await ad.on_processing_complete(evt_old, ProcessingOutcome.SUCCESS)
+    assert raw_old.effective() == {"🤖"}
+    assert ("remove", "📄") in raw_old.ledger()
+    assert key not in ad._rxn_active
+    assert key not in ad._rxn_msg_refs
+    assert key not in getattr(ad, "_rxn_retained", set())
+    assert raw_new.ledger() == []
+
+
+@pytest.mark.asyncio
+async def test_strict_same_id_success_exception():
+    cfg = PlatformConfig(enabled=True, token="***")
+    cfg.extra = {"persona_emoji": "🤖", "dynamic_reactions": True, "reaction_cooldown": 0}
+    ad = DiscordAdapter(cfg)
+    ad._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=99999, name="HermesBot"))
+    ad._rxn_cooldown = 0.0
+    src = SessionSource(platform=Platform.DISCORD, chat_id="strict-same-success-exc", chat_type="dm", user_id="42")
+    raw_old = LedgerMessage(msg_id=96111)
+    evt_old = _make_event("96111", raw_old, source=src)
+    await ad.on_processing_start(evt_old)
+    with patch("agent.display.get_tool_emoji", return_value="📄"):
+        await ad.on_tool_call_start(src, "read_file")
+    key = ad._reaction_msg_key(src)
+    orig_remove = ad._reaction_remove
+    ad._reaction_remove = AsyncMock(side_effect=RuntimeError("boom"))
+    await ad.on_processing_complete(evt_old, ProcessingOutcome.SUCCESS)
+    assert raw_old.ledger() == [("add", "🤖"), ("add", "📄"), ("remove", "🤖"), ("add", "🤖")]
+    assert raw_old.effective() == {"🤖", "📄"}
+    assert key in getattr(ad, "_rxn_retained", set())
+    raw_new = LedgerMessage(msg_id=96111)
+    assert raw_new is not raw_old
+    assert str(raw_new.id) == str(raw_old.id)
+    evt_new = _make_event("96111", raw_new, source=src)
+    await ad.on_processing_start(evt_new)
+    assert raw_new.ledger() == []
+    snapshot = list(raw_old.ledger())
+    await ad.on_processing_complete(evt_new, ProcessingOutcome.SUCCESS)
+    assert raw_old.ledger() == snapshot
+    assert raw_new.ledger() == []
+    assert key in ad._rxn_active
+    ad._reaction_remove = orig_remove
+    snapshot2 = list(raw_old.ledger())
+    await ad.on_processing_complete(evt_new, ProcessingOutcome.SUCCESS)
+    assert raw_old.ledger() == snapshot2
+    assert raw_new.ledger() == []
+    assert key in ad._rxn_active
+    assert key in getattr(ad, "_rxn_retained", set())
+    await ad.on_processing_complete(evt_old, ProcessingOutcome.SUCCESS)
+    assert raw_old.effective() == {"🤖"}
+    assert key not in ad._rxn_active
+    assert key not in getattr(ad, "_rxn_retained", set())
+
+
+@pytest.mark.asyncio
+async def test_strict_same_id_cancelled_false():
+    cfg = PlatformConfig(enabled=True, token="***")
+    cfg.extra = {"persona_emoji": "🤖", "dynamic_reactions": True, "reaction_cooldown": 0}
+    ad = DiscordAdapter(cfg)
+    ad._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=99999, name="HermesBot"))
+    ad._rxn_cooldown = 0.0
+    src = SessionSource(platform=Platform.DISCORD, chat_id="strict-same-cancel-false", chat_type="dm", user_id="42")
+    raw_old = LedgerMessage(msg_id=96121)
+    evt_old = _make_event("96121", raw_old, source=src)
+    await ad.on_processing_start(evt_old)
+    with patch("agent.display.get_tool_emoji", return_value="📄"):
+        await ad.on_tool_call_start(src, "read_file")
+    assert raw_old.effective() == {"📄"}
+    key = ad._reaction_msg_key(src)
+    orig_remove = ad._reaction_remove
+    ad._reaction_remove = AsyncMock(return_value=False)
+    await ad.on_processing_complete(evt_old, ProcessingOutcome.CANCELLED)
+    assert raw_old.ledger() == [("add", "🤖"), ("add", "📄"), ("remove", "🤖")]
+    assert raw_old.effective() == {"📄"}
+    assert key in getattr(ad, "_rxn_retained", set())
+    raw_new = LedgerMessage(msg_id=96121)
+    assert raw_new is not raw_old
+    assert str(raw_new.id) == str(raw_old.id)
+    evt_new = _make_event("96121", raw_new, source=src)
+    await ad.on_processing_start(evt_new)
+    assert raw_new.ledger() == []
+    snapshot = list(raw_old.ledger())
+    await ad.on_processing_complete(evt_new, ProcessingOutcome.CANCELLED)
+    assert raw_old.ledger() == snapshot
+    assert raw_new.ledger() == []
+    assert key in ad._rxn_active
+    ad._reaction_remove = orig_remove
+    snapshot2 = list(raw_old.ledger())
+    await ad.on_processing_complete(evt_new, ProcessingOutcome.CANCELLED)
+    assert raw_old.ledger() == snapshot2
+    assert raw_new.ledger() == []
+    assert key in ad._rxn_active
+    assert key in getattr(ad, "_rxn_retained", set())
+    await ad.on_processing_complete(evt_old, ProcessingOutcome.CANCELLED)
+    assert raw_old.effective() == set()
+    assert key not in ad._rxn_active
+    assert key not in getattr(ad, "_rxn_retained", set())
+
+
+@pytest.mark.asyncio
+async def test_strict_same_id_cancelled_exception():
+    cfg = PlatformConfig(enabled=True, token="***")
+    cfg.extra = {"persona_emoji": "🤖", "dynamic_reactions": True, "reaction_cooldown": 0}
+    ad = DiscordAdapter(cfg)
+    ad._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=99999, name="HermesBot"))
+    ad._rxn_cooldown = 0.0
+    src = SessionSource(platform=Platform.DISCORD, chat_id="strict-same-cancel-exc", chat_type="dm", user_id="42")
+    raw_old = LedgerMessage(msg_id=96131)
+    evt_old = _make_event("96131", raw_old, source=src)
+    await ad.on_processing_start(evt_old)
+    with patch("agent.display.get_tool_emoji", return_value="📄"):
+        await ad.on_tool_call_start(src, "read_file")
+    key = ad._reaction_msg_key(src)
+    orig_remove = ad._reaction_remove
+    ad._reaction_remove = AsyncMock(side_effect=RuntimeError("transport"))
+    await ad.on_processing_complete(evt_old, ProcessingOutcome.CANCELLED)
+    assert raw_old.ledger() == [("add", "🤖"), ("add", "📄"), ("remove", "🤖")]
+    assert raw_old.effective() == {"📄"}
+    assert key in getattr(ad, "_rxn_retained", set())
+    raw_new = LedgerMessage(msg_id=96131)
+    assert raw_new is not raw_old
+    evt_new = _make_event("96131", raw_new, source=src)
+    await ad.on_processing_start(evt_new)
+    assert raw_new.ledger() == []
+    snapshot = list(raw_old.ledger())
+    await ad.on_processing_complete(evt_new, ProcessingOutcome.CANCELLED)
+    assert raw_old.ledger() == snapshot
+    assert raw_new.ledger() == []
+    ad._reaction_remove = orig_remove
+    snapshot2 = list(raw_old.ledger())
+    await ad.on_processing_complete(evt_new, ProcessingOutcome.CANCELLED)
+    assert raw_old.ledger() == snapshot2
+    assert key in getattr(ad, "_rxn_retained", set())
+    await ad.on_processing_complete(evt_old, ProcessingOutcome.CANCELLED)
+    assert raw_old.effective() == set()
+    assert key not in getattr(ad, "_rxn_retained", set())
+
+
+@pytest.mark.asyncio
+async def test_strict_missing_cap_success_false():
+    """SUCCESS false: missing add_reaction distinct raw must not mutate old while failing and after recovery."""
+    cfg = PlatformConfig(enabled=True, token="***")
+    cfg.extra = {"persona_emoji": "🤖", "dynamic_reactions": True, "reaction_cooldown": 0}
+    ad = DiscordAdapter(cfg)
+    ad._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=99999, name="HermesBot"))
+    ad._rxn_cooldown = 0.0
+    src = SessionSource(platform=Platform.DISCORD, chat_id="strict-miss-success-false", chat_type="dm", user_id="42")
+    raw_old = LedgerMessage(msg_id=96201)
+    evt_old = _make_event("96201", raw_old, source=src)
+    await ad.on_processing_start(evt_old)
+    with patch("agent.display.get_tool_emoji", return_value="📄"):
+        await ad.on_tool_call_start(src, "read_file")
+    assert raw_old.effective() == {"📄"}
+    key = ad._reaction_msg_key(src)
+    orig_remove = ad._reaction_remove
+    orig_add = ad._reaction_add
+    ad._reaction_remove = AsyncMock(return_value=False)
+    await ad.on_processing_complete(evt_old, ProcessingOutcome.SUCCESS)
+    assert raw_old.ledger() == [("add", "🤖"), ("add", "📄"), ("remove", "🤖"), ("add", "🤖")]
+    assert raw_old.effective() == {"🤖", "📄"}
+    assert key in getattr(ad, "_rxn_retained", set())
+    raw_new = _MissingCapMessage(msg_id=96201)
+    assert not hasattr(raw_new, "add_reaction")
+    assert str(raw_new.id) == str(raw_old.id)
+    evt_new = _make_event("96201", raw_new, source=src)
+    await ad.on_processing_start(evt_new)
+    assert raw_new.ledger() == []
+    assert ad._rxn_msg_refs.get(key) is raw_old
+    snapshot = list(raw_old.ledger())
+    await ad.on_processing_complete(evt_new, ProcessingOutcome.SUCCESS)
+    assert raw_old.ledger() == snapshot, "missing-cap rejected SUCCESS while still failing must not mutate old"
+    assert raw_new.ledger() == []
+    assert key in ad._rxn_active
+    assert ad._rxn_msg_refs.get(key) is raw_old
+    ad._reaction_remove = orig_remove
+    ad._reaction_add = orig_add
+    snapshot2 = list(raw_old.ledger())
+    await ad.on_processing_complete(evt_new, ProcessingOutcome.SUCCESS)
+    assert raw_old.ledger() == snapshot2, "missing-cap rejected SUCCESS after recovery must not mutate old"
+    assert raw_new.ledger() == []
+    assert key in ad._rxn_active
+    assert ad._rxn_msg_refs.get(key) is raw_old
+    assert key in getattr(ad, "_rxn_retained", set())
+    await ad.on_processing_complete(evt_old, ProcessingOutcome.SUCCESS)
+    assert raw_old.effective() == {"🤖"}
+    assert key not in ad._rxn_active
+    assert key not in getattr(ad, "_rxn_retained", set())
+    assert raw_new.ledger() == []
+
+
+@pytest.mark.asyncio
+async def test_strict_missing_cap_success_exception():
+    cfg = PlatformConfig(enabled=True, token="***")
+    cfg.extra = {"persona_emoji": "🤖", "dynamic_reactions": True, "reaction_cooldown": 0}
+    ad = DiscordAdapter(cfg)
+    ad._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=99999, name="HermesBot"))
+    ad._rxn_cooldown = 0.0
+    src = SessionSource(platform=Platform.DISCORD, chat_id="strict-miss-success-exc", chat_type="dm", user_id="42")
+    raw_old = LedgerMessage(msg_id=96211)
+    evt_old = _make_event("96211", raw_old, source=src)
+    await ad.on_processing_start(evt_old)
+    with patch("agent.display.get_tool_emoji", return_value="📄"):
+        await ad.on_tool_call_start(src, "read_file")
+    key = ad._reaction_msg_key(src)
+    orig_remove = ad._reaction_remove
+    ad._reaction_remove = AsyncMock(side_effect=RuntimeError("boom"))
+    await ad.on_processing_complete(evt_old, ProcessingOutcome.SUCCESS)
+    assert raw_old.effective() == {"🤖", "📄"}
+    assert key in getattr(ad, "_rxn_retained", set())
+    raw_new = _MissingCapMessage(msg_id=96211)
+    evt_new = _make_event("96211", raw_new, source=src)
+    await ad.on_processing_start(evt_new)
+    assert raw_new.ledger() == []
+    snapshot = list(raw_old.ledger())
+    await ad.on_processing_complete(evt_new, ProcessingOutcome.SUCCESS)
+    assert raw_old.ledger() == snapshot
+    assert raw_new.ledger() == []
+    ad._reaction_remove = orig_remove
+    snapshot2 = list(raw_old.ledger())
+    await ad.on_processing_complete(evt_new, ProcessingOutcome.SUCCESS)
+    assert raw_old.ledger() == snapshot2
+    assert key in getattr(ad, "_rxn_retained", set())
+    await ad.on_processing_complete(evt_old, ProcessingOutcome.SUCCESS)
+    assert raw_old.effective() == {"🤖"}
+    assert key not in getattr(ad, "_rxn_retained", set())
+
+
+@pytest.mark.asyncio
+async def test_strict_missing_cap_cancelled_false():
+    cfg = PlatformConfig(enabled=True, token="***")
+    cfg.extra = {"persona_emoji": "🤖", "dynamic_reactions": True, "reaction_cooldown": 0}
+    ad = DiscordAdapter(cfg)
+    ad._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=99999, name="HermesBot"))
+    ad._rxn_cooldown = 0.0
+    src = SessionSource(platform=Platform.DISCORD, chat_id="strict-miss-cancel-false", chat_type="dm", user_id="42")
+    raw_old = LedgerMessage(msg_id=96221)
+    evt_old = _make_event("96221", raw_old, source=src)
+    await ad.on_processing_start(evt_old)
+    with patch("agent.display.get_tool_emoji", return_value="📄"):
+        await ad.on_tool_call_start(src, "read_file")
+    key = ad._reaction_msg_key(src)
+    orig_remove = ad._reaction_remove
+    ad._reaction_remove = AsyncMock(return_value=False)
+    await ad.on_processing_complete(evt_old, ProcessingOutcome.CANCELLED)
+    assert raw_old.effective() == {"📄"}
+    assert key in getattr(ad, "_rxn_retained", set())
+    raw_new = _MissingCapMessage(msg_id=96221)
+    evt_new = _make_event("96221", raw_new, source=src)
+    await ad.on_processing_start(evt_new)
+    assert raw_new.ledger() == []
+    snapshot = list(raw_old.ledger())
+    await ad.on_processing_complete(evt_new, ProcessingOutcome.CANCELLED)
+    assert raw_old.ledger() == snapshot
+    assert raw_new.ledger() == []
+    ad._reaction_remove = orig_remove
+    snapshot2 = list(raw_old.ledger())
+    await ad.on_processing_complete(evt_new, ProcessingOutcome.CANCELLED)
+    assert raw_old.ledger() == snapshot2
+    assert key in getattr(ad, "_rxn_retained", set())
+    await ad.on_processing_complete(evt_old, ProcessingOutcome.CANCELLED)
+    assert raw_old.effective() == set()
+    assert key not in getattr(ad, "_rxn_retained", set())
+
+
+@pytest.mark.asyncio
+async def test_strict_missing_cap_cancelled_exception():
+    cfg = PlatformConfig(enabled=True, token="***")
+    cfg.extra = {"persona_emoji": "🤖", "dynamic_reactions": True, "reaction_cooldown": 0}
+    ad = DiscordAdapter(cfg)
+    ad._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=99999, name="HermesBot"))
+    ad._rxn_cooldown = 0.0
+    src = SessionSource(platform=Platform.DISCORD, chat_id="strict-miss-cancel-exc", chat_type="dm", user_id="42")
+    raw_old = LedgerMessage(msg_id=96231)
+    evt_old = _make_event("96231", raw_old, source=src)
+    await ad.on_processing_start(evt_old)
+    with patch("agent.display.get_tool_emoji", return_value="📄"):
+        await ad.on_tool_call_start(src, "read_file")
+    key = ad._reaction_msg_key(src)
+    orig_remove = ad._reaction_remove
+    ad._reaction_remove = AsyncMock(side_effect=RuntimeError("transport"))
+    await ad.on_processing_complete(evt_old, ProcessingOutcome.CANCELLED)
+    assert key in getattr(ad, "_rxn_retained", set())
+    raw_new = _MissingCapMessage(msg_id=96231)
+    evt_new = _make_event("96231", raw_new, source=src)
+    await ad.on_processing_start(evt_new)
+    snapshot = list(raw_old.ledger())
+    await ad.on_processing_complete(evt_new, ProcessingOutcome.CANCELLED)
+    assert raw_old.ledger() == snapshot
+    ad._reaction_remove = orig_remove
+    snapshot2 = list(raw_old.ledger())
+    await ad.on_processing_complete(evt_new, ProcessingOutcome.CANCELLED)
+    assert raw_old.ledger() == snapshot2
+    assert key in getattr(ad, "_rxn_retained", set())
+    await ad.on_processing_complete(evt_old, ProcessingOutcome.CANCELLED)
+    assert raw_old.effective() == set()
+    assert key not in getattr(ad, "_rxn_retained", set())
+
+
+@pytest.mark.asyncio
+async def test_strict_source_only_retry_success_false():
+    """Source-only (raw None) original retry must still reconcile old and clear only after confirmed success."""
+    cfg = PlatformConfig(enabled=True, token="***")
+    cfg.extra = {"persona_emoji": "🤖", "dynamic_reactions": True, "reaction_cooldown": 0}
+    ad = DiscordAdapter(cfg)
+    ad._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=99999, name="HermesBot"))
+    ad._rxn_cooldown = 0.0
+    src = SessionSource(platform=Platform.DISCORD, chat_id="strict-source-success", chat_type="dm", user_id="42")
+    raw_old = LedgerMessage(msg_id=96301)
+    evt_old = _make_event("96301", raw_old, source=src)
+    await ad.on_processing_start(evt_old)
+    with patch("agent.display.get_tool_emoji", return_value="📄"):
+        await ad.on_tool_call_start(src, "read_file")
+    assert raw_old.effective() == {"📄"}
+    key = ad._reaction_msg_key(src)
+    orig_remove = ad._reaction_remove
+    orig_add = ad._reaction_add
+    ad._reaction_remove = AsyncMock(return_value=False)
+    await ad.on_processing_complete(evt_old, ProcessingOutcome.SUCCESS)
+    assert raw_old.effective() == {"🤖", "📄"}
+    assert key in getattr(ad, "_rxn_retained", set())
+    assert ad._rxn_msg_refs.get(key) is raw_old
+    evt_source = MessageEvent(text="hello", message_type=MessageType.TEXT, source=src, raw_message=None, message_id="96301")
+    # while still failing, make both add and remove fail so no ledger mutation
+    ad._reaction_add = AsyncMock(return_value=False)
+    snapshot = list(raw_old.ledger())
+    await ad.on_processing_complete(evt_source, ProcessingOutcome.SUCCESS)
+    assert raw_old.ledger() == snapshot, "source-only retry while still failing must not mutate old"
+    assert raw_old.effective() == {"🤖", "📄"}
+    assert key in ad._rxn_active
+    assert ad._rxn_msg_refs.get(key) is raw_old
+    assert key in getattr(ad, "_rxn_retained", set())
+    ad._reaction_remove = orig_remove
+    ad._reaction_add = orig_add
+    await ad.on_processing_complete(evt_source, ProcessingOutcome.SUCCESS)
+    assert raw_old.effective() == {"🤖"}
+    assert key not in ad._rxn_active
+    assert key not in ad._rxn_msg_refs
+    assert key not in getattr(ad, "_rxn_retained", set())
+
+
+@pytest.mark.asyncio
+async def test_strict_source_only_retry_cancelled_false():
+    cfg = PlatformConfig(enabled=True, token="***")
+    cfg.extra = {"persona_emoji": "🤖", "dynamic_reactions": True, "reaction_cooldown": 0}
+    ad = DiscordAdapter(cfg)
+    ad._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=99999, name="HermesBot"))
+    ad._rxn_cooldown = 0.0
+    src = SessionSource(platform=Platform.DISCORD, chat_id="strict-source-cancel", chat_type="dm", user_id="42")
+    raw_old = LedgerMessage(msg_id=96311)
+    evt_old = _make_event("96311", raw_old, source=src)
+    await ad.on_processing_start(evt_old)
+    with patch("agent.display.get_tool_emoji", return_value="📄"):
+        await ad.on_tool_call_start(src, "read_file")
+    key = ad._reaction_msg_key(src)
+    orig_remove = ad._reaction_remove
+    ad._reaction_remove = AsyncMock(return_value=False)
+    await ad.on_processing_complete(evt_old, ProcessingOutcome.CANCELLED)
+    assert raw_old.effective() == {"📄"}
+    assert key in getattr(ad, "_rxn_retained", set())
+    evt_source = MessageEvent(text="hello", message_type=MessageType.TEXT, source=src, raw_message=None, message_id="96311")
+    snapshot = list(raw_old.ledger())
+    await ad.on_processing_complete(evt_source, ProcessingOutcome.CANCELLED)
+    assert raw_old.ledger() == snapshot
+    assert raw_old.effective() == {"📄"}
+    assert key in ad._rxn_active
+    assert key in getattr(ad, "_rxn_retained", set())
+    ad._reaction_remove = orig_remove
+    await ad.on_processing_complete(evt_source, ProcessingOutcome.CANCELLED)
+    assert raw_old.effective() == set()
+    assert key not in ad._rxn_active
+    assert key not in getattr(ad, "_rxn_retained", set())

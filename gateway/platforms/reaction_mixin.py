@@ -392,35 +392,26 @@ class DynamicReactionMixin:
                 return
             # Peek without popping: retain authority until remote confirms removal
             msg_ref = self._rxn_msg_refs.get(key)
-            if msg_ref is None:
-                msg_ref = self._reaction_resolve_message(event)
-                if msg_ref is not None:
-                    # cache for potential retry while authority retained
-                    self._rxn_msg_refs[key] = msg_ref
             # Bind retained authority to original lifecycle event: a completion
             # carrying a different raw message/lifecycle must not mutate the
             # retained old reference nor clear its authority.
             if key in getattr(self, "_rxn_retained", set()):
                 event_raw = getattr(event, "raw_message", None)
-                if event_raw is not None and hasattr(event_raw, "add_reaction"):
+                if event_raw is not None:
                     retained_ref = msg_ref
-                    if retained_ref is not None and event_raw is not retained_ref:
-                        try:
-                            ev_id = getattr(event_raw, "id", None)
-                            ret_id = getattr(retained_ref, "id", None)
-                            # Same logical message (same id) is allowed even if object differs
-                            if ev_id is not None and ret_id is not None and str(ev_id) == str(ret_id):
-                                pass
-                            else:
-                                logger.debug(
-                                    "reaction complete ignored for non-origin raw %r vs retained %r for key %s",
-                                    ev_id,
-                                    ret_id,
-                                    key,
-                                )
-                                return
-                        except Exception:
-                            return
+                    if event_raw is not retained_ref:
+                        logger.debug(
+                            "reaction complete ignored for non-origin raw %r vs retained %r for key %s",
+                            getattr(event_raw, "id", None),
+                            getattr(retained_ref, "id", None) if retained_ref is not None else None,
+                            key,
+                        )
+                        return
+            if msg_ref is None:
+                msg_ref = self._reaction_resolve_message(event)
+                if msg_ref is not None:
+                    # cache for potential retry while authority retained
+                    self._rxn_msg_refs[key] = msg_ref
             current = self._rxn_active.get(key)
             if msg_ref is None:
                 self._rxn_active.pop(key, None)
