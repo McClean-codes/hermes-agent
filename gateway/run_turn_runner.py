@@ -41,6 +41,39 @@ class TurnRunner:
     def __init__(self, runner: "GatewayRunner", ctx: TurnContext) -> None:
         self._runner = runner
         self._ctx = ctx
+        # Snapshot exact registered token once on the gateway event-loop thread after processing start
+        # Use existing runner adapter resolver and existing TurnContext.inbound_message_id; do not widen scope.
+        self._rxn_token = None
+        self._rxn_token_aware = False
+        try:
+            # Resolve adapter via existing runner resolver
+            adapter = None
+            try:
+                # Existing resolver is runner._adapter_for_source (used elsewhere in this file)
+                resolver = getattr(runner, "_adapter_for_source", None)
+                if callable(resolver):
+                    adapter = resolver(ctx.source)
+                else:
+                    adapter = getattr(ctx, "_status_adapter", None)
+            except Exception:
+                adapter = getattr(ctx, "_status_adapter", None)
+            if adapter is not None and getattr(adapter, "_rxn_token_aware", False):
+                self._rxn_token_aware = True
+                get_tok = getattr(adapter, "_rxn_get_token", None)
+                if callable(get_tok):
+                    try:
+                        # Use exact inbound_message_id from TurnContext
+                        self._rxn_token = get_tok(ctx.source, getattr(ctx, "inbound_message_id", None))
+                    except Exception:
+                        self._rxn_token = None
+                else:
+                    self._rxn_token = None
+            else:
+                self._rxn_token_aware = False
+                self._rxn_token = None
+        except Exception:
+            self._rxn_token = None
+            self._rxn_token_aware = False
 
     # ── shared thread→loop plumbing ─────────────────────────────────────────────────────────
 
@@ -104,12 +137,27 @@ class TurnRunner:
         # tool progress messages are off.
         if event_type == "tool.started" and tool_name and getattr(ctx, "_status_adapter", None) and ctx._run_still_current():
             try:
-                self._schedule(
-                    ctx._status_adapter._run_processing_hook(
-                        "on_tool_call_start", ctx.source, tool_name
-                    ),
-                    "on_tool_call_start scheduling error",
-                )
+                adapter = ctx._status_adapter
+                # Token-aware Discord path: use snapshotted token, never source-only callbacks
+                is_token_aware = getattr(adapter, "_rxn_token_aware", False) or getattr(self, "_rxn_token_aware", False)
+                if is_token_aware:
+                    tok = getattr(self, "_rxn_token", None)
+                    if tok is not None:
+                        self._schedule(
+                            adapter._run_processing_hook("on_tool_call_start", tok, tool_name),
+                            "on_tool_call_start scheduling error",
+                        )
+                    else:
+                        # Capture returned None: schedule no reaction hook
+                        pass
+                else:
+                    # Non-token-aware adapters preserve existing source-argument behavior
+                    self._schedule(
+                        adapter._run_processing_hook(
+                            "on_tool_call_start", ctx.source, tool_name
+                        ),
+                        "on_tool_call_start scheduling error",
+                    )
             except Exception:
                 pass
         if not ctx.progress_queue or not ctx._run_still_current():
