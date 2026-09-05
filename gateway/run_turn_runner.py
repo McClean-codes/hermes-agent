@@ -400,7 +400,7 @@ def _redact_progress_text(text: str | None, *, final: bool = True) -> str:
                 return fixed
             except Exception:
                 return redacted
-        except Exception as e:
+        except Exception:
             raise
     except Exception:
         try:
