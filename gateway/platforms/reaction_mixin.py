@@ -374,13 +374,18 @@ class DynamicReactionMixin:
         async with self._rxn_lock(key):
             if key not in self._rxn_active:
                 return
-            msg_ref = self._rxn_msg_refs.pop(key, None)
+            # Peek without popping: retain authority until remote confirms removal
+            msg_ref = self._rxn_msg_refs.get(key)
             if msg_ref is None:
                 msg_ref = self._reaction_resolve_message(event)
-            current = self._rxn_active.pop(key, None)
-            self._rxn_last_swap.pop(key, None)
-
+                if msg_ref is not None:
+                    # cache for potential retry while authority retained
+                    self._rxn_msg_refs[key] = msg_ref
+            current = self._rxn_active.get(key)
             if msg_ref is None:
+                self._rxn_active.pop(key, None)
+                self._rxn_msg_refs.pop(key, None)
+                self._rxn_last_swap.pop(key, None)
                 self._rxn_locks.pop(key, None)
                 return
 
@@ -392,9 +397,16 @@ class DynamicReactionMixin:
                 if current:
                     if not self._reaction_replace_mode:
                         try:
-                            await self._reaction_remove(msg_ref, current)
+                            ok = await self._reaction_remove(msg_ref, current)
                         except Exception as e:
                             logger.debug("cancel cleanup remove failed (%s): %s", current, e)
+                            return
+                        if not ok:
+                            logger.debug("cancel cleanup remove failed (%s): unconfirmed removal", current)
+                            return
+                self._rxn_active.pop(key, None)
+                self._rxn_msg_refs.pop(key, None)
+                self._rxn_last_swap.pop(key, None)
                 self._rxn_locks.pop(key, None)
                 return
 
@@ -407,21 +419,40 @@ class DynamicReactionMixin:
             if translated is None:
                 translated = self._reaction_translate_emoji("❌") or "❌"
 
+            if translated == current:
+                self._rxn_active.pop(key, None)
+                self._rxn_msg_refs.pop(key, None)
+                self._rxn_last_swap.pop(key, None)
+                self._rxn_locks.pop(key, None)
+                return
+
             try:
                 if self._reaction_replace_mode:
                     ok = await self._reaction_set(msg_ref, translated)
                     if not ok:
+                        logger.debug("reaction complete set failed (%s -> %s): unconfirmed", current, translated)
                         return
                 else:
-                    if translated != current:
-                        ok = await self._reaction_add(msg_ref, translated)
-                        if not ok:
-                            return
+                    ok = await self._reaction_add(msg_ref, translated)
+                    if not ok:
+                        logger.debug("reaction complete add failed (%s -> %s): unconfirmed", current, translated)
+                        return
                     if current and current != translated:
-                        await self._reaction_remove(msg_ref, current)
+                        remove_ok = await self._reaction_remove(msg_ref, current)
+                        if not remove_ok:
+                            logger.debug(
+                                "reaction complete remove failed (%s -> %s): unconfirmed removal, keeping prior state",
+                                current,
+                                translated,
+                            )
+                            return
             except Exception as e:
                 logger.debug("reaction complete swap failed (%s -> %s): %s", current, translated, e)
-                # On failure, ensure we don't leave stale locks; active already popped
+                return
+
+            self._rxn_active.pop(key, None)
+            self._rxn_msg_refs.pop(key, None)
+            self._rxn_last_swap.pop(key, None)
 
         # Clean up lock outside the lock itself
         self._rxn_locks.pop(key, None)

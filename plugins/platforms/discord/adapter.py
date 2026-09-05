@@ -2756,10 +2756,12 @@ class DiscordAdapter(DynamicReactionMixin, BasePlatformAdapter):
         if hasattr(source, "source") and source.source is not None:
             source = source.source
         # Canonical participant/profile-scoped identity (parity with SessionStore/ build_session_key)
+        # Use the same owner-aware profile resolver as the owning adapter/session path so
+        # secondary ingress before handler stamping does not collapse to agent:main.
         try:
             from gateway.session import build_session_key
 
-            profile = getattr(source, "profile", None)
+            profile = self._session_key_profile(source)
             group_per_user = True
             thread_per_user = False
             gcfg = None
@@ -2773,13 +2775,10 @@ class DiscordAdapter(DynamicReactionMixin, BasePlatformAdapter):
 
                     group_per_user = _coerce_bool(group_per_user, True)
                     thread_per_user = _coerce_bool(thread_per_user, False)
-                    multiplex = _coerce_bool(getattr(gcfg, "multiplex_profiles", False), False)
                 except Exception:
-                    multiplex = bool(getattr(gcfg, "multiplex_profiles", False))
-                if not multiplex:
-                    profile = None
+                    pass
             else:
-                # Best-effort file config; defaults already True/False and source profile
+                # Best-effort file config; defaults already True/False
                 try:
                     from hermes_cli.config import load_config
 
@@ -2797,11 +2796,6 @@ class DiscordAdapter(DynamicReactionMixin, BasePlatformAdapter):
 
                             group_per_user = _coerce_bool(_pick("group_sessions_per_user", group_per_user), True)
                             thread_per_user = _coerce_bool(_pick("thread_sessions_per_user", thread_per_user), False)
-                            multiplex_raw = _pick("multiplex_profiles", None)
-                            if multiplex_raw is not None:
-                                multiplex = _coerce_bool(multiplex_raw, False)
-                                if not multiplex:
-                                    profile = None
                         except Exception:
                             pass
                 except Exception:
