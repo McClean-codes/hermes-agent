@@ -5593,3 +5593,272 @@ class TestSubagentNoticeHostileStrictEgress:
                 assert "example.com" in entry, f"benign URL should survive: {entry!r}"
         finally:
             run_mod.safe_schedule_threadsafe = orig  # type: ignore[assignment]
+
+# ---------------------------------------------------------------------------
+# SEC-PF-FINAL-REASONING-AUGMENTATION-EGRESS — hostile last_reasoning after
+# sanitization, opaque userinfo + token/api_key/signature query must not
+# reach the enabled Slack adapter ledger. Real GatewayRunner final delivery
+# caller, not a sanitizer helper, with primary/fallback/both-layer failure
+# cases for the assembled final path (reasoning + footer + base).
+# ---------------------------------------------------------------------------
+
+class TestFinalReasoningSlackHostileStrictEgress:
+    """Reasoning-augmented final egress: hostile last_reasoning must be masked before Slack delivery."""
+
+    LONG_OPAQUE = "longOpaqueUserInfo1234567890ABCDEFExtraLongTail1234567890"
+    OPAQUE_TOKEN = "opaqueTok12345"
+    OPAQUE_API_KEY = "opaqueKey67890"
+    OPAQUE_SIG = "opaqueSigAbCd12"
+    DANGEROUS_PREFIX = LONG_OPAQUE[:8]
+
+    RAW_URL_BARE = f"https://***@ex.com/p"
+    RAW_URL_USERPASS = f"https://alice:{LONG_OPAQUE}@ex.com/p"
+    RAW_URL_QUERY = f"https://ex.com/cb?token={OPAQUE_TOKEN}&api_key={OPAQUE_API_KEY}&signature={OPAQUE_SIG}"
+    RAW_URL_COMBINED = f"https://***@ex.com/p?token={OPAQUE_TOKEN}&api_key={OPAQUE_API_KEY}"
+
+    def _hostile_reasoning(self) -> str:
+        return (
+            f"Reasoning with userinfo {self.RAW_URL_USERPASS} and bare {self.RAW_URL_BARE} "
+            f"and query {self.RAW_URL_QUERY} and combined {self.RAW_URL_COMBINED}"
+        )
+
+    async def _run_gateway_with_reasoning(
+        self,
+        *,
+        final_response: str,
+        last_reasoning: str | None,
+        enable_reasoning: bool = True,
+        ledger: list,
+    ):
+        from gateway.config import Platform, GatewayConfig, PlatformConfig
+        from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
+        from gateway.run import GatewayRunner
+        from gateway.session import SessionSource, SessionEntry, build_session_key
+        from unittest.mock import MagicMock, AsyncMock
+
+        class _CaptureSlackAdapter(BasePlatformAdapter):
+            def __init__(self):
+                super().__init__(PlatformConfig(enabled=True, token="xoxb-fake"), Platform.SLACK)
+
+            async def connect(self, *, is_reconnect: bool = False) -> bool:
+                return True
+
+            async def disconnect(self) -> None:
+                return None
+
+            async def send(self, chat_id, content, reply_to=None, metadata=None):
+                ledger.append(content)
+                return SendResult(success=True, message_id="slack-final-reason-1")
+
+            async def send_typing(self, chat_id, metadata=None):
+                return None
+
+            async def get_chat_info(self, chat_id):
+                return {"id": chat_id}
+
+        fake_adapter = _CaptureSlackAdapter()
+        fake_adapter.send = AsyncMock(side_effect=fake_adapter.send)
+
+        config = GatewayConfig(platforms={Platform.SLACK: PlatformConfig(enabled=True, token="xoxb-fake")})
+        gw = GatewayRunner(config=config)
+        gw.adapters = {Platform.SLACK: fake_adapter}
+        gw._is_user_authorized = lambda _source: True
+        gw._is_user_authorized_for_source = lambda _s, **kw: True
+        # Enable reasoning for this platform
+        gw._show_reasoning = bool(enable_reasoning)
+        # Session store stubs
+        from datetime import datetime, timedelta
+
+        now = datetime.now()
+        session_entry = SessionEntry(
+            session_key="agent:main:slack:channel:C123:U123",
+            session_id="sess-reason-hostile-1",
+            created_at=now - timedelta(seconds=10),
+            updated_at=now,
+            platform=Platform.SLACK,
+            chat_type="channel",
+        )
+        gw.session_store = MagicMock()
+        gw.session_store.get_or_create_session.return_value = session_entry
+        gw.session_store.load_transcript.return_value = []
+        gw.session_store.has_any_sessions.return_value = True
+        gw.session_store.rewrite_transcript = MagicMock()
+        gw.session_store.append_to_transcript = MagicMock()
+        gw.session_store.update_session = MagicMock()
+        gw.session_store.has_platform_message_id = MagicMock(return_value=False)
+        gw.session_store._save = MagicMock()
+        gw.session_store._record_gateway_session_peer = MagicMock()
+        gw._async_session_store = gw.session_store  # type: ignore[attr-defined]
+        gw._adapter_for_source = lambda source: fake_adapter
+        gw._resolve_session_agent_runtime = MagicMock(return_value=("test/model", {"api_key": "fake", "base_url": "https://openrouter.ai/api/v1"}))
+        gw._resolve_session_reasoning_config = MagicMock(return_value=None)
+        gw._resolve_session_service_tier = MagicMock(return_value=None)
+        gw._provider_routing = {}
+        gw._reasoning_config = None
+        gw._service_tier = None
+        gw._is_session_run_current = lambda _k, _g: True
+        # Ensure display resolution forces show_reasoning true when gw flag is true
+        orig_resolve = None
+        try:
+            from gateway import run as run_mod
+
+            orig_resolve = run_mod._resolve_gateway_display_bool
+
+            def _patched_resolve(cfg, pkey, key, default=False, platform=None, require_platform_override_for=None):
+                if key == "show_reasoning" and enable_reasoning:
+                    return True
+                try:
+                    return orig_resolve(cfg, pkey, key, default=default, platform=platform, require_platform_override_for=require_platform_override_for)
+                except Exception:
+                    return bool(default) if key != "show_reasoning" else bool(enable_reasoning)
+
+            run_mod._resolve_gateway_display_bool = _patched_resolve  # type: ignore[assignment]
+        except Exception:
+            pass
+
+        # Mock the agent turn to return controlled last_reasoning
+        async def _fake_run_agent(**kw):
+            return {
+                "final_response": final_response,
+                "last_reasoning": last_reasoning,
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": final_response, "reasoning": last_reasoning},
+                ],
+                "api_calls": 1,
+                "failed": False,
+                "error": None,
+                "session_id": session_entry.session_id,
+                "history_offset": 0,
+                "last_prompt_tokens": 0,
+            }
+
+        gw._run_agent = _fake_run_agent  # type: ignore[assignment]
+
+        event = MessageEvent(
+            text="hi",
+            source=SessionSource(platform=Platform.SLACK, chat_id="C123", chat_type="channel", user_id="U123", thread_id="T123"),
+            message_id="msg-reason-hostile-1",
+        )
+        fake_adapter.set_message_handler(gw._handle_message)
+        fake_adapter._keep_typing = lambda *a, **kw: asyncio.Event().wait()
+
+        import os
+
+        orig_home = os.environ.get("SLACK_HOME_CHANNEL")
+        os.environ["SLACK_HOME_CHANNEL"] = "C123"
+        try:
+            await fake_adapter._process_message_background(event, build_session_key(event.source))
+        finally:
+            if orig_home is None:
+                os.environ.pop("SLACK_HOME_CHANNEL", None)
+            else:
+                os.environ["SLACK_HOME_CHANNEL"] = orig_home
+            if orig_resolve is not None:
+                try:
+                    run_mod._resolve_gateway_display_bool = orig_resolve  # type: ignore[assignment]
+                except Exception:
+                    pass
+        return gw, fake_adapter
+
+    @pytest.mark.asyncio
+    async def test_reasoning_hostile_via_production_gateway_slack_no_leakage(self):
+        ledger: list[str] = []
+        hostile_reasoning = self._hostile_reasoning()
+        benign_final = "Benign answer for reasoning test — no secrets."
+        await self._run_gateway_with_reasoning(
+            final_response=benign_final,
+            last_reasoning=hostile_reasoning,
+            ledger=ledger,
+        )
+        assert len(ledger) >= 1, f"expected at least one final send, got {ledger}"
+        for entry in ledger:
+            assert self.RAW_URL_USERPASS not in entry, f"raw userpass URL leaked in reasoning egress: {entry!r}"
+            assert self.RAW_URL_QUERY not in entry, f"raw query URL leaked in reasoning egress: {entry!r}"
+            # RAW_URL_BARE/COMBINED with *** are masked forms - check raw opaque prefix instead
+            assert self.LONG_OPAQUE not in entry, f"opaque long userinfo leaked in reasoning egress: {entry!r}"
+            assert self.OPAQUE_TOKEN not in entry, f"opaque token leaked in reasoning egress: {entry!r}"
+            assert self.OPAQUE_API_KEY not in entry, f"opaque api_key leaked in reasoning egress: {entry!r}"
+            assert self.OPAQUE_SIG not in entry, f"opaque signature leaked in reasoning egress: {entry!r}"
+            assert self.DANGEROUS_PREFIX not in entry, f"dangerous prefix leaked in reasoning egress: {entry!r}"
+            # Must not be the raw assembled response (reasoning+final) and must have marker
+            assert hostile_reasoning not in entry
+        # Benign final piece should survive (masked reasoning, but final answer remains)
+        # The ledger entry is the sanitized assembled response; benign tail must be present
+        assert any("Benign answer" in e for e in ledger)
+
+    @pytest.mark.asyncio
+    async def test_reasoning_primary_redactor_failure_still_masks(self):
+        ledger: list[str] = []
+        hostile_reasoning = self._hostile_reasoning()
+        benign_final = "Benign answer primary-failure test."
+        with patch("agent.redact.redact_sensitive_text", side_effect=RuntimeError("primary boom")):
+            await self._run_gateway_with_reasoning(
+                final_response=benign_final,
+                last_reasoning=hostile_reasoning,
+                ledger=ledger,
+            )
+        assert len(ledger) >= 1
+        for entry in ledger:
+            assert self.RAW_URL_USERPASS not in entry
+            assert self.RAW_URL_QUERY not in entry
+            assert self.LONG_OPAQUE not in entry
+            assert self.OPAQUE_TOKEN not in entry
+            assert self.OPAQUE_SIG not in entry
+            assert hostile_reasoning not in entry
+            assert self.DANGEROUS_PREFIX not in entry
+
+    @pytest.mark.asyncio
+    async def test_reasoning_fallback_redactor_failure_still_masks(self):
+        ledger: list[str] = []
+        hostile_reasoning = self._hostile_reasoning()
+        benign_final = "Benign answer fallback-failure test."
+        with patch("gateway.run._redact_gateway_user_facing_secrets", side_effect=RuntimeError("gateway boom")):
+            await self._run_gateway_with_reasoning(
+                final_response=benign_final,
+                last_reasoning=hostile_reasoning,
+                ledger=ledger,
+            )
+        assert len(ledger) >= 1
+        for entry in ledger:
+            assert self.RAW_URL_USERPASS not in entry
+            assert self.RAW_URL_QUERY not in entry
+            assert self.LONG_OPAQUE not in entry
+            assert self.OPAQUE_TOKEN not in entry
+            assert hostile_reasoning not in entry
+
+    @pytest.mark.asyncio
+    async def test_reasoning_both_layers_fail_closed_to_REDACTED(self):
+        ledger: list[str] = []
+        hostile_reasoning = self._hostile_reasoning()
+        benign_final = "Benign but should be redacted on both-layer failure"
+        with (
+            patch("agent.redact.redact_sensitive_text", side_effect=RuntimeError("primary boom")),
+            patch("gateway.run._redact_gateway_user_facing_secrets", side_effect=RuntimeError("gateway boom")),
+        ):
+            await self._run_gateway_with_reasoning(
+                final_response=benign_final,
+                last_reasoning=hostile_reasoning,
+                ledger=ledger,
+            )
+        assert len(ledger) >= 1
+        for entry in ledger:
+            assert hostile_reasoning not in entry
+            assert self.LONG_OPAQUE not in entry
+            assert self.OPAQUE_TOKEN not in entry
+            assert self.DANGEROUS_PREFIX not in entry
+            assert entry == "[REDACTED]", f"expected exact [REDACTED] on both-layer failure, got {entry!r}"
+
+    @pytest.mark.asyncio
+    async def test_reasoning_non_secret_control_preserved(self):
+        ledger: list[str] = []
+        benign_reasoning = "Benign reasoning with https://example.com/page?foo=bar&baz=qux for docs."
+        benign_final = "Final answer https://example.com/other?x=1 no secrets."
+        await self._run_gateway_with_reasoning(
+            final_response=benign_final,
+            last_reasoning=benign_reasoning,
+            ledger=ledger,
+        )
+        assert len(ledger) >= 1
+        for entry in ledger:
+            assert "example.com" in entry, f"non-secret URL should survive reasoning egress: {entry!r}"

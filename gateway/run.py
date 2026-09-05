@@ -4368,6 +4368,90 @@ class GatewayRunner(
         cleanup_lock: Any = None
         is_current: Any = None
 
+    # SEC-PF-FINAL-REASONING-AUGMENTATION-EGRESS — strict sanitization after all
+    # human-facing final augmentations (reasoning, runtime footer, etc.) and
+    # immediately before every adapter delivery path (first send, retry, fallback,
+    # edit/update). The base sanitizer in _hmwa_shape_agent_response runs BEFORE
+    # _hmwa_prepend_reasoning/footer, so hostile last_reasoning + opaque URL
+    # credentials would otherwise bypass egress. Fail-closed to [REDACTED].
+    async def _hmwa_deliver_turn_response(
+        self,
+        event,
+        source,
+        session_entry,
+        session_key,
+        run_generation,
+        agent_result,
+        agent_messages,
+        response,
+        _footer_line,
+        _intentional_silence,
+    ):  # type: ignore[override]
+        # Sanitize the fully assembled human-facing response after reasoning/footer
+        # augmentation. Also sanitize the trailing footer when streamed (direct
+        # adapter.send path). Use the canonical final sanitizer so benign URLs
+        # survive, opaque userinfo/query credentials are masked, and both-layer
+        # redactor failure yields exact [REDACTED].
+        sanitized_response = response
+        sanitized_footer = _footer_line
+        if isinstance(response, str) and response:
+            try:
+                sanitized_response = _sanitize_gateway_final_response(
+                    source.platform, response
+                )
+            except Exception:
+                logger.debug(
+                    "final assembled response sanitization failed in deliver",
+                    exc_info=True,
+                )
+                sanitized_response = "[REDACTED]"
+        if isinstance(_footer_line, str) and _footer_line:
+            try:
+                sanitized_footer = _sanitize_gateway_final_response(
+                    source.platform, _footer_line
+                )
+            except Exception:
+                logger.debug(
+                    "footer strict sanitization failed in deliver", exc_info=True
+                )
+                sanitized_footer = "[REDACTED]"
+        # Delegate to the TurnMixin implementation with sanitized payloads.
+        return await super()._hmwa_deliver_turn_response(  # type: ignore[misc]
+            event,
+            source,
+            session_entry,
+            session_key,
+            run_generation,
+            agent_result,
+            agent_messages,
+            sanitized_response,
+            sanitized_footer,
+            _intentional_silence,
+        )
+
+    async def _handle_message_with_agent(
+        self, event, source, _quick_key: str, run_generation: int
+    ):  # type: ignore[override]
+        # Wrap the TurnMixin turn to sanitize the returned final string after all
+        # augmentations (reasoning + footer + compression reset notice) and before
+        # it reaches BasePlatformAdapter._send_final_text's ledger + retry path.
+        # This is the last defense for the primary send/fallback/retry; the
+        # _hmwa_deliver_turn_response override above covers the direct footer
+        # send and streaming paths.
+        result = await super()._handle_message_with_agent(  # type: ignore[misc]
+            event, source, _quick_key, run_generation
+        )
+        if isinstance(result, str) and result:
+            try:
+                result = _sanitize_gateway_final_response(source.platform, result)
+            except Exception:
+                logger.debug(
+                    "final assembled response sanitization failed in handle",
+                    exc_info=True,
+                )
+                result = "[REDACTED]"
+        return result
+
 
 def _run_planned_stop_watcher(
     stop_event: threading.Event, runner, loop: asyncio.AbstractEventLoop, shutdown_handler, *,
