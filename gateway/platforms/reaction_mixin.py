@@ -188,16 +188,37 @@ class DynamicReactionMixin:
         or ``_reaction_set`` returns truthy); False on disabled behavior,
         missing capability, provider ``False``, or exception.  Commits
         ``_rxn_active`` and ``_rxn_msg_refs`` only on confirmed success.
+
+        On every new public start attempt for a participant/profile-scoped key,
+        any failed/disabled/exception/missing-capability outcome clears prior
+        active/message authority for that key before returning, so a stale
+        confirmed start for an earlier message cannot authorize later tool or
+        completion mutations.
         """
         if not getattr(self, "_rxn_initialized", False):
             return False
+        # Derive key early so failed/disabled/missing paths can invalidate stale authority
+        key: Optional[Hashable] = None
+        try:
+            key = self._reaction_msg_key(event)
+        except Exception:
+            key = None
         if not self._rxn_reactions_enabled():
+            if key is not None:
+                self._rxn_active.pop(key, None)
+                self._rxn_msg_refs.pop(key, None)
+                self._rxn_last_swap.pop(key, None)
+                self._rxn_locks.pop(key, None)
             return False
 
         msg_ref = self._reaction_resolve_message(event)
         if msg_ref is None:
+            if key is not None:
+                self._rxn_active.pop(key, None)
+                self._rxn_msg_refs.pop(key, None)
+                self._rxn_last_swap.pop(key, None)
+                self._rxn_locks.pop(key, None)
             return False
-        key = self._reaction_msg_key(event)
         if key is None:
             return False
 
@@ -212,9 +233,17 @@ class DynamicReactionMixin:
             else:
                 ok = await self._reaction_add(msg_ref, translated)
             if not ok:
+                self._rxn_active.pop(key, None)
+                self._rxn_msg_refs.pop(key, None)
+                self._rxn_last_swap.pop(key, None)
+                self._rxn_locks.pop(key, None)
                 return False
         except Exception as e:
             logger.debug("reaction start add failed (%s): %s", translated, e)
+            self._rxn_active.pop(key, None)
+            self._rxn_msg_refs.pop(key, None)
+            self._rxn_last_swap.pop(key, None)
+            self._rxn_locks.pop(key, None)
             return False
 
         self._rxn_active[key] = translated
@@ -277,7 +306,14 @@ class DynamicReactionMixin:
                     if not ok:
                         return
                     if current and current != tool_emoji:
-                        await self._reaction_remove(msg_ref, current)
+                        remove_ok = await self._reaction_remove(msg_ref, current)
+                        if not remove_ok:
+                            logger.debug(
+                                "reaction swap remove failed (%s -> %s): unconfirmed removal, keeping prior state",
+                                current,
+                                tool_emoji,
+                            )
+                            return
             except Exception as e:
                 logger.debug("reaction swap failed (%s -> %s): %s", current, tool_emoji, e)
                 # Do not corrupt active tracking on transient failure; keep previous
@@ -290,12 +326,21 @@ class DynamicReactionMixin:
         """Replace active reaction with final emoji."""
         if not getattr(self, "_rxn_initialized", False):
             return
-        if not self._rxn_reactions_enabled():
-            return
-
         key = self._reaction_msg_key(event)
         if key is None:
             return
+        # If reactions are disabled, clear any stale authority for this key
+        # but do not attempt remote mutations; this invalidates prior active
+        # so later tool/completion cannot reuse it via stale msg_refs.
+        if not self._rxn_reactions_enabled():
+            # Use lock-protected cleanup to avoid races with concurrent swaps
+            async with self._rxn_lock(key):
+                self._rxn_active.pop(key, None)
+                self._rxn_msg_refs.pop(key, None)
+                self._rxn_last_swap.pop(key, None)
+            self._rxn_locks.pop(key, None)
+            return
+
         # Confirmed-start predicate: no active session must not authorize a
         # final reaction. Raw MessageEvent or raw-cache alone is not authority.
         if key not in self._rxn_active:

@@ -2768,8 +2768,13 @@ class DiscordAdapter(DynamicReactionMixin, BasePlatformAdapter):
     def _reaction_resolve_message(self, event):
         """Extract the raw Discord message from the event or session cache."""
         raw = getattr(event, "raw_message", None)
-        if raw and hasattr(raw, "add_reaction"):
-            return raw
+        if raw is not None:
+            # If raw is present but lacks capability, treat as missing — do not
+            # fall back to stale cached raw (prevents missing-capability replay
+            # from resolving an old message's raw and mutating it via stale authority).
+            if hasattr(raw, "add_reaction"):
+                return raw
+            return None
         source = getattr(event, "source", event)
         key = self._session_key_from_source(source)
         return self._session_raw_messages.get(key)

@@ -677,20 +677,52 @@ async def test_process_message_background_adds_and_swaps_reactions_legacy(adapte
     assert "✅" not in raw.effective()
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Confirmed-start parity regression — provider outcome must gate state and ACK
+# (real durable SQLite recovery store, no writer mocks)
 # ---------------------------------------------------------------------------
 
+def _query_durable_row(adapter, message_id: str):
+    """Read back the durable discord_messages row via the real recovery store."""
+    def _op(conn):
+        row = conn.execute(
+            "SELECT status, emoji_ack, replied FROM discord_messages WHERE message_id=?",
+            (str(message_id),),
+        ).fetchone()
+        return row
+    return adapter._with_discord_recovery_db(_op)
+
+
+def _make_recovery_adapter(tmp_path, monkeypatch):
+    """Create a DiscordAdapter wired to a temporary SQLite recovery store."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("DISCORD_MISSED_MESSAGE_BACKFILL", "true")
+    monkeypatch.delenv("DISCORD_REACTIONS", raising=False)
+    config = PlatformConfig(enabled=True, token="***")
+    if not isinstance(getattr(config, "extra", None), dict):
+        config.extra = {}
+    # Ensure backfill enabled via config as well, for robustness
+    config.extra["missed_message_backfill"] = {"enabled": True}
+    ad = DiscordAdapter(config)
+    ad._client = SimpleNamespace(
+        tree=FakeTree(),
+        get_channel=lambda _id: None,
+        fetch_channel=AsyncMock(),
+        user=SimpleNamespace(id=99999, name="HermesBot"),
+    )
+    return ad
+
+
 @pytest.mark.asyncio
-async def test_on_processing_start_provider_false_leaves_no_state_and_ack_false(adapter):
-    """Provider False must not commit active/msg_refs and must record emoji_ack=False."""
+async def test_on_processing_start_provider_false_leaves_no_state_and_ack_false(tmp_path, monkeypatch):
+    """Provider False must not commit active/msg_refs and must record emoji_ack=False via real DB."""
+    adapter = _make_recovery_adapter(tmp_path, monkeypatch)
     adapter.config.extra["persona_emoji"] = "🤖"
     adapter._rxn_persona_emoji = "🤖"
     raw = LedgerMessage(msg_id=9001)
     event = _make_event("9001", raw)
-    # deterministic fake at provider boundary only
+    # fake only at provider boundary
     adapter._reaction_add = AsyncMock(return_value=False)
-    ack_record = MagicMock()
-    adapter._record_discord_processing_start = ack_record
 
     await adapter.on_processing_start(event)
 
@@ -698,20 +730,22 @@ async def test_on_processing_start_provider_false_leaves_no_state_and_ack_false(
     assert raw.ledger() == []
     assert key not in adapter._rxn_active
     assert key not in adapter._rxn_msg_refs
-    assert ack_record.call_count == 1
-    assert ack_record.call_args.kwargs["emoji_ack"] is False
+    assert key not in adapter._session_raw_messages
+    row = _query_durable_row(adapter, "9001")
+    assert row is not None, "durable row must exist after start"
+    assert row[0] == "processing"
+    assert row[1] == 0, "emoji_ack must be 0 for provider False"
 
 
 @pytest.mark.asyncio
-async def test_on_processing_start_provider_exception_leaves_no_state_and_ack_false(adapter):
-    """Provider exception must not commit state and must record emoji_ack=False."""
+async def test_on_processing_start_provider_exception_leaves_no_state_and_ack_false(tmp_path, monkeypatch):
+    """Provider exception must not commit state and must record emoji_ack=False via real DB."""
+    adapter = _make_recovery_adapter(tmp_path, monkeypatch)
     adapter.config.extra["persona_emoji"] = "🤖"
     adapter._rxn_persona_emoji = "🤖"
     raw = LedgerMessage(msg_id=9002)
     event = _make_event("9002", raw)
     adapter._reaction_add = AsyncMock(side_effect=RuntimeError("boom"))
-    ack_record = MagicMock()
-    adapter._record_discord_processing_start = ack_record
 
     await adapter.on_processing_start(event)
 
@@ -719,54 +753,58 @@ async def test_on_processing_start_provider_exception_leaves_no_state_and_ack_fa
     assert raw.ledger() == []
     assert key not in adapter._rxn_active
     assert key not in adapter._rxn_msg_refs
-    assert ack_record.call_count == 1
-    assert ack_record.call_args.kwargs["emoji_ack"] is False
+    assert key not in adapter._session_raw_messages
+    row = _query_durable_row(adapter, "9002")
+    assert row is not None
+    assert row[0] == "processing"
+    assert row[1] == 0
 
 
 @pytest.mark.asyncio
-async def test_on_processing_start_missing_capability_leaves_no_state_and_ack_false(adapter, monkeypatch):
-    """Missing capability (no add_reaction) / disabled must not commit state and ack False."""
+async def test_on_processing_start_missing_capability_leaves_no_state_and_ack_false(tmp_path, monkeypatch):
+    """Missing capability / disabled must not commit state and ack False via real DB."""
+    adapter = _make_recovery_adapter(tmp_path, monkeypatch)
     adapter.config.extra["persona_emoji"] = "🤖"
     adapter._rxn_persona_emoji = "🤖"
-    # use a raw message without add_reaction to simulate missing capability
     raw_no_cap = SimpleNamespace(id=9003)
     event = _make_event("9003", raw_no_cap)
-    ack_record = MagicMock()
-    adapter._record_discord_processing_start = ack_record
 
     await adapter.on_processing_start(event)
 
     key = adapter._reaction_msg_key(event)
-    # no provider add should have been attempted via ledger, active/msg_refs empty
     assert key not in adapter._rxn_active
     assert key not in adapter._rxn_msg_refs
-    assert ack_record.call_count == 1
-    assert ack_record.call_args.kwargs["emoji_ack"] is False
+    assert key not in adapter._session_raw_messages
+    row = _query_durable_row(adapter, "9003")
+    assert row is not None
+    assert row[0] == "processing"
+    assert row[1] == 0
 
     # also verify disabled path produces same false ack via env
     monkeypatch.setenv("DISCORD_REACTIONS", "false")
     raw2 = LedgerMessage(msg_id=9004)
     event2 = _make_event("9004", raw2)
-    ack2 = MagicMock()
-    adapter._record_discord_processing_start = ack2
     await adapter.on_processing_start(event2)
     key2 = adapter._reaction_msg_key(event2)
     assert raw2.ledger() == []
     assert key2 not in adapter._rxn_active
     assert key2 not in adapter._rxn_msg_refs
-    assert ack2.call_count == 1
-    assert ack2.call_args.kwargs["emoji_ack"] is False
+    # disabled start still records a row with ack 0
+    row2 = _query_durable_row(adapter, "9004")
+    assert row2 is not None
+    assert row2[1] == 0
+    # re-enable for other tests
+    monkeypatch.delenv("DISCORD_REACTIONS", raising=False)
 
 
 @pytest.mark.asyncio
-async def test_on_processing_start_confirmed_add_records_ack_true(adapter):
-    """Confirmed provider success commits state, populates ledger, and records emoji_ack=True."""
+async def test_on_processing_start_confirmed_add_records_ack_true(tmp_path, monkeypatch):
+    """Confirmed provider success commits state, populates ledger, and records emoji_ack=True via real DB."""
+    adapter = _make_recovery_adapter(tmp_path, monkeypatch)
     adapter.config.extra["persona_emoji"] = "🤖"
     adapter._rxn_persona_emoji = "🤖"
     raw = LedgerMessage(msg_id=9005)
     event = _make_event("9005", raw)
-    ack_record = MagicMock()
-    adapter._record_discord_processing_start = ack_record
 
     await adapter.on_processing_start(event)
 
@@ -775,13 +813,17 @@ async def test_on_processing_start_confirmed_add_records_ack_true(adapter):
     assert raw.effective() == {"🤖"}
     assert adapter._rxn_active.get(key) == "🤖"
     assert adapter._rxn_msg_refs.get(key) is raw
-    assert ack_record.call_count == 1
-    assert ack_record.call_args.kwargs["emoji_ack"] is True
+    assert key in adapter._session_raw_messages
+    row = _query_durable_row(adapter, "9005")
+    assert row is not None
+    assert row[0] == "processing"
+    assert row[1] == 1
 
 
 @pytest.mark.asyncio
-async def test_failed_start_false_blocks_tool_and_complete_with_recovered_provider(adapter):
-    """Provider False on start must block later tool and completion even after provider recovers."""
+async def test_failed_start_false_blocks_tool_and_complete_with_recovered_provider(tmp_path, monkeypatch):
+    """Provider False on start must block later tool and completion even after provider recovers — real durable."""
+    adapter = _make_recovery_adapter(tmp_path, monkeypatch)
     adapter.config.extra["persona_emoji"] = "🤖"
     adapter.config.extra["dynamic_reactions"] = True
     adapter.config.extra["reaction_cooldown"] = 0
@@ -796,8 +838,6 @@ async def test_failed_start_false_blocks_tool_and_complete_with_recovered_provid
     # Fail the initial start at the provider boundary only
     orig_add = adapter._reaction_add
     adapter._reaction_add = AsyncMock(return_value=False)
-    ack_start = MagicMock()
-    adapter._record_discord_processing_start = ack_start
 
     await adapter.on_processing_start(event)
 
@@ -805,12 +845,12 @@ async def test_failed_start_false_blocks_tool_and_complete_with_recovered_provid
     assert key not in adapter._rxn_active
     assert key not in adapter._rxn_msg_refs
     assert key not in adapter._session_raw_messages
-    assert ack_start.call_count == 1
-    assert ack_start.call_args.kwargs["emoji_ack"] is False
+    row = _query_durable_row(adapter, "9101")
+    assert row is not None
+    assert row[1] == 0
 
     # Recover provider boundary to success (real ledger-backed add)
     adapter._reaction_add = orig_add
-    # Ensure dynamic still enabled and cooldown 0
     adapter._rxn_cooldown = 0.0
 
     # Later source-only tool callback must remain no-op despite recovered provider
@@ -821,12 +861,12 @@ async def test_failed_start_false_blocks_tool_and_complete_with_recovered_provid
     assert key not in adapter._rxn_active
     assert key not in adapter._rxn_msg_refs
     assert key not in adapter._session_raw_messages
-    # durable ACK must still be false (no new start recorded)
-    assert ack_start.call_args.kwargs["emoji_ack"] is False
+    # durable row still 0 (no new start recorded)
+    row2 = _query_durable_row(adapter, "9101")
+    assert row2[1] == 0
+    assert row2[0] == "processing"
 
     # Later completion callback must also remain no-op (no final emoji, no untracked add)
-    complete_ack = MagicMock()
-    adapter._record_discord_processing_complete = complete_ack
     await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
 
     assert raw.ledger() == []
@@ -834,17 +874,20 @@ async def test_failed_start_false_blocks_tool_and_complete_with_recovered_provid
     assert key not in adapter._rxn_msg_refs
     assert key not in adapter._session_raw_messages
     assert raw.effective() == set()
+    # completion updates status but leaves emoji_ack 0
+    row3 = _query_durable_row(adapter, "9101")
+    assert row3[1] == 0
+    assert row3[0] == "processed"
 
     # Control: confirmed start still permits tool and terminal ledger behavior
     raw2 = LedgerMessage(msg_id=9102)
     event2 = _make_event("9102", raw2)
     source2 = event2.source
     key2 = adapter._reaction_msg_key(event2)
-    ack2 = MagicMock()
-    adapter._record_discord_processing_start = ack2
     await adapter.on_processing_start(event2)
     assert raw2.ledger() == [("add", "🤖")]
-    assert ack2.call_args.kwargs["emoji_ack"] is True
+    row_ctl = _query_durable_row(adapter, "9102")
+    assert row_ctl[1] == 1
     assert key2 in adapter._rxn_active
     assert key2 in adapter._session_raw_messages
     with patch("agent.display.get_tool_emoji", return_value="📄"):
@@ -852,15 +895,18 @@ async def test_failed_start_false_blocks_tool_and_complete_with_recovered_provid
     assert ("add", "📄") in raw2.ledger()
     assert adapter._rxn_active.get(key2) == "📄"
     await adapter.on_processing_complete(event2, ProcessingOutcome.SUCCESS)
-    # terminal should have restored persona and removed tool
     assert raw2.effective() == {"🤖"}
     assert key2 not in adapter._rxn_active
     assert key2 not in adapter._session_raw_messages
+    row_ctl2 = _query_durable_row(adapter, "9102")
+    # successful start ack remains 1 after completion
+    assert row_ctl2[1] == 1
 
 
 @pytest.mark.asyncio
-async def test_failed_start_exception_blocks_tool_and_complete_with_recovered_provider(adapter):
-    """Provider exception on start must block later tool and completion even after provider recovers."""
+async def test_failed_start_exception_blocks_tool_and_complete_with_recovered_provider(tmp_path, monkeypatch):
+    """Provider exception on start must block later tool and completion even after provider recovers — real durable."""
+    adapter = _make_recovery_adapter(tmp_path, monkeypatch)
     adapter.config.extra["persona_emoji"] = "🤖"
     adapter.config.extra["dynamic_reactions"] = True
     adapter.config.extra["reaction_cooldown"] = 0
@@ -874,8 +920,6 @@ async def test_failed_start_exception_blocks_tool_and_complete_with_recovered_pr
 
     orig_add = adapter._reaction_add
     adapter._reaction_add = AsyncMock(side_effect=RuntimeError("boom"))
-    ack_start = MagicMock()
-    adapter._record_discord_processing_start = ack_start
 
     await adapter.on_processing_start(event)
 
@@ -883,8 +927,9 @@ async def test_failed_start_exception_blocks_tool_and_complete_with_recovered_pr
     assert key not in adapter._rxn_active
     assert key not in adapter._rxn_msg_refs
     assert key not in adapter._session_raw_messages
-    assert ack_start.call_count == 1
-    assert ack_start.call_args.kwargs["emoji_ack"] is False
+    row = _query_durable_row(adapter, "9201")
+    assert row is not None
+    assert row[1] == 0
 
     adapter._reaction_add = orig_add
     adapter._rxn_cooldown = 0.0
@@ -897,8 +942,6 @@ async def test_failed_start_exception_blocks_tool_and_complete_with_recovered_pr
     assert key not in adapter._rxn_msg_refs
     assert key not in adapter._session_raw_messages
 
-    complete_ack = MagicMock()
-    adapter._record_discord_processing_complete = complete_ack
     await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
 
     assert raw.ledger() == []
@@ -906,17 +949,269 @@ async def test_failed_start_exception_blocks_tool_and_complete_with_recovered_pr
     assert key not in adapter._rxn_msg_refs
     assert key not in adapter._session_raw_messages
     assert raw.effective() == set()
+    row2 = _query_durable_row(adapter, "9201")
+    assert row2[1] == 0
 
     # Control: confirmed start still permits existing ledger behavior
     raw2 = LedgerMessage(msg_id=9202)
     event2 = _make_event("9202", raw2)
-    ack2 = MagicMock()
-    adapter._record_discord_processing_start = ack2
     await adapter.on_processing_start(event2)
     assert raw2.ledger() == [("add", "🤖")]
-    assert ack2.call_args.kwargs["emoji_ack"] is True
+    row_ctl = _query_durable_row(adapter, "9202")
+    assert row_ctl[1] == 1
     with patch("agent.display.get_tool_emoji", return_value="📄"):
         await adapter.on_tool_call_start(event2.source, "read_file")
     assert ("add", "📄") in raw2.ledger()
     await adapter.on_processing_complete(event2, ProcessingOutcome.FAILURE)
     assert raw2.effective() == {"❌"}
+    row_ctl2 = _query_durable_row(adapter, "9202")
+    assert row_ctl2[1] == 1
+
+
+# ---------------------------------------------------------------------------
+# Stale same-key authority — confirmed message1 then failed/disabled/missing start for message2
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_stale_same_key_failed_start_clears_prior_authority(tmp_path, monkeypatch):
+    """Confirmed start message1 → same-key provider-False start message2 → tool/completion must not affect message1 — real DB."""
+    adapter = _make_recovery_adapter(tmp_path, monkeypatch)
+    adapter.config.extra["persona_emoji"] = "🤖"
+    adapter.config.extra["dynamic_reactions"] = True
+    adapter.config.extra["reaction_cooldown"] = 0
+    adapter._rxn_persona_emoji = "🤖"
+    adapter._rxn_dynamic = True
+    adapter._rxn_cooldown = 0.0
+
+    # Same participant/profile-scoped key: same chat_id 123
+    src = _make_source(chat_id="123")
+    raw1 = LedgerMessage(msg_id=8001)
+    event1 = _make_event("8001", raw1, source=src)
+    await adapter.on_processing_start(event1)
+    assert raw1.ledger() == [("add", "🤖")]
+    key = adapter._reaction_msg_key(event1)
+    assert key in adapter._rxn_active
+    assert key in adapter._session_raw_messages
+    row1 = _query_durable_row(adapter, "8001")
+    assert row1[1] == 1
+
+    # Same-key second message with provider False
+    raw2 = LedgerMessage(msg_id=8002)
+    event2 = _make_event("8002", raw2, source=src)
+    orig_add = adapter._reaction_add
+    adapter._reaction_add = AsyncMock(return_value=False)
+    await adapter.on_processing_start(event2)
+    # Must clear prior authority
+    assert key not in adapter._rxn_active
+    assert key not in adapter._rxn_msg_refs
+    assert key not in adapter._session_raw_messages
+    assert raw1.ledger() == [("add", "🤖")]  # no new effects on message1
+    assert raw2.ledger() == []
+    row2 = _query_durable_row(adapter, "8002")
+    assert row2 is not None
+    assert row2[1] == 0
+
+    # Recover provider, then source-only tool/completion must not mutate message1
+    adapter._reaction_add = orig_add
+    adapter._rxn_cooldown = 0.0
+    with patch("agent.display.get_tool_emoji", return_value="📄"):
+        await adapter.on_tool_call_start(src, "read_file")
+    assert raw1.ledger() == [("add", "🤖")]
+    assert raw2.ledger() == []
+    assert key not in adapter._rxn_active
+    assert key not in adapter._rxn_msg_refs
+
+    await adapter.on_processing_complete(event2, ProcessingOutcome.SUCCESS)
+    assert raw1.ledger() == [("add", "🤖")]
+    assert raw1.effective() == {"🤖"}
+    assert raw2.ledger() == []
+    assert key not in adapter._rxn_active
+    assert key not in adapter._session_raw_messages
+    # durable for message2 remains 0
+    row2b = _query_durable_row(adapter, "8002")
+    assert row2b[1] == 0
+
+
+@pytest.mark.asyncio
+async def test_stale_same_key_disabled_start_clears_prior_authority(tmp_path, monkeypatch):
+    """Confirmed start message1 → same-key disabled start message2 → recovery tool must not mutate message1."""
+    adapter = _make_recovery_adapter(tmp_path, monkeypatch)
+    adapter.config.extra["persona_emoji"] = "🤖"
+    adapter.config.extra["dynamic_reactions"] = True
+    adapter.config.extra["reaction_cooldown"] = 0
+    adapter._rxn_persona_emoji = "🤖"
+    adapter._rxn_dynamic = True
+    adapter._rxn_cooldown = 0.0
+
+    src = _make_source(chat_id="456")
+    raw1 = LedgerMessage(msg_id=8011)
+    event1 = _make_event("8011", raw1, source=src)
+    await adapter.on_processing_start(event1)
+    assert raw1.ledger() == [("add", "🤖")]
+    key = adapter._reaction_msg_key(event1)
+    row1 = _query_durable_row(adapter, "8011")
+    assert row1[1] == 1
+
+    # Disabled second start (reactions disabled via env)
+    monkeypatch.setenv("DISCORD_REACTIONS", "false")
+    raw2 = LedgerMessage(msg_id=8012)
+    event2 = _make_event("8012", raw2, source=src)
+    await adapter.on_processing_start(event2)
+    assert key not in adapter._rxn_active
+    assert key not in adapter._rxn_msg_refs
+    assert key not in adapter._session_raw_messages
+    assert raw1.ledger() == [("add", "🤖")]
+    assert raw2.ledger() == []
+    row2 = _query_durable_row(adapter, "8012")
+    assert row2 is not None
+    assert row2[1] == 0
+    # re-enable and ensure tool still no-ops (stale cleared)
+    monkeypatch.delenv("DISCORD_REACTIONS", raising=False)
+    adapter._rxn_cooldown = 0.0
+    with patch("agent.display.get_tool_emoji", return_value="📄"):
+        await adapter.on_tool_call_start(src, "read_file")
+    assert raw1.ledger() == [("add", "🤖")]
+    assert raw2.ledger() == []
+    await adapter.on_processing_complete(event2, ProcessingOutcome.SUCCESS)
+    assert raw1.ledger() == [("add", "🤖")]
+    assert key not in adapter._rxn_active
+
+
+@pytest.mark.asyncio
+async def test_stale_same_key_missing_capability_start_clears_prior_authority(tmp_path, monkeypatch):
+    """Confirmed start message1 → same-key missing-capability start message2 → tool must not affect message1."""
+    adapter = _make_recovery_adapter(tmp_path, monkeypatch)
+    adapter.config.extra["persona_emoji"] = "🤖"
+    adapter.config.extra["dynamic_reactions"] = True
+    adapter.config.extra["reaction_cooldown"] = 0
+    adapter._rxn_persona_emoji = "🤖"
+    adapter._rxn_dynamic = True
+    adapter._rxn_cooldown = 0.0
+
+    src = _make_source(chat_id="789")
+    raw1 = LedgerMessage(msg_id=8021)
+    event1 = _make_event("8021", raw1, source=src)
+    await adapter.on_processing_start(event1)
+    assert raw1.ledger() == [("add", "🤖")]
+    key = adapter._reaction_msg_key(event1)
+    row1 = _query_durable_row(adapter, "8021")
+    assert row1[1] == 1
+
+    # Missing capability: raw without add_reaction
+    raw2 = SimpleNamespace(id=8022)
+    event2 = _make_event("8022", raw2, source=src)
+    await adapter.on_processing_start(event2)
+    assert key not in adapter._rxn_active
+    assert key not in adapter._rxn_msg_refs
+    assert key not in adapter._session_raw_messages
+    assert raw1.ledger() == [("add", "🤖")]
+    row2 = _query_durable_row(adapter, "8022")
+    assert row2 is not None
+    assert row2[1] == 0
+
+    adapter._rxn_cooldown = 0.0
+    with patch("agent.display.get_tool_emoji", return_value="📄"):
+        await adapter.on_tool_call_start(src, "read_file")
+    assert raw1.ledger() == [("add", "🤖")]
+    await adapter.on_processing_complete(event2, ProcessingOutcome.SUCCESS)
+    assert raw1.ledger() == [("add", "🤖")]
+    assert key not in adapter._rxn_active
+
+
+@pytest.mark.asyncio
+async def test_stale_disabled_completion_clears_authority(tmp_path, monkeypatch):
+    """Confirmed start → disabled completion must clear stale so later tool cannot mutate the message."""
+    adapter = _make_recovery_adapter(tmp_path, monkeypatch)
+    adapter.config.extra["persona_emoji"] = "🤖"
+    adapter.config.extra["dynamic_reactions"] = True
+    adapter.config.extra["reaction_cooldown"] = 0
+    adapter._rxn_persona_emoji = "🤖"
+    adapter._rxn_dynamic = True
+    adapter._rxn_cooldown = 0.0
+
+    src = _make_source(chat_id="999")
+    raw1 = LedgerMessage(msg_id=8031)
+    event1 = _make_event("8031", raw1, source=src)
+    await adapter.on_processing_start(event1)
+    assert raw1.ledger() == [("add", "🤖")]
+    key = adapter._reaction_msg_key(event1)
+    assert key in adapter._rxn_active
+
+    # Disabled completion
+    monkeypatch.setenv("DISCORD_REACTIONS", "false")
+    await adapter.on_processing_complete(event1, ProcessingOutcome.SUCCESS)
+    # Must have cleared stale authority even though reactions disabled
+    assert key not in adapter._rxn_active
+    assert key not in adapter._rxn_msg_refs
+    assert key not in adapter._session_raw_messages
+    # Ledger should not have added final persona (disabled) and should not have mutated again
+    assert raw1.ledger() == [("add", "🤖")]
+    # Re-enable and attempt tool — must remain no-op and not affect raw1
+    monkeypatch.delenv("DISCORD_REACTIONS", raising=False)
+    adapter._rxn_cooldown = 0.0
+    with patch("agent.display.get_tool_emoji", return_value="📄"):
+        await adapter.on_tool_call_start(src, "read_file")
+    assert raw1.ledger() == [("add", "🤖")]
+    assert key not in adapter._rxn_active
+
+
+# ---------------------------------------------------------------------------
+# Removal ACK — provider False during add-before-remove swap must not advance tracked state
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_tool_swap_removal_false_does_not_advance_tracked_state(tmp_path, monkeypatch):
+    """When _reaction_remove returns False during tool swap, tracked state must not advance and cleanup remains reachable."""
+    adapter = _make_recovery_adapter(tmp_path, monkeypatch)
+    adapter.config.extra["persona_emoji"] = "🤖"
+    adapter.config.extra["dynamic_reactions"] = True
+    adapter.config.extra["reaction_cooldown"] = 0
+    adapter._rxn_persona_emoji = "🤖"
+    adapter._rxn_dynamic = True
+    adapter._rxn_cooldown = 0.0
+
+    raw = LedgerMessage(msg_id=9103)
+    event = _make_event("9103", raw)
+    src = event.source
+    await adapter.on_processing_start(event)
+    assert raw.ledger() == [("add", "🤖")]
+    assert raw.effective() == {"🤖"}
+    key = adapter._reaction_msg_key(event)
+    assert adapter._rxn_active.get(key) == "🤖"
+
+    # Make removal return False at provider boundary (keep add succeeding)
+    orig_remove = adapter._reaction_remove
+    adapter._reaction_remove = AsyncMock(return_value=False)
+
+    with patch("agent.display.get_tool_emoji", return_value="📄"):
+        await adapter.on_tool_call_start(src, "read_file")
+
+    # Add succeeded, so ledger has both emojis, but tracked must NOT have advanced
+    assert ("add", "📄") in raw.ledger()
+    # Removal was attempted but returned False, so no remove in ledger (mocked boundary)
+    # Effective remote has both (add succeeded, remove not confirmed)
+    # Tracked state must still be persona, not tool
+    assert adapter._rxn_active.get(key) == "🤖", "tracked state must not advance when removal unconfirmed"
+    assert raw.effective() == {"🤖", "📄"}
+
+    # Cleanup must remain reachable: restore provider and retry swap must succeed
+    adapter._reaction_remove = orig_remove
+    adapter._rxn_cooldown = 0.0
+    with patch("agent.display.get_tool_emoji", return_value="📄"):
+        await adapter.on_tool_call_start(src, "read_file")
+    # Now removal succeeds, should be add before remove ordering already proven, but now active advances
+    assert adapter._rxn_active.get(key) == "📄"
+    assert raw.effective() == {"📄"}
+    # Additional reachable check: distinct tool after failure
+    adapter._rxn_cooldown = 0.0
+    with patch("agent.display.get_tool_emoji", return_value="🔍"):
+        await adapter.on_tool_call_start(src, "web_search")
+    assert adapter._rxn_active.get(key) == "🔍"
+    assert raw.effective() == {"🔍"}
+
+    # Completion should still be able to run and restore persona
+    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+    assert raw.effective() == {"🤖"}
+    assert key not in adapter._rxn_active
+
+
