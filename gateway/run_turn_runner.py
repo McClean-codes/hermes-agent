@@ -38,6 +38,7 @@ logger = logging.getLogger("gateway.run")
 def _normalize_param_name(name: str) -> str:
     """Normalize a query param name for sensitive comparison: 3-round unquote_plus, casefold, hyphen/space to underscore."""
     from urllib.parse import unquote_plus
+
     decoded = name
     for _ in range(3):
         try:
@@ -54,6 +55,7 @@ def _get_normalized_sensitive_set():
     """Return normalized authoritative sensitive set or None if unavailable (fail-closed)."""
     try:
         from agent.redact import _SENSITIVE_QUERY_PARAMS
+
         return frozenset(_normalize_param_name(k) for k in _SENSITIVE_QUERY_PARAMS)
     except Exception:
         return None
@@ -71,23 +73,85 @@ def _is_sensitive_key(key: str, normalized_set) -> bool:
 def _find_sensitive_value_end(text: str, start: int) -> int:
     n = len(text)
     j = start
-    terminators = {'&', ';', '#', '"', "'", "<", ">", "]", "}", ")"}
+    terminators = {"&", ";", "#", '"', "'", "<", ">", "]", "}", ")"}
     prose_words = {
-        "and", "or", "the", "with", "for", "a", "an", "in", "on", "at", "by", "to", "of",
-        "is", "are", "was", "were", "be", "been", "has", "have", "had", "do", "does", "did",
-        "will", "would", "could", "should", "may", "might", "must", "can", "cannot", "but",
-        "if", "then", "else", "when", "where", "why", "how", "what", "which", "who", "whom",
-        "whose", "that", "this", "these", "those", "it", "its", "they", "them", "their",
-        "we", "you", "he", "she", "combined", "bare", "query", "reasoning", "userinfo",
-        "benign", "answer", "secrets", "no",
+        "and",
+        "or",
+        "the",
+        "with",
+        "for",
+        "a",
+        "an",
+        "in",
+        "on",
+        "at",
+        "by",
+        "to",
+        "of",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "has",
+        "have",
+        "had",
+        "do",
+        "does",
+        "did",
+        "will",
+        "would",
+        "could",
+        "should",
+        "may",
+        "might",
+        "must",
+        "can",
+        "cannot",
+        "but",
+        "if",
+        "then",
+        "else",
+        "when",
+        "where",
+        "why",
+        "how",
+        "what",
+        "which",
+        "who",
+        "whom",
+        "whose",
+        "that",
+        "this",
+        "these",
+        "those",
+        "it",
+        "its",
+        "they",
+        "them",
+        "their",
+        "we",
+        "you",
+        "he",
+        "she",
+        "combined",
+        "bare",
+        "query",
+        "reasoning",
+        "userinfo",
+        "benign",
+        "answer",
+        "secrets",
+        "no",
     }
     while j < n:
         c = text[j]
         if c in terminators:
             break
-        if c in ' \t\n\r':
+        if c in " \t\n\r":
             k = j
-            while k < n and text[k] in ' \t\n\r':
+            while k < n and text[k] in " \t\n\r":
                 k += 1
             if k >= n:
                 j = n
@@ -96,18 +160,29 @@ def _find_sensitive_value_end(text: str, start: int) -> int:
             if nxt in terminators:
                 break
             token_end = k
-            while token_end < n and text[token_end] not in terminators and text[token_end] not in ' \t\n\r':
+            while (
+                token_end < n
+                and text[token_end] not in terminators
+                and text[token_end] not in " \t\n\r"
+            ):
                 token_end += 1
             next_token = text[k:token_end]
-            if next_token.startswith("http://") or next_token.startswith("https://") or next_token.startswith("ws://") or next_token.startswith("wss://") or next_token.startswith("ftp://") or next_token.startswith("//"):
+            if (
+                next_token.startswith("http://")
+                or next_token.startswith("https://")
+                or next_token.startswith("ws://")
+                or next_token.startswith("wss://")
+                or next_token.startswith("ftp://")
+                or next_token.startswith("//")
+            ):
                 break
             if next_token.casefold() in prose_words:
                 break
-            next_amp = text.find('&', k)
-            next_semi = text.find(';', k)
-            next_hash = text.find('#', k)
+            next_amp = text.find("&", k)
+            next_semi = text.find(";", k)
+            next_hash = text.find("#", k)
             next_ws2 = None
-            for ws in [' ', '\n', '\t', '\r']:
+            for ws in [" ", "\n", "\t", "\r"]:
                 idx = text.find(ws, k)
                 if idx != -1:
                     if next_ws2 is None or idx < next_ws2:
@@ -122,7 +197,12 @@ def _find_sensitive_value_end(text: str, start: int) -> int:
                 continue
             if next_term is None and next_ws2 is None:
                 import re
-                if next_token and len(next_token) <= 20 and next_token.casefold() not in prose_words:
+
+                if (
+                    next_token
+                    and len(next_token) <= 20
+                    and next_token.casefold() not in prose_words
+                ):
                     if re.fullmatch(r"[A-Za-z0-9_\-\.\!\+\%]+", next_token):
                         j = k
                         continue
@@ -135,10 +215,11 @@ def _find_sensitive_value_end(text: str, start: int) -> int:
 
 
 def _canonicalize_query_whitespace(text: str, normalized_set) -> str:
-    if not text or '?' not in text:
-        if '&' not in text and ';' not in text:
+    if not text or "?" not in text:
+        if "&" not in text and ";" not in text:
             return text
     import re
+
     pattern = re.compile(r"([?&#;])\s*([^=\s&;#\"'<>]+?)\s*=")
     intervals = []
     for m in pattern.finditer(text):
@@ -162,21 +243,27 @@ def _canonicalize_query_whitespace(text: str, normalized_set) -> str:
     for s, e in merged:
         out_parts.append(text[last:s])
         segment = text[s:e]
-        no_ws = re.sub(r'[ \t\n\r]+', '', segment)
+        no_ws = re.sub(r"[ \t\n\r]+", "", segment)
         out_parts.append(no_ws)
         last = e
     out_parts.append(text[last:])
-    return ''.join(out_parts)
+    return "".join(out_parts)
 
 
 def _canonicalize_userinfo_whitespace(text: str) -> str:
     import re
+
     new_text = text
     for _ in range(5):
-        pat1 = re.compile(r'((?:https?|wss?|ftp)://[^/\s?#]*:[^/\s?#@]*)\s+([^\s]*@[^\s]*)', re.IGNORECASE)
-        pat2 = re.compile(r'(//[^/\s?#]*:[^/\s?#@]*)\s+([^\s]*@[^\s]*)')
+        pat1 = re.compile(
+            r"((?:https?|wss?|ftp)://[^/\s?#]*:[^/\s?#@]*)\s+([^\s]*@[^\s]*)",
+            re.IGNORECASE,
+        )
+        pat2 = re.compile(r"(//[^/\s?#]*:[^/\s?#@]*)\s+([^\s]*@[^\s]*)")
+
         def repl(m):
             return m.group(1) + m.group(2)
+
         tmp = pat1.sub(repl, new_text)
         tmp = pat2.sub(repl, tmp)
         if tmp == new_text:
@@ -197,6 +284,7 @@ def _find_safe_prefix_len(text: str, normalized_set) -> int:
         return 0
     candidates = []
     import re
+
     pattern = re.compile(r"([?&#;])\s*([^=\s&;#\"'<>]+?)\s*=")
     for m in pattern.finditer(text):
         key = m.group(2)
@@ -205,44 +293,44 @@ def _find_safe_prefix_len(text: str, normalized_set) -> int:
         val_start = m.end()
         val_end = _find_sensitive_value_end(text, val_start)
         if val_end == n:
-            scheme_pos = text.rfind('://', 0, m.start())
+            scheme_pos = text.rfind("://", 0, m.start())
             if scheme_pos != -1:
                 s = scheme_pos
-                while s > 0 and text[s-1].isalpha():
+                while s > 0 and text[s - 1].isalpha():
                     s -= 1
                 url_start = s
             else:
-                net_pos = text.rfind('//', 0, m.start())
+                net_pos = text.rfind("//", 0, m.start())
                 if net_pos != -1:
                     url_start = net_pos
                 else:
                     url_start = m.start()
             candidates.append(url_start)
-    for m in re.finditer(r'(?:https?|wss?|ftp)://', text, re.IGNORECASE):
+    for m in re.finditer(r"(?:https?|wss?|ftp)://", text, re.IGNORECASE):
         url_start = m.start()
         auth_start = m.end()
         ends = []
-        for sep in ['/', '?', '#']:
+        for sep in ["/", "?", "#"]:
             idx = text.find(sep, auth_start)
             if idx != -1:
                 ends.append(idx)
         auth_end = min(ends) if ends else n
         segment = text[auth_start:auth_end]
-        if ':' in segment and '@' not in segment:
+        if ":" in segment and "@" not in segment:
             candidates.append(url_start)
-    for m in re.finditer(r'//', text):
-        if m.start() > 0 and text[m.start()-1] == ':':
+    for m in re.finditer(r"//", text):
+        if m.start() > 0 and text[m.start() - 1] == ":":
             continue
         url_start = m.start()
         auth_start = m.end()
         ends = []
-        for sep in ['/', '?', '#']:
+        for sep in ["/", "?", "#"]:
             idx = text.find(sep, auth_start)
             if idx != -1:
                 ends.append(idx)
         auth_end = min(ends) if ends else n
         segment = text[auth_start:auth_end]
-        if ':' in segment and '@' not in segment:
+        if ":" in segment and "@" not in segment:
             candidates.append(url_start)
     if candidates:
         return min(candidates)
@@ -251,26 +339,32 @@ def _find_safe_prefix_len(text: str, normalized_set) -> int:
 
 def _strict_url_param_fixup(text: str, normalized_set) -> str:
     import re
+
     if normalized_set is None:
         return text
     pat = re.compile(r"([?#&;])([A-Za-z0-9_.~+%\-]+)=([^#&;\s\"'<>]*)")
+
     def repl(m):
         key = m.group(2)
         if _is_sensitive_key(key, normalized_set):
             return f"{m.group(1)}{m.group(2)}=***"
         return m.group(0)
+
     return pat.sub(repl, text)
 
 
 def _strict_url_userinfo_fixup(text: str) -> str:
     import re
+
     pat = re.compile(r"(//)([^/\s?#@]+)@")
+
     def repl(m):
         userinfo = m.group(2)
         if ":" in userinfo:
             return f"{m.group(1)}{userinfo.partition(':')[0]}:***@"
         else:
             return f"{m.group(1)}***@"
+
     return pat.sub(repl, text)
 
 
@@ -296,7 +390,10 @@ def _redact_progress_text(text: str | None, *, final: bool = True) -> str:
             canonical = _canonicalize_text(safe_raw, normalized_set)
         try:
             from agent.redact import redact_sensitive_text
-            redacted = redact_sensitive_text(canonical, force=True, redact_url_credentials=True)
+
+            redacted = redact_sensitive_text(
+                canonical, force=True, redact_url_credentials=True
+            )
             try:
                 fixed = _strict_url_param_fixup(redacted, normalized_set)
                 fixed = _strict_url_userinfo_fixup(fixed)
@@ -314,33 +411,42 @@ def _redact_progress_text(text: str | None, *, final: bool = True) -> str:
                 safe_raw = s[:safe_len]
                 canonical_fb = _canonicalize_text(safe_raw, normalized_set)
             from gateway.run import _redact_gateway_user_facing_secrets
+
             redacted = _redact_gateway_user_facing_secrets(canonical_fb)
             try:
                 from agent.redact import _redact_strict_url_credentials
+
                 strict = _redact_strict_url_credentials(redacted)
                 try:
                     strict = _strict_url_param_fixup(strict, normalized_set)
                 except Exception:
                     pass
                 if "://" in canonical_fb:
-                    if canonical_fb != redacted and ("***" in strict or "[REDACTED]" in strict):
+                    if canonical_fb != redacted and (
+                        "***" in strict or "[REDACTED]" in strict
+                    ):
                         return strict
                     if "***" in strict or strict == "[REDACTED]":
                         return strict
                 return strict
             except Exception:
                 if "://" in canonical_fb or "?" in canonical_fb or "@" in canonical_fb:
-                    if canonical_fb != redacted and ("***" in redacted or "[REDACTED]" in redacted):
+                    if canonical_fb != redacted and (
+                        "***" in redacted or "[REDACTED]" in redacted
+                    ):
                         return redacted
                     return "[REDACTED]"
                 return redacted
         except Exception:
             logger.debug("progress redaction unavailable", exc_info=True)
             check_text = s
-            has_url_shape = "://" in check_text or "?" in check_text or "@" in check_text
+            has_url_shape = (
+                "://" in check_text or "?" in check_text or "@" in check_text
+            )
             has_credential_shape = False
             try:
                 from agent.redact import _PREFIX_SUBSTRINGS
+
                 for p in _PREFIX_SUBSTRINGS:
                     if p and p in check_text:
                         has_credential_shape = True
@@ -406,6 +512,7 @@ class _StatefulStreamRedactor:
                 return True
         try:
             from agent.redact import _PREFIX_SUBSTRINGS
+
             for p in _PREFIX_SUBSTRINGS:
                 if p and p in s:
                     return True
@@ -434,10 +541,12 @@ class _StatefulStreamRedactor:
                 return sanitized_full
             self._failure_latch = "both_failed"
             return None
-        if len(sanitized_full) < len(self._sanitized_flushed) or not sanitized_full.startswith(self._sanitized_flushed):
+        if len(sanitized_full) < len(
+            self._sanitized_flushed
+        ) or not sanitized_full.startswith(self._sanitized_flushed):
             self._failure_latch = "both_failed"
             return None
-        new_part = sanitized_full[len(self._sanitized_flushed):]
+        new_part = sanitized_full[len(self._sanitized_flushed) :]
         self._sanitized_flushed = sanitized_full
         return new_part if new_part else None
 
@@ -461,7 +570,7 @@ class _StatefulStreamRedactor:
 
     def pending_sanitized_tail(self) -> str:
         if len(self._sanitized_full) > len(self._sanitized_flushed):
-            return self._sanitized_full[len(self._sanitized_flushed):]
+            return self._sanitized_full[len(self._sanitized_flushed) :]
         return ""
 
 
@@ -474,6 +583,7 @@ def _sanitize_stream_final_text(platform: Any, text: str | None) -> str:
         return s
     try:
         from gateway.run import _sanitize_gateway_final_response
+
         return _sanitize_gateway_final_response(platform, s)
     except Exception:
         try:

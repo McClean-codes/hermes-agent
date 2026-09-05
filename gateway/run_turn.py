@@ -3530,7 +3530,9 @@ class GatewayTurnMixin:
                                             )
 
                                             try:
-                                                _san = _proxy_redact(content, final=False)
+                                                _san = _proxy_redact(
+                                                    content, final=False
+                                                )
                                             except Exception:
                                                 _san = "[REDACTED]"
                                             _stream_consumer.on_delta(_san)
@@ -3610,7 +3612,9 @@ class GatewayTurnMixin:
             )
 
             _san_ret = (
-                _proxy_ret_redact(full_response, final=True) if full_response else full_response
+                _proxy_ret_redact(full_response, final=True)
+                if full_response
+                else full_response
             )
             if _san_ret is None:
                 _san_ret = "[REDACTED]"

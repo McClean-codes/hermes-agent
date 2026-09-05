@@ -7947,14 +7947,18 @@ class TestStatefulStreamedEgress:
             except:
                 pass
 
+
 class TestPFSharedFailClosedEgressV2:
     """PF_SHARED_FAIL_CLOSED_EGRESS_V2 comprehensive real-caller ledger coverage."""
+
     LONG_OPAQUE = "longOpaqueUserInfo1234567890ABCDEFExtraLongTail1234567890"
+
     @staticmethod
     def _assert_no_raw(payload: str, raws):
         for r in raws:
             if r and r in payload:
                 raise AssertionError(f"raw leak {r!r} in {payload!r}")
+
     @pytest.mark.asyncio
     async def test_stream_ledger_comprehensive_split_variants(self):
         import queue, asyncio, re
@@ -7963,75 +7967,178 @@ class TestPFSharedFailClosedEgressV2:
         from gateway.run_turn_runner import TurnRunner
         from gateway.stream_consumer import StreamConsumerConfig
         from gateway.platforms.base import SendResult
-        from gateway.config import Platform, GatewayConfig, PlatformConfig, StreamingConfig
+        from gateway.config import (
+            Platform,
+            GatewayConfig,
+            PlatformConfig,
+            StreamingConfig,
+        )
+
         variants = [
             ("short", "https://ex.com/cb?session=opaque\nx&view=1", ["opaque"]),
             ("punct", "https://ex.com/cb?api-key=opaque !&view=1", ["opaque"]),
-            ("dotted", "https://ex.com/cb?x-amz-signature=opaque\t.tail&view=1", ["opaque", ".tail"]),
+            (
+                "dotted",
+                "https://ex.com/cb?x-amz-signature=opaque\t.tail&view=1",
+                ["opaque", ".tail"],
+            ),
             ("network", "//alice:opaque .tail@ex.test/p", ["opaque", ".tail"]),
             ("hyphen", "https://ex.com/cb?api-key=opaque\nx&view=1", ["opaque"]),
             ("double", "https://ex.com/cb?api%255Fkey=opaque\nx&view=1", ["opaque"]),
             ("triple", "https://ex.com/cb?api%252Bkey=opaque\nx&view=1", ["opaque"]),
-            ("session", "https://ex.com/cb?session=opaqueTok123\nx&view=1", ["opaqueTok123"]),
-            ("xamz", "https://ex.com/cb?x-amz-signature=opaqueSigAb\t.tail&view=1", ["opaqueSigAb"]),
-            ("userinfo_nl", "https://alice:longOpaqueUserInfo1234567890ABCDEFExtraLongTail1234567890\nOpaqueTail@ex.com/p", ["longOpaqueUserInfo1234567890ABCDEFExtraLongTail1234567890"]),
+            (
+                "session",
+                "https://ex.com/cb?session=opaqueTok123\nx&view=1",
+                ["opaqueTok123"],
+            ),
+            (
+                "xamz",
+                "https://ex.com/cb?x-amz-signature=opaqueSigAb\t.tail&view=1",
+                ["opaqueSigAb"],
+            ),
+            (
+                "userinfo_nl",
+                "https://alice:longOpaqueUserInfo1234567890ABCDEFExtraLongTail1234567890\nOpaqueTail@ex.com/p",
+                ["longOpaqueUserInfo1234567890ABCDEFExtraLongTail1234567890"],
+            ),
         ]
         for name, hostile, raws in variants:
             ledger = []
+
             class Cap:
                 async def send(self, chat_id, content, reply_to=None, metadata=None):
                     ledger.append(("send", content))
                     return SendResult(success=True, message_id="m1")
-                async def edit_message(self, chat_id, message_id, content, metadata=None, finalize=False):
+
+                async def edit_message(
+                    self, chat_id, message_id, content, metadata=None, finalize=False
+                ):
                     ledger.append(("edit", content))
-                    m = MagicMock(); m.success = True; m.message_id = message_id; return m
-                async def send_typing(self, chat_id, metadata=None): return None
-                async def get_chat_info(self, chat_id): return {"id": chat_id}
-                def supports_draft_streaming(self, **kw): return False
-                def supports_native_streaming(self, **kw): return False
+                    m = MagicMock()
+                    m.success = True
+                    m.message_id = message_id
+                    return m
+
+                async def send_typing(self, chat_id, metadata=None):
+                    return None
+
+                async def get_chat_info(self, chat_id):
+                    return {"id": chat_id}
+
+                def supports_draft_streaming(self, **kw):
+                    return False
+
+                def supports_native_streaming(self, **kw):
+                    return False
+
             cap = Cap()
-            ctx = TurnContext(source=MagicMock(chat_id="C123", platform=Platform.SLACK), _run_still_current=lambda: True, progress_mode="all", tool_progress_enabled=True, tool_progress_filter={}, progress_queue=queue.Queue(), log_queue=None, last_progress_msg=[None], last_tool=[None], last_was_terminal_block=[False], repeat_count=[0], long_tool_hint_fired=[False], agent_holder=[None], _native_slack_task_cards=False, result_holder=[None], tools_holder=[None], stream_consumer_holder=[None], streaming_tts_consumer_holder=[None], user_config={"display": {}}, resolve_display_setting=lambda cfg, plat, key: None, event_message_id="evt-"+name, _status_thread_metadata={})
+            ctx = TurnContext(
+                source=MagicMock(chat_id="C123", platform=Platform.SLACK),
+                _run_still_current=lambda: True,
+                progress_mode="all",
+                tool_progress_enabled=True,
+                tool_progress_filter={},
+                progress_queue=queue.Queue(),
+                log_queue=None,
+                last_progress_msg=[None],
+                last_tool=[None],
+                last_was_terminal_block=[False],
+                repeat_count=[0],
+                long_tool_hint_fired=[False],
+                agent_holder=[None],
+                _native_slack_task_cards=False,
+                result_holder=[None],
+                tools_holder=[None],
+                stream_consumer_holder=[None],
+                streaming_tts_consumer_holder=[None],
+                user_config={"display": {}},
+                resolve_display_setting=lambda cfg, plat, key: None,
+                event_message_id="evt-" + name,
+                _status_thread_metadata={},
+            )
+
             class Stub:
                 def __init__(self):
-                    self.config = GatewayConfig(platforms={Platform.SLACK: PlatformConfig(enabled=True, token="x")})
-                    self.config.streaming = StreamingConfig(enabled=True, transport="edit", edit_interval=0.05, buffer_threshold=1)
-                def _adapter_for_source(self, s): return cap
-                def _build_stream_consumer_config(self, source, scfg, adapter, on_missing_cursor="raise"):
-                    return StreamConsumerConfig(edit_interval=0.05, buffer_threshold=1, cursor="", transport="edit", chat_type="channel"), None
+                    self.config = GatewayConfig(
+                        platforms={
+                            Platform.SLACK: PlatformConfig(enabled=True, token="x")
+                        }
+                    )
+                    self.config.streaming = StreamingConfig(
+                        enabled=True,
+                        transport="edit",
+                        edit_interval=0.05,
+                        buffer_threshold=1,
+                    )
+
+                def _adapter_for_source(self, s):
+                    return cap
+
+                def _build_stream_consumer_config(
+                    self, source, scfg, adapter, on_missing_cursor="raise"
+                ):
+                    return StreamConsumerConfig(
+                        edit_interval=0.05,
+                        buffer_threshold=1,
+                        cursor="",
+                        transport="edit",
+                        chat_type="channel",
+                    ), None
+
             runner = TurnRunner(Stub(), ctx)
             sc, delta_cb, _, _ = runner._setup_stream_consumer("slack")
             task = asyncio.create_task(sc.run())
             await asyncio.sleep(0.08)
             prefix = "prefix "
             m = re.search(r"[ \t\n]", hostile)
-            split_at = m.start() if m else len(hostile)//2
+            split_at = m.start() if m else len(hostile) // 2
             part1 = prefix + hostile[:split_at]
             part2 = hostile[split_at:]
             delta_cb(part1)
             await asyncio.sleep(0.15)
-            assert ledger[0][1] == prefix, f"{name}: initial send should be exact prefix, got {ledger[0]!r}"
+            assert ledger[0][1] == prefix, (
+                f"{name}: initial send should be exact prefix, got {ledger[0]!r}"
+            )
             for _, c in ledger:
                 self._assert_no_raw(c, raws)
             delta_cb(part2)
             await asyncio.sleep(0.22)
             for _, c in ledger:
                 self._assert_no_raw(c, raws)
-            runner._finish_stream_consumer({"final_response": prefix + hostile, "failed": False, "interrupted": False, "completed": True}, [], sc)
+            runner._finish_stream_consumer(
+                {
+                    "final_response": prefix + hostile,
+                    "failed": False,
+                    "interrupted": False,
+                    "completed": True,
+                },
+                [],
+                sc,
+            )
             await asyncio.sleep(0.35)
             try:
                 await asyncio.wait_for(task, timeout=1.5)
             except asyncio.TimeoutError:
                 task.cancel()
-                try: await task
-                except: pass
-            assert len(ledger) >= 2, f"{name}: expected at least 2 effects, got {ledger}"
+                try:
+                    await task
+                except:
+                    pass
+            assert len(ledger) >= 2, (
+                f"{name}: expected at least 2 effects, got {ledger}"
+            )
             for _, c in ledger:
                 self._assert_no_raw(c, raws)
             if "&view=1" in hostile:
-                assert any("&view=1" in c or "view=1" in c for _, c in ledger), f"{name}: public &view=1 not preserved in {ledger!r}"
-            assert any("***" in c or "[REDACTED]" in c for _, c in ledger), f"{name}: expected mask {ledger!r}"
+                assert any("&view=1" in c or "view=1" in c for _, c in ledger), (
+                    f"{name}: public &view=1 not preserved in {ledger!r}"
+                )
+            assert any("***" in c or "[REDACTED]" in c for _, c in ledger), (
+                f"{name}: expected mask {ledger!r}"
+            )
             sends = [c for k, c in ledger if k == "send"]
             assert sends.count(prefix) == 1, f"{name}: duplicate prefix send {sends!r}"
+
     @pytest.mark.asyncio
     async def test_benign_exact_equality_via_stream(self):
         import queue, asyncio
@@ -8040,7 +8147,13 @@ class TestPFSharedFailClosedEgressV2:
         from gateway.run_turn_runner import TurnRunner
         from gateway.stream_consumer import StreamConsumerConfig
         from gateway.platforms.base import SendResult
-        from gateway.config import Platform, GatewayConfig, PlatformConfig, StreamingConfig
+        from gateway.config import (
+            Platform,
+            GatewayConfig,
+            PlatformConfig,
+            StreamingConfig,
+        )
+
         cases = [
             "See https://example.test/a?foo=bar user@example.test next",
             "https://example.test/a?notoken=abcd next",
@@ -8050,62 +8163,170 @@ class TestPFSharedFailClosedEgressV2:
         ]
         for benign in cases:
             ledger = []
+
             class Cap:
                 async def send(self, chat_id, content, reply_to=None, metadata=None):
                     ledger.append(("send", content))
                     return SendResult(success=True, message_id="m1")
-                async def edit_message(self, chat_id, message_id, content, metadata=None, finalize=False):
+
+                async def edit_message(
+                    self, chat_id, message_id, content, metadata=None, finalize=False
+                ):
                     ledger.append(("edit", content))
-                    m = MagicMock(); m.success = True; m.message_id = message_id; return m
-                async def send_typing(self, chat_id, metadata=None): return None
-                async def get_chat_info(self, chat_id): return {"id": chat_id}
-                def supports_draft_streaming(self, **kw): return False
-                def supports_native_streaming(self, **kw): return False
+                    m = MagicMock()
+                    m.success = True
+                    m.message_id = message_id
+                    return m
+
+                async def send_typing(self, chat_id, metadata=None):
+                    return None
+
+                async def get_chat_info(self, chat_id):
+                    return {"id": chat_id}
+
+                def supports_draft_streaming(self, **kw):
+                    return False
+
+                def supports_native_streaming(self, **kw):
+                    return False
+
             cap = Cap()
-            ctx = TurnContext(source=MagicMock(chat_id="C123", platform=Platform.SLACK), _run_still_current=lambda: True, progress_mode="all", tool_progress_enabled=True, tool_progress_filter={}, progress_queue=queue.Queue(), log_queue=None, last_progress_msg=[None], last_tool=[None], last_was_terminal_block=[False], repeat_count=[0], long_tool_hint_fired=[False], agent_holder=[None], _native_slack_task_cards=False, result_holder=[None], tools_holder=[None], stream_consumer_holder=[None], streaming_tts_consumer_holder=[None], user_config={"display": {}}, resolve_display_setting=lambda cfg, plat, key: None, event_message_id="evt-benign", _status_thread_metadata={})
+            ctx = TurnContext(
+                source=MagicMock(chat_id="C123", platform=Platform.SLACK),
+                _run_still_current=lambda: True,
+                progress_mode="all",
+                tool_progress_enabled=True,
+                tool_progress_filter={},
+                progress_queue=queue.Queue(),
+                log_queue=None,
+                last_progress_msg=[None],
+                last_tool=[None],
+                last_was_terminal_block=[False],
+                repeat_count=[0],
+                long_tool_hint_fired=[False],
+                agent_holder=[None],
+                _native_slack_task_cards=False,
+                result_holder=[None],
+                tools_holder=[None],
+                stream_consumer_holder=[None],
+                streaming_tts_consumer_holder=[None],
+                user_config={"display": {}},
+                resolve_display_setting=lambda cfg, plat, key: None,
+                event_message_id="evt-benign",
+                _status_thread_metadata={},
+            )
+
             class Stub:
                 def __init__(self):
-                    self.config = GatewayConfig(platforms={Platform.SLACK: PlatformConfig(enabled=True, token="x")})
-                    self.config.streaming = StreamingConfig(enabled=True, transport="edit", edit_interval=0.05, buffer_threshold=1)
-                def _adapter_for_source(self, s): return cap
-                def _build_stream_consumer_config(self, source, scfg, adapter, on_missing_cursor="raise"):
-                    return StreamConsumerConfig(edit_interval=0.05, buffer_threshold=1, cursor="", transport="edit", chat_type="channel"), None
+                    self.config = GatewayConfig(
+                        platforms={
+                            Platform.SLACK: PlatformConfig(enabled=True, token="x")
+                        }
+                    )
+                    self.config.streaming = StreamingConfig(
+                        enabled=True,
+                        transport="edit",
+                        edit_interval=0.05,
+                        buffer_threshold=1,
+                    )
+
+                def _adapter_for_source(self, s):
+                    return cap
+
+                def _build_stream_consumer_config(
+                    self, source, scfg, adapter, on_missing_cursor="raise"
+                ):
+                    return StreamConsumerConfig(
+                        edit_interval=0.05,
+                        buffer_threshold=1,
+                        cursor="",
+                        transport="edit",
+                        chat_type="channel",
+                    ), None
+
             runner = TurnRunner(Stub(), ctx)
             sc, delta_cb, _, _ = runner._setup_stream_consumer("slack")
             task = asyncio.create_task(sc.run())
             await asyncio.sleep(0.08)
             delta_cb(benign)
             await asyncio.sleep(0.22)
-            runner._finish_stream_consumer({"final_response": benign, "failed": False, "interrupted": False, "completed": True}, [], sc)
+            runner._finish_stream_consumer(
+                {
+                    "final_response": benign,
+                    "failed": False,
+                    "interrupted": False,
+                    "completed": True,
+                },
+                [],
+                sc,
+            )
             await asyncio.sleep(0.3)
             try:
                 await asyncio.wait_for(task, timeout=1.5)
             except asyncio.TimeoutError:
                 task.cancel()
-                try: await task
-                except: pass
-            assert any(benign in c for _, c in ledger), f"benign {benign!r} not preserved in {ledger!r}"
+                try:
+                    await task
+                except:
+                    pass
+            assert any(benign in c for _, c in ledger), (
+                f"benign {benign!r} not preserved in {ledger!r}"
+            )
             for _, c in ledger:
-                assert "***" not in c and "[REDACTED]" not in c, f"benign should not be masked {c!r}"
+                assert "***" not in c and "[REDACTED]" not in c, (
+                    f"benign should not be masked {c!r}"
+                )
             if "?notoken=abcd next" in benign:
-                assert any("notoken=abcd next" in c for _, c in ledger), f"separator lost for notoken {ledger!r}"
+                assert any("notoken=abcd next" in c for _, c in ledger), (
+                    f"separator lost for notoken {ledger!r}"
+                )
             if "user@example.test" in benign:
-                assert any("user@example.test" in c for _, c in ledger), f"email not preserved {ledger!r}"
+                assert any("user@example.test" in c for _, c in ledger), (
+                    f"email not preserved {ledger!r}"
+                )
+
     @pytest.mark.asyncio
     async def test_ordinary_final_and_status_via_shared_boundary(self):
-        from gateway.run import _sanitize_gateway_final_response, _prepare_gateway_status_message
+        from gateway.run import (
+            _sanitize_gateway_final_response,
+            _prepare_gateway_status_message,
+        )
         from gateway.config import Platform
-        for hostile in ["https://alice:longOpaque\nTail@ex.com/p", "https://ex.com/cb?session=opaque\nTail&view=1", "https://ex.com/cb?x-amz-signature=opaque\t.tail&view=1", "https://ex.com/cb?api%255Fkey=opaque\nx&view=1"]:
+
+        for hostile in [
+            "https://alice:longOpaque\nTail@ex.com/p",
+            "https://ex.com/cb?session=opaque\nTail&view=1",
+            "https://ex.com/cb?x-amz-signature=opaque\t.tail&view=1",
+            "https://ex.com/cb?api%255Fkey=opaque\nx&view=1",
+        ]:
             sanitized = _sanitize_gateway_final_response(Platform.SLACK, hostile)
-            assert "opaque" not in sanitized.lower() or "***" in sanitized or "[REDACTED]" in sanitized, f"ordinary final leak {hostile!r} -> {sanitized!r}"
+            assert (
+                "opaque" not in sanitized.lower()
+                or "***" in sanitized
+                or "[REDACTED]" in sanitized
+            ), f"ordinary final leak {hostile!r} -> {sanitized!r}"
             assert "longOpaque" not in sanitized or "***" in sanitized
-            status = _prepare_gateway_status_message(Platform.SLACK, "tool.started", hostile)
+            status = _prepare_gateway_status_message(
+                Platform.SLACK, "tool.started", hostile
+            )
             if status is not None:
-                assert "opaque" not in status.lower() or "***" in status or "[REDACTED]" in status, f"status leak {status!r}"
+                assert (
+                    "opaque" not in status.lower()
+                    or "***" in status
+                    or "[REDACTED]" in status
+                ), f"status leak {status!r}"
         benign = "See https://example.test/a?foo=bar user@example.test next"
         assert _sanitize_gateway_final_response(Platform.SLACK, benign) == benign
-        assert _sanitize_gateway_final_response(Platform.SLACK, "https://example.test/a?notoken=abcd next") == "https://example.test/a?notoken=abcd next"
-        assert _prepare_gateway_status_message(Platform.SLACK, "status", benign) == benign
+        assert (
+            _sanitize_gateway_final_response(
+                Platform.SLACK, "https://example.test/a?notoken=abcd next"
+            )
+            == "https://example.test/a?notoken=abcd next"
+        )
+        assert (
+            _prepare_gateway_status_message(Platform.SLACK, "status", benign) == benign
+        )
+
     @pytest.mark.asyncio
     async def test_none_forward_and_reset(self):
         import queue, asyncio
@@ -8114,28 +8335,93 @@ class TestPFSharedFailClosedEgressV2:
         from gateway.run_turn_runner import TurnRunner
         from gateway.stream_consumer import StreamConsumerConfig
         from gateway.platforms.base import SendResult
-        from gateway.config import Platform, GatewayConfig, PlatformConfig, StreamingConfig
+        from gateway.config import (
+            Platform,
+            GatewayConfig,
+            PlatformConfig,
+            StreamingConfig,
+        )
+
         ledger = []
+
         class Cap:
             async def send(self, chat_id, content, reply_to=None, metadata=None):
                 ledger.append(("send", content))
                 return SendResult(success=True, message_id="m1")
-            async def edit_message(self, chat_id, message_id, content, metadata=None, finalize=False):
+
+            async def edit_message(
+                self, chat_id, message_id, content, metadata=None, finalize=False
+            ):
                 ledger.append(("edit", content))
-                m = MagicMock(); m.success = True; m.message_id = message_id; return m
-            async def send_typing(self, chat_id, metadata=None): return None
-            async def get_chat_info(self, chat_id): return {"id": chat_id}
-            def supports_draft_streaming(self, **kw): return False
-            def supports_native_streaming(self, **kw): return False
+                m = MagicMock()
+                m.success = True
+                m.message_id = message_id
+                return m
+
+            async def send_typing(self, chat_id, metadata=None):
+                return None
+
+            async def get_chat_info(self, chat_id):
+                return {"id": chat_id}
+
+            def supports_draft_streaming(self, **kw):
+                return False
+
+            def supports_native_streaming(self, **kw):
+                return False
+
         cap = Cap()
-        ctx = TurnContext(source=MagicMock(chat_id="C123", platform=Platform.SLACK), _run_still_current=lambda: True, progress_mode="all", tool_progress_enabled=True, tool_progress_filter={}, progress_queue=queue.Queue(), log_queue=None, last_progress_msg=[None], last_tool=[None], last_was_terminal_block=[False], repeat_count=[0], long_tool_hint_fired=[False], agent_holder=[None], _native_slack_task_cards=False, result_holder=[None], tools_holder=[None], stream_consumer_holder=[None], streaming_tts_consumer_holder=[None], user_config={"display": {}}, resolve_display_setting=lambda cfg, plat, key: None, event_message_id="evt-none", _status_thread_metadata={})
+        ctx = TurnContext(
+            source=MagicMock(chat_id="C123", platform=Platform.SLACK),
+            _run_still_current=lambda: True,
+            progress_mode="all",
+            tool_progress_enabled=True,
+            tool_progress_filter={},
+            progress_queue=queue.Queue(),
+            log_queue=None,
+            last_progress_msg=[None],
+            last_tool=[None],
+            last_was_terminal_block=[False],
+            repeat_count=[0],
+            long_tool_hint_fired=[False],
+            agent_holder=[None],
+            _native_slack_task_cards=False,
+            result_holder=[None],
+            tools_holder=[None],
+            stream_consumer_holder=[None],
+            streaming_tts_consumer_holder=[None],
+            user_config={"display": {}},
+            resolve_display_setting=lambda cfg, plat, key: None,
+            event_message_id="evt-none",
+            _status_thread_metadata={},
+        )
+
         class Stub:
             def __init__(self):
-                self.config = GatewayConfig(platforms={Platform.SLACK: PlatformConfig(enabled=True, token="x")})
-                self.config.streaming = StreamingConfig(enabled=True, transport="edit", edit_interval=0.05, buffer_threshold=1)
-            def _adapter_for_source(self, s): return cap
-            def _build_stream_consumer_config(self, source, scfg, adapter, on_missing_cursor="raise"):
-                return StreamConsumerConfig(edit_interval=0.05, buffer_threshold=1, cursor="", transport="edit", chat_type="channel"), None
+                self.config = GatewayConfig(
+                    platforms={Platform.SLACK: PlatformConfig(enabled=True, token="x")}
+                )
+                self.config.streaming = StreamingConfig(
+                    enabled=True,
+                    transport="edit",
+                    edit_interval=0.05,
+                    buffer_threshold=1,
+                )
+
+            def _adapter_for_source(self, s):
+                return cap
+
+            def _build_stream_consumer_config(
+                self, source, scfg, adapter, on_missing_cursor="raise"
+            ):
+                return StreamConsumerConfig(
+                    edit_interval=0.05,
+                    buffer_threshold=1,
+                    cursor="",
+                    transport="edit",
+                    chat_type="channel",
+                ), None
+
         runner = TurnRunner(Stub(), ctx)
         sc, delta_cb, _, _ = runner._setup_stream_consumer("slack")
         task = asyncio.create_task(sc.run())
@@ -8150,72 +8436,191 @@ class TestPFSharedFailClosedEgressV2:
         for _, c in ledger:
             assert "opaqueTail" not in c, f"None boundary leak {c!r}"
         hostile_final = "https://ex.com/cb?session=hostileOpaque123&view=1"
-        runner._finish_stream_consumer({"final_response": hostile_final, "failed": False, "interrupted": False, "completed": True}, [], sc)
+        runner._finish_stream_consumer(
+            {
+                "final_response": hostile_final,
+                "failed": False,
+                "interrupted": False,
+                "completed": True,
+            },
+            [],
+            sc,
+        )
         await asyncio.sleep(0.3)
-        try: await asyncio.wait_for(task, timeout=1.5)
+        try:
+            await asyncio.wait_for(task, timeout=1.5)
         except asyncio.TimeoutError:
             task.cancel()
-            try: await task
-            except: pass
+            try:
+                await task
+            except:
+                pass
         assert any("***" in c or "[REDACTED]" in c for _, c in ledger)
         for _, c in ledger:
             assert "hostileOpaque123" not in c
+
     @pytest.mark.asyncio
     async def test_failure_injection_both_layers(self):
         from unittest.mock import patch
         from gateway.run import _sanitize_gateway_final_response
         from gateway.config import Platform
+
         hostile = "https://alice:longOpaque@ex.com/p https://ex.com/cb?token=secret123"
-        with patch("agent.redact.redact_sensitive_text", side_effect=RuntimeError("primary boom")):
+        with patch(
+            "agent.redact.redact_sensitive_text",
+            side_effect=RuntimeError("primary boom"),
+        ):
             sanitized = _sanitize_gateway_final_response(Platform.SLACK, hostile)
             assert hostile not in sanitized
-            assert "longOpaque" not in sanitized or "***" in sanitized or "[REDACTED]" in sanitized
-        with patch("agent.redact.redact_sensitive_text", side_effect=RuntimeError("primary")), patch("gateway.run._redact_gateway_user_facing_secrets", side_effect=RuntimeError("fallback")):
+            assert (
+                "longOpaque" not in sanitized
+                or "***" in sanitized
+                or "[REDACTED]" in sanitized
+            )
+        with (
+            patch(
+                "agent.redact.redact_sensitive_text",
+                side_effect=RuntimeError("primary"),
+            ),
+            patch(
+                "gateway.run._redact_gateway_user_facing_secrets",
+                side_effect=RuntimeError("fallback"),
+            ),
+        ):
             sanitized = _sanitize_gateway_final_response(Platform.SLACK, hostile)
-            assert sanitized == "[REDACTED]", f"both-layer should be exact [REDACTED] got {sanitized!r}"
+            assert sanitized == "[REDACTED]", (
+                f"both-layer should be exact [REDACTED] got {sanitized!r}"
+            )
         import queue, asyncio
         from unittest.mock import MagicMock
         from gateway.turn_context import TurnContext
         from gateway.run_turn_runner import TurnRunner
         from gateway.stream_consumer import StreamConsumerConfig
         from gateway.platforms.base import SendResult
-        from gateway.config import Platform, GatewayConfig, PlatformConfig, StreamingConfig
+        from gateway.config import (
+            Platform,
+            GatewayConfig,
+            PlatformConfig,
+            StreamingConfig,
+        )
+
         ledger = []
+
         class Cap:
             async def send(self, chat_id, content, reply_to=None, metadata=None):
                 ledger.append(("send", content))
                 return SendResult(success=True, message_id="m1")
-            async def edit_message(self, chat_id, message_id, content, metadata=None, finalize=False):
+
+            async def edit_message(
+                self, chat_id, message_id, content, metadata=None, finalize=False
+            ):
                 ledger.append(("edit", content))
-                m = MagicMock(); m.success = True; m.message_id = message_id; return m
-            async def send_typing(self, chat_id, metadata=None): return None
-            async def get_chat_info(self, chat_id): return {"id": chat_id}
-            def supports_draft_streaming(self, **kw): return False
-            def supports_native_streaming(self, **kw): return False
+                m = MagicMock()
+                m.success = True
+                m.message_id = message_id
+                return m
+
+            async def send_typing(self, chat_id, metadata=None):
+                return None
+
+            async def get_chat_info(self, chat_id):
+                return {"id": chat_id}
+
+            def supports_draft_streaming(self, **kw):
+                return False
+
+            def supports_native_streaming(self, **kw):
+                return False
+
         cap = Cap()
-        ctx = TurnContext(source=MagicMock(chat_id="C123", platform=Platform.SLACK), _run_still_current=lambda: True, progress_mode="all", tool_progress_enabled=True, tool_progress_filter={}, progress_queue=queue.Queue(), log_queue=None, last_progress_msg=[None], last_tool=[None], last_was_terminal_block=[False], repeat_count=[0], long_tool_hint_fired=[False], agent_holder=[None], _native_slack_task_cards=False, result_holder=[None], tools_holder=[None], stream_consumer_holder=[None], streaming_tts_consumer_holder=[None], user_config={"display": {}}, resolve_display_setting=lambda cfg, plat, key: None, event_message_id="evt-fail", _status_thread_metadata={})
+        ctx = TurnContext(
+            source=MagicMock(chat_id="C123", platform=Platform.SLACK),
+            _run_still_current=lambda: True,
+            progress_mode="all",
+            tool_progress_enabled=True,
+            tool_progress_filter={},
+            progress_queue=queue.Queue(),
+            log_queue=None,
+            last_progress_msg=[None],
+            last_tool=[None],
+            last_was_terminal_block=[False],
+            repeat_count=[0],
+            long_tool_hint_fired=[False],
+            agent_holder=[None],
+            _native_slack_task_cards=False,
+            result_holder=[None],
+            tools_holder=[None],
+            stream_consumer_holder=[None],
+            streaming_tts_consumer_holder=[None],
+            user_config={"display": {}},
+            resolve_display_setting=lambda cfg, plat, key: None,
+            event_message_id="evt-fail",
+            _status_thread_metadata={},
+        )
+
         class Stub:
             def __init__(self):
-                self.config = GatewayConfig(platforms={Platform.SLACK: PlatformConfig(enabled=True, token="x")})
-                self.config.streaming = StreamingConfig(enabled=True, transport="edit", edit_interval=0.05, buffer_threshold=1)
-            def _adapter_for_source(self, s): return cap
-            def _build_stream_consumer_config(self, source, scfg, adapter, on_missing_cursor="raise"):
-                return StreamConsumerConfig(edit_interval=0.05, buffer_threshold=1, cursor="", transport="edit", chat_type="channel"), None
+                self.config = GatewayConfig(
+                    platforms={Platform.SLACK: PlatformConfig(enabled=True, token="x")}
+                )
+                self.config.streaming = StreamingConfig(
+                    enabled=True,
+                    transport="edit",
+                    edit_interval=0.05,
+                    buffer_threshold=1,
+                )
+
+            def _adapter_for_source(self, s):
+                return cap
+
+            def _build_stream_consumer_config(
+                self, source, scfg, adapter, on_missing_cursor="raise"
+            ):
+                return StreamConsumerConfig(
+                    edit_interval=0.05,
+                    buffer_threshold=1,
+                    cursor="",
+                    transport="edit",
+                    chat_type="channel",
+                ), None
+
         runner = TurnRunner(Stub(), ctx)
         sc, delta_cb, _, _ = runner._setup_stream_consumer("slack")
         task = asyncio.create_task(sc.run())
         await asyncio.sleep(0.08)
-        with patch("agent.redact.redact_sensitive_text", side_effect=RuntimeError("boom")), patch("gateway.run._redact_gateway_user_facing_secrets", side_effect=RuntimeError("boom")):
+        with (
+            patch(
+                "agent.redact.redact_sensitive_text", side_effect=RuntimeError("boom")
+            ),
+            patch(
+                "gateway.run._redact_gateway_user_facing_secrets",
+                side_effect=RuntimeError("boom"),
+            ),
+        ):
             delta_cb("https://alice:longOpaque@ex.com/p")
             await asyncio.sleep(0.15)
-            runner._finish_stream_consumer({"final_response": hostile, "failed": False, "interrupted": False, "completed": True}, [], sc)
+            runner._finish_stream_consumer(
+                {
+                    "final_response": hostile,
+                    "failed": False,
+                    "interrupted": False,
+                    "completed": True,
+                },
+                [],
+                sc,
+            )
             await asyncio.sleep(0.3)
-        try: await asyncio.wait_for(task, timeout=1.5)
+        try:
+            await asyncio.wait_for(task, timeout=1.5)
         except asyncio.TimeoutError:
             task.cancel()
-            try: await task
-            except: pass
-        assert any(c == "[REDACTED]" for _, c in ledger), f"both-layer stream should be exact [REDACTED] {ledger!r}"
+            try:
+                await task
+            except:
+                pass
+        assert any(c == "[REDACTED]" for _, c in ledger), (
+            f"both-layer stream should be exact [REDACTED] {ledger!r}"
+        )
         for _, c in ledger:
             assert "longOpaque" not in c
             assert "secret123" not in c
