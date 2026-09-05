@@ -80,6 +80,160 @@ def _redact_progress_text(text: str | None) -> str:
             return "[REDACTED]"
 
 
+# ---- stateful streamed egress redaction (SEC-PF-STREAMING-STATEFUL) ---------
+# Stateful buffering for streamed model-derived text. A credential split across
+# two model deltas must not leak through a partial send/edit. Per-chunk regex
+# alone is insufficient. We buffer the trailing incomplete token that could be
+# part of a URL credential or dangerous prefix until the next delta completes
+# it or finish() flushes the sanitized final. Benign URLs survive; both-layer
+# failure emits exact [REDACTED]; ordering/prefix and no-duplicate are preserved
+# because the flushed prefix is always a prefix of the sanitized full.
+class _StatefulStreamRedactor:
+    """Buffering redactor that is stateful across model deltas."""
+
+    def __init__(self) -> None:
+        self._raw: str = ""
+        self._sanitized_flushed: str = ""
+        self._sanitized_full: str = ""
+
+    def _sanitize(self, text: str) -> str:
+        try:
+            return _redact_progress_text(text)
+        except Exception:
+            logger.debug("stateful stream sanitize primary failed", exc_info=True)
+            try:
+                from gateway.run import _redact_gateway_user_facing_secrets
+
+                redacted = _redact_gateway_user_facing_secrets(text)
+                try:
+                    from agent.redact import _redact_strict_url_credentials
+
+                    return _redact_strict_url_credentials(redacted)
+                except Exception:
+                    if "://" in text:
+                        if text != redacted and (
+                            "***" in redacted or "[REDACTED]" in redacted
+                        ):
+                            return redacted
+                        return "[REDACTED]"
+                    return redacted
+            except Exception:
+                logger.debug("stateful stream sanitize fallback failed", exc_info=True)
+                return "[REDACTED]"
+
+    def _has_risk(self, s: str) -> bool:
+        if not s:
+            return False
+        if "://" in s or "?" in s or "@" in s:
+            return True
+        low = s.lower()
+        for kw in (
+            "token",
+            "api_key",
+            "apikey",
+            "signature",
+            "secret",
+            "password",
+            "auth",
+            "key=",
+            "token=",
+            "code=",
+        ):
+            if kw in low:
+                return True
+        # Known vendor prefix substrings are credential-shaped even outside URLs
+        try:
+            from agent.redact import _PREFIX_SUBSTRINGS
+
+            for p in _PREFIX_SUBSTRINGS:
+                if p and p in s:
+                    return True
+        except Exception:
+            for p in ("sk-", "ghp_", "gho_", "xox", "AIza", "AKIA", "glpat-"):
+                if p in s:
+                    return True
+        return False
+
+    def _find_safe_len(self, sanitized: str) -> int:
+        # Exact [REDACTED] or already masked is safe to flush fully
+        if sanitized == "[REDACTED]" or "***" in sanitized:
+            return len(sanitized)
+        if not self._has_risk(sanitized):
+            return len(sanitized)
+        # Risk present but not yet masked -> hold back trailing token after last whitespace
+        last_ws = -1
+        for i in range(len(sanitized) - 1, -1, -1):
+            if sanitized[i] in " \t\n\r":
+                last_ws = i
+                break
+        if last_ws == -1:
+            return 0
+        trailing = sanitized[last_ws + 1 :]
+        if self._has_risk(trailing):
+            return last_ws + 1
+        return len(sanitized)
+
+    def on_delta(self, text: str) -> str | None:
+        if text is None:
+            return None
+        s = str(text)
+        if not s:
+            return None
+        self._raw += s
+        sanitized_full = self._sanitize(self._raw)
+        self._sanitized_full = sanitized_full
+        # Both-layer failure is exact [REDACTED] — flush only if nothing sent yet; otherwise let finish() deliver it
+        if sanitized_full == "[REDACTED]":
+            if not self._sanitized_flushed:
+                self._sanitized_flushed = sanitized_full
+                return sanitized_full
+            # Already flushed a benign prefix; do not append "[REDACTED]" as suffix — finish() will replace via adoption
+            return None
+        safe_len = self._find_safe_len(sanitized_full)
+        if safe_len < len(self._sanitized_flushed):
+            safe_len = len(self._sanitized_flushed)
+        safe_prefix = sanitized_full[:safe_len]
+        new_part = safe_prefix[len(self._sanitized_flushed) :]
+        self._sanitized_flushed = safe_prefix
+        return new_part if new_part else None
+
+    def sanitize_final(self, final_text: str | None) -> str | None:
+        if final_text is None:
+            return None
+        s = str(final_text)
+        if not s:
+            return s
+        sanitized = self._sanitize(s)
+        # Record for consistency; flushed state is not used after finish
+        self._sanitized_full = sanitized
+        return sanitized
+
+    def pending_sanitized_tail(self) -> str:
+        # Sanitized full that hasn't been flushed yet (for debugging)
+        if len(self._sanitized_full) > len(self._sanitized_flushed):
+            return self._sanitized_full[len(self._sanitized_flushed) :]
+        return ""
+
+
+def _sanitize_stream_final_text(platform: Any, text: str | None) -> str:
+    """Sanitize a final stream payload with strict fail-closed semantics."""
+    if text is None:
+        return "[REDACTED]"
+    s = str(text)
+    if not s:
+        return s
+    try:
+        from gateway.run import _sanitize_gateway_final_response
+
+        return _sanitize_gateway_final_response(platform, s)
+    except Exception:
+        try:
+            return _redact_progress_text(s)
+        except Exception:
+            logger.debug("stream final sanitize failed", exc_info=True)
+            return "[REDACTED]"
+
+
 # ---- progress filter helpers (per-tool + category) ---------------------------
 # Category aliases supported in display.tool_progress_filter keys. Normalized to lower case.
 # "skills" covers skill_manage/skill_view etc; "mcp" covers all MCP-discovered tools;
@@ -1563,20 +1717,52 @@ class TurnRunner:
             for sc in ((stream_consumer if want_stream_deltas else None), stts)
             if sc is not None
         ]
+        # SEC-PF-STREAMING-STATEFUL — stateful URL-aware fail-closed redaction across deltas.
+        # A credential split across deltas must not leak; per-chunk regex alone is insufficient.
+        # Buffer the trailing incomplete token until safe boundary or finish().
+        _stream_redactor = _StatefulStreamRedactor()
+        try:
+            ctx._stream_redactor = _stream_redactor
+        except Exception:
+            pass
         stream_delta_cb = None
         if delta_sinks:
 
             def stream_delta_cb(text: str) -> None:
-                if ctx._run_still_current():
-                    for sink in delta_sinks:
-                        sink.on_delta(text)
+                if not ctx._run_still_current():
+                    return
+                # Stateful sanitization: only forward the newly-safe sanitized prefix
+                try:
+                    sanitized = _stream_redactor.on_delta(text)
+                except Exception:
+                    logger.debug("stateful redactor on_delta failed", exc_info=True)
+                    try:
+                        sanitized = _redact_progress_text(text)
+                    except Exception:
+                        sanitized = "[REDACTED]"
+                    # On failure of stateful path, forward sanitized chunk if it contains no raw credential
+                    if sanitized is None:
+                        sanitized = "[REDACTED]"
+                if sanitized is None:
+                    return
+                for sink in delta_sinks:
+                    try:
+                        sink.on_delta(sanitized)
+                    except Exception:
+                        logger.debug("sink on_delta failed", exc_info=True)
 
         def interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
             if not ctx._run_still_current():
                 return
+            # Sanitize commentary before it reaches the stream consumer
+            try:
+                sanitized_commentary = _redact_progress_text(text) if text else text
+            except Exception:
+                logger.debug("commentary sanitize failed", exc_info=True)
+                sanitized_commentary = "[REDACTED]"
             if stream_consumer is not None:
                 stream_consumer.on_segment_break() if already_streamed else stream_consumer.on_commentary(
-                    text
+                    sanitized_commentary
                 )
             elif (
                 not already_streamed and ctx._status_adapter and str(text or "").strip()
@@ -2472,9 +2658,29 @@ class TurnRunner:
         if _final_for_stream is None:
             stream_consumer.finish()
             return
+        # SEC-PF-STREAMING-STATEFUL — strict fail-closed sanitization of authoritative final before any adapter effect.
+        # The stream consumer's first-send/edit path previously passed raw final_response without URL-aware redaction;
+        # post-worker sanitization ran too late (already_sent). Sanitize here with the same authoritative boundary
+        # that protects ordinary send/retry/fallback, preserving benign URLs and failing closed to [REDACTED].
+        _sanitized_final = None
+        try:
+            redactor = getattr(ctx, "_stream_redactor", None)
+            if redactor is not None and hasattr(redactor, "sanitize_final"):
+                _sanitized_final = redactor.sanitize_final(_final_for_stream)  # type: ignore[union-attr]
+            else:
+                _sanitized_final = _sanitize_stream_final_text(
+                    getattr(ctx.source, "platform", None), _final_for_stream
+                )
+            if _sanitized_final is None:
+                _sanitized_final = "[REDACTED]"
+            elif not isinstance(_sanitized_final, str):
+                _sanitized_final = str(_sanitized_final)
+        except Exception:
+            logger.debug("stream final sanitize failed", exc_info=True)
+            _sanitized_final = "[REDACTED]"
         # Duck-type safe: test doubles / older consumers may expose a zero-arg finish().
         try:
-            stream_consumer.finish(_final_for_stream)
+            stream_consumer.finish(_sanitized_final)
         except TypeError:
             stream_consumer.finish()
 

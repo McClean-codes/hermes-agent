@@ -13,6 +13,8 @@ from typing import Any, Callable, List, Optional, Set
 
 @dataclass
 class TurnContext:
+    # Stateful streamed egress redaction — per-turn buffer for credential-split protection
+    _stream_redactor: Any = None
     # read-only turn identity / wiring
     source: Any = None
     _run_still_current: Callable[[], bool] = None  # type: ignore[assignment]
