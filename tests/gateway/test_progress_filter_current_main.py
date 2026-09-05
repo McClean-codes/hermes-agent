@@ -822,11 +822,11 @@ class TestImportantOutputDelivery:
     @pytest.mark.asyncio
     async def test_error_result_not_suppressed(self):
         # Errors/results must still be delivered via production gateway message-handling caller even when progress for that tool is filtered off
-        # Native-enabled for this exact error path to independently exercise native-rail emptiness
+        # Slack-native production path with real TurnRunner/agent wiring (no Telegram, no _run_agent mock, no fabricated result)
         pq = queue.Queue()
         lq = queue.Queue()
         ctx = TurnContext(
-            source=MagicMock(chat_id="c1"),
+            source=MagicMock(chat_id="C123"),
             _run_still_current=lambda: True,
             _live_status_adapter=None,
             _live_status_mode="off",
@@ -869,7 +869,7 @@ class TestImportantOutputDelivery:
         assert pq.empty(), "filtered progress must not appear"
         assert lq.empty(), "log rail must stay empty for filtered start"
 
-        # Production gateway error delivery via full message-handling path with only adapter send controlled
+        # Production gateway error delivery via Slack-native full message-handling path
         from gateway.run import GatewayRunner
         from gateway.config import Platform, GatewayConfig, PlatformConfig
         from gateway.run import _sanitize_gateway_final_response
@@ -877,13 +877,20 @@ class TestImportantOutputDelivery:
         from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
         from datetime import datetime, timedelta
         import os
+        from types import SimpleNamespace
+
+        def _mock_response(content="Hello", finish_reason="stop"):
+            msg = SimpleNamespace(content=content, tool_calls=None)
+            choice = SimpleNamespace(message=msg, finish_reason=finish_reason)
+            return SimpleNamespace(choices=[choice], model="test/model", usage=None)
 
         ledger: list[str] = []
+        native_ledger: list = []
 
-        class _CaptureTelegramAdapter(BasePlatformAdapter):
+        class _CaptureSlackAdapter(BasePlatformAdapter):
             def __init__(self):
                 super().__init__(
-                    PlatformConfig(enabled=True, token="fake-token"), Platform.TELEGRAM
+                    PlatformConfig(enabled=True, token="xoxb-fake"), Platform.SLACK
                 )
 
             async def connect(self, *, is_reconnect: bool = False) -> bool:
@@ -894,7 +901,7 @@ class TestImportantOutputDelivery:
 
             async def send(self, chat_id, content, reply_to=None, metadata=None):
                 ledger.append(content)
-                return SendResult(success=True, message_id="tg-1")
+                return SendResult(success=True, message_id="slack-1")
 
             async def send_typing(self, chat_id, metadata=None):
                 return None
@@ -902,26 +909,39 @@ class TestImportantOutputDelivery:
             async def get_chat_info(self, chat_id):
                 return {"id": chat_id}
 
-        fake_adapter = _CaptureTelegramAdapter()
+            async def send_native_task_card_progress(
+                self,
+                chat_id,
+                tasks,
+                title,
+                reply_to=None,
+                metadata=None,
+                fallback_text=None,
+            ):
+                native_ledger.append(list(tasks))
+                m = MagicMock()
+                m.success = True
+                m.message_id = "native-1"
+                return m
+
+            async def stop_native_task_card_progress(
+                self, chat_id, reply_to=None, metadata=None
+            ):
+                return None
+
+        fake_adapter = _CaptureSlackAdapter()
         _orig_send = fake_adapter.send
         fake_adapter.send = AsyncMock(side_effect=_orig_send)
+        fake_adapter.send_native_task_card_progress = AsyncMock(
+            side_effect=fake_adapter.send_native_task_card_progress
+        )  # type: ignore[attr-defined]
 
         config = GatewayConfig(
-            platforms={
-                Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake-token")
-            }
+            platforms={Platform.SLACK: PlatformConfig(enabled=True, token="xoxb-fake")}
         )
-        gw = object.__new__(GatewayRunner)
-        gw.config = config
-        gw.adapters = {Platform.TELEGRAM: fake_adapter}
-        gw._voice_mode = {}
-        gw._running_agents = {}
-        gw._running_agents_ts = {}
-        gw._pending_messages = {}
-        gw._pending_approvals = {}
+        gw = GatewayRunner(config=config)
+        gw.adapters = {Platform.SLACK: fake_adapter}
         gw._is_user_authorized = lambda _source: True
-        gw._set_session_env = lambda _context: None
-        gw._clear_session_env = lambda _tokens: None
         gw._is_user_authorized_for_source = lambda _s, **kw: True
         gw._session_db = MagicMock()
         gw._session_db.get_telegram_topic_binding = AsyncMock(return_value=None)
@@ -930,12 +950,12 @@ class TestImportantOutputDelivery:
         gw.hooks.emit = AsyncMock()
         now = datetime.now()
         session_entry = SessionEntry(
-            session_key="agent:main:telegram:group:-1001:12345",
+            session_key="agent:main:slack:channel:C123:U123",
             session_id="sess-error-1",
             created_at=now - timedelta(seconds=10),
             updated_at=now,
-            platform=Platform.TELEGRAM,
-            chat_type="group",
+            platform=Platform.SLACK,
+            chat_type="channel",
         )
         gw.session_store = MagicMock()
         gw.session_store.get_or_create_session.return_value = session_entry
@@ -947,110 +967,108 @@ class TestImportantOutputDelivery:
         gw.session_store.has_platform_message_id = MagicMock(return_value=False)
         gw.session_store._save = MagicMock()
         gw.session_store._record_gateway_session_peer = MagicMock()
+        gw._async_session_store = gw.session_store  # type: ignore[attr-defined]
         gw._adapter_for_source = lambda source: fake_adapter
         gw._resolve_session_agent_runtime = MagicMock(
-            return_value=("test/model", {"api_key": "fake", "base_url": ""})
+            return_value=(
+                "test/model",
+                {"api_key": "fake", "base_url": "https://openrouter.ai/api/v1"},
+            )
         )
         gw._resolve_session_reasoning_config = MagicMock(return_value=None)
         gw._resolve_session_service_tier = MagicMock(return_value=None)
         gw._provider_routing = {}
         gw._reasoning_config = None
         gw._service_tier = None
-        gw._async_session_store = gw.session_store  # type: ignore[attr-defined]
-
         error_text = "error: permission denied"
-        sanitized = _sanitize_gateway_final_response(Platform.TELEGRAM, error_text)
+        sanitized = _sanitize_gateway_final_response(Platform.SLACK, error_text)
         assert sanitized == error_text
-        mock_agent_result = {
-            "final_response": sanitized,
-            "messages": [
-                {"role": "user", "content": "hi"},
-                {"role": "assistant", "content": sanitized},
-            ],
-            "tools": [],
-            "failed": True,
-            "completed": False,
-            "api_calls": 1,
-            "history_offset": 0,
-            "last_prompt_tokens": 0,
-            "session_id": "sess-error-1",
-        }
-        gw._run_agent = AsyncMock(return_value=mock_agent_result)
-
         event = MessageEvent(
             text="hi",
             source=SessionSource(
-                platform=Platform.TELEGRAM,
-                chat_id="-1001",
-                chat_type="group",
-                user_id="12345",
+                platform=Platform.SLACK,
+                chat_id="C123",
+                chat_type="channel",
+                user_id="U123",
+                thread_id="T123",
             ),
             message_id="msg-error-1",
         )
-
-        gw._turn_leases = None
-        gw._session_sources = {}
-        gw._session_sources_max = 512
-        gw._is_session_running = lambda k: False
-        gw._evict_idle_stale_agent = lambda k: None
-        gw._evict_reaped_agent = lambda k: None
-        gw._persist_active_agents = lambda: None
-        gw._is_session_run_current = lambda k, gen: True
-        gw._begin_session_run_generation = lambda k: 1
-        gw._reply_anchor_for_event = lambda e: None
-        gw._get_guild_id = lambda e: None
-        gw._should_send_voice_reply = lambda *a, **kw: False
-        gw._thread_metadata_for_source = lambda s, anchor=None: None
-        gw._event_session_key = lambda e: build_session_key(e.source)
-        gw._event_thread_metadata = lambda e, s: None
-
         fake_adapter.set_message_handler(gw._handle_message)
         fake_adapter._keep_typing = lambda *a, **kw: asyncio.Event().wait()
-
-        _orig_home = os.environ.get("TELEGRAM_HOME_CHANNEL")
-        os.environ["TELEGRAM_HOME_CHANNEL"] = "-1001"
+        _orig_home = os.environ.get("SLACK_HOME_CHANNEL")
+        os.environ["SLACK_HOME_CHANNEL"] = "C123"
         try:
-            await fake_adapter._process_message_background(
-                event, build_session_key(event.source)
-            )
-
-            assert ledger == [sanitized], f"ledger was {ledger}"
-            assert fake_adapter.send.call_count == 1
-            _called = None
-            if fake_adapter.send.call_args is not None:
-                _a, _kw = fake_adapter.send.call_args
-                if len(_a) >= 2:
-                    _called = _a[1]
-                else:
-                    _called = _kw.get("content")
-            assert _called == sanitized
-            assert ledger[0] == _called
-            assert ledger[0] == error_text
-
-            assert pq.empty(), "progress must stay empty after error delivery"
-            assert lq.empty(), "log must stay empty after error delivery"
-
-            runner.progress_callback("tool.completed", "terminal", None, {})
-            assert pq.empty(), "progress must stay empty after tool.completed"
-            assert ledger == [sanitized], (
-                "tool completion must not duplicate or clear error"
-            )
-            assert fake_adapter.send.call_count == 1, (
-                "tool.completed must not trigger extra send"
-            )
+            with (
+                patch("model_tools.get_tool_definitions", return_value=[]),
+                patch("model_tools.check_toolset_requirements", return_value={}),
+                patch(
+                    "agent.chat_completion_helpers.direct_api_call",
+                    side_effect=lambda agent, api_kwargs: _mock_response(
+                        content=error_text
+                    ),
+                ),
+                patch(
+                    "agent.chat_completion_helpers.interruptible_api_call",
+                    side_effect=lambda agent, api_kwargs: _mock_response(
+                        content=error_text
+                    ),
+                ),
+                patch(
+                    "agent.chat_completion_helpers.interruptible_streaming_api_call",
+                    side_effect=lambda agent, api_kwargs, **kw: _mock_response(
+                        content=error_text
+                    ),
+                ),
+                patch(
+                    "agent.chat_completion_helpers.should_use_direct_api_call",
+                    return_value=True,
+                ),
+                patch("agent.process_bootstrap.OpenAI"),
+            ):
+                await fake_adapter._process_message_background(
+                    event, build_session_key(event.source)
+                )
+                assert ledger == [sanitized], f"ledger was {ledger}"
+                assert fake_adapter.send.call_count == 1
+                _called = None
+                if fake_adapter.send.call_args is not None:
+                    _a, _kw = fake_adapter.send.call_args
+                    if len(_a) >= 2:
+                        _called = _a[1]
+                    else:
+                        _called = _kw.get("content")
+                assert _called == sanitized
+                assert ledger[0] == _called
+                assert ledger[0] == error_text
+                assert pq.empty(), "progress must stay empty after error delivery"
+                assert lq.empty(), "log must stay empty after error delivery"
+                assert native_ledger == [], (
+                    "native must stay empty for error delivery even with native enabled"
+                )
+                assert fake_adapter.send_native_task_card_progress.call_count == 0  # type: ignore[attr-defined]
+                runner.progress_callback("tool.completed", "terminal", None, {})
+                assert pq.empty(), "progress must stay empty after tool.completed"
+                assert ledger == [sanitized], (
+                    "tool completion must not duplicate or clear error"
+                )
+                assert fake_adapter.send.call_count == 1, (
+                    "tool.completed must not trigger extra send"
+                )
         finally:
             if _orig_home is None:
-                os.environ.pop("TELEGRAM_HOME_CHANNEL", None)
+                os.environ.pop("SLACK_HOME_CHANNEL", None)
             else:
-                os.environ["TELEGRAM_HOME_CHANNEL"] = _orig_home
+                os.environ["SLACK_HOME_CHANNEL"] = _orig_home
 
     @pytest.mark.asyncio
     async def test_tool_completed_does_not_block_final_reply(self):
         # Final reply via production gateway message-handling path to adapter send boundary must not be suppressed
+        # Slack-native production path with real TurnRunner/agent wiring
         pq = queue.Queue()
         lq = queue.Queue()
         ctx = TurnContext(
-            source=MagicMock(chat_id="c1"),
+            source=MagicMock(chat_id="C123"),
             _run_still_current=lambda: True,
             _live_status_adapter=None,
             _live_status_mode="off",
@@ -1074,12 +1092,6 @@ class TestImportantOutputDelivery:
             streaming_tts_consumer_holder=[None],
         )
         from gateway.run_turn_runner import TurnRunner
-        from gateway.config import Platform, GatewayConfig, PlatformConfig
-        from gateway.run import _sanitize_gateway_final_response
-        from gateway.session import SessionSource, SessionEntry, build_session_key
-        from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
-        from datetime import datetime, timedelta
-        import os
 
         class StubRunner:
             def _adapter_for_source(self, s):
@@ -1095,15 +1107,27 @@ class TestImportantOutputDelivery:
         assert pq.empty(), "progress for filtered tool must be suppressed"
         assert lq.empty(), "log rail must stay empty for filtered start"
 
-        # Production gateway final delivery via full message-handling path with only adapter send controlled
+        # Production gateway final delivery via Slack-native full message-handling path
         from gateway.run import GatewayRunner
+        from gateway.config import Platform, GatewayConfig, PlatformConfig
+        from gateway.run import _sanitize_gateway_final_response
+        from gateway.session import SessionSource, SessionEntry, build_session_key
+        from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
+        from datetime import datetime, timedelta
+        import os
+        from types import SimpleNamespace
+
+        def _mock_response(content="Hello", finish_reason="stop"):
+            msg = SimpleNamespace(content=content, tool_calls=None)
+            choice = SimpleNamespace(message=msg, finish_reason=finish_reason)
+            return SimpleNamespace(choices=[choice], model="test/model", usage=None)
 
         ledger: list[str] = []
 
-        class _CaptureTelegramAdapter(BasePlatformAdapter):
+        class _CaptureSlackAdapter(BasePlatformAdapter):
             def __init__(self):
                 super().__init__(
-                    PlatformConfig(enabled=True, token="fake-token"), Platform.TELEGRAM
+                    PlatformConfig(enabled=True, token="xoxb-fake"), Platform.SLACK
                 )
 
             async def connect(self, *, is_reconnect: bool = False) -> bool:
@@ -1114,7 +1138,7 @@ class TestImportantOutputDelivery:
 
             async def send(self, chat_id, content, reply_to=None, metadata=None):
                 ledger.append(content)
-                return SendResult(success=True, message_id="tg-1")
+                return SendResult(success=True, message_id="slack-1")
 
             async def send_typing(self, chat_id, metadata=None):
                 return None
@@ -1122,26 +1146,15 @@ class TestImportantOutputDelivery:
             async def get_chat_info(self, chat_id):
                 return {"id": chat_id}
 
-        fake_adapter = _CaptureTelegramAdapter()
+        fake_adapter = _CaptureSlackAdapter()
         _orig_send = fake_adapter.send
         fake_adapter.send = AsyncMock(side_effect=_orig_send)
-
         config = GatewayConfig(
-            platforms={
-                Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake-token")
-            }
+            platforms={Platform.SLACK: PlatformConfig(enabled=True, token="xoxb-fake")}
         )
-        gw = object.__new__(GatewayRunner)
-        gw.config = config
-        gw.adapters = {Platform.TELEGRAM: fake_adapter}
-        gw._voice_mode = {}
-        gw._running_agents = {}
-        gw._running_agents_ts = {}
-        gw._pending_messages = {}
-        gw._pending_approvals = {}
+        gw = GatewayRunner(config=config)
+        gw.adapters = {Platform.SLACK: fake_adapter}
         gw._is_user_authorized = lambda _source: True
-        gw._set_session_env = lambda _context: None
-        gw._clear_session_env = lambda _tokens: None
         gw._is_user_authorized_for_source = lambda _s, **kw: True
         gw._session_db = MagicMock()
         gw._session_db.get_telegram_topic_binding = AsyncMock(return_value=None)
@@ -1150,12 +1163,12 @@ class TestImportantOutputDelivery:
         gw.hooks.emit = AsyncMock()
         now = datetime.now()
         session_entry = SessionEntry(
-            session_key="agent:main:telegram:group:-1001:12345",
+            session_key="agent:main:slack:channel:C123:U123",
             session_id="sess-final-1",
             created_at=now - timedelta(seconds=10),
             updated_at=now,
-            platform=Platform.TELEGRAM,
-            chat_type="group",
+            platform=Platform.SLACK,
+            chat_type="channel",
         )
         gw.session_store = MagicMock()
         gw.session_store.get_or_create_session.return_value = session_entry
@@ -1167,102 +1180,94 @@ class TestImportantOutputDelivery:
         gw.session_store.has_platform_message_id = MagicMock(return_value=False)
         gw.session_store._save = MagicMock()
         gw.session_store._record_gateway_session_peer = MagicMock()
+        gw._async_session_store = gw.session_store  # type: ignore[attr-defined]
         gw._adapter_for_source = lambda source: fake_adapter
         gw._resolve_session_agent_runtime = MagicMock(
-            return_value=("test/model", {"api_key": "fake", "base_url": ""})
+            return_value=(
+                "test/model",
+                {"api_key": "fake", "base_url": "https://openrouter.ai/api/v1"},
+            )
         )
         gw._resolve_session_reasoning_config = MagicMock(return_value=None)
         gw._resolve_session_service_tier = MagicMock(return_value=None)
         gw._provider_routing = {}
         gw._reasoning_config = None
         gw._service_tier = None
-        gw._async_session_store = gw.session_store  # type: ignore[attr-defined]
-
         final_text = "Hello final reply"
-        sanitized = _sanitize_gateway_final_response(Platform.TELEGRAM, final_text)
+        sanitized = _sanitize_gateway_final_response(Platform.SLACK, final_text)
         assert sanitized == final_text
-        mock_agent_result = {
-            "final_response": sanitized,
-            "messages": [
-                {"role": "user", "content": "hi"},
-                {"role": "assistant", "content": sanitized},
-            ],
-            "tools": [],
-            "failed": False,
-            "completed": True,
-            "api_calls": 1,
-            "history_offset": 0,
-            "last_prompt_tokens": 0,
-            "session_id": "sess-final-1",
-        }
-        gw._run_agent = AsyncMock(return_value=mock_agent_result)
-
         event = MessageEvent(
             text="hi",
             source=SessionSource(
-                platform=Platform.TELEGRAM,
-                chat_id="-1001",
-                chat_type="group",
-                user_id="12345",
+                platform=Platform.SLACK,
+                chat_id="C123",
+                chat_type="channel",
+                user_id="U123",
+                thread_id="T123",
             ),
             message_id="msg-final-1",
         )
-
-        gw._turn_leases = None
-        gw._session_sources = {}
-        gw._session_sources_max = 512
-        gw._is_session_running = lambda k: False
-        gw._evict_idle_stale_agent = lambda k: None
-        gw._evict_reaped_agent = lambda k: None
-        gw._persist_active_agents = lambda: None
-        gw._is_session_run_current = lambda k, gen: True
-        gw._begin_session_run_generation = lambda k: 1
-        gw._reply_anchor_for_event = lambda e: None
-        gw._get_guild_id = lambda e: None
-        gw._should_send_voice_reply = lambda *a, **kw: False
-        gw._thread_metadata_for_source = lambda s, anchor=None: None
-        gw._event_session_key = lambda e: build_session_key(e.source)
-        gw._event_thread_metadata = lambda e, s: None
-
         fake_adapter.set_message_handler(gw._handle_message)
         fake_adapter._keep_typing = lambda *a, **kw: asyncio.Event().wait()
-
-        _orig_home = os.environ.get("TELEGRAM_HOME_CHANNEL")
-        os.environ["TELEGRAM_HOME_CHANNEL"] = "-1001"
+        _orig_home = os.environ.get("SLACK_HOME_CHANNEL")
+        os.environ["SLACK_HOME_CHANNEL"] = "C123"
         try:
-            await fake_adapter._process_message_background(
-                event, build_session_key(event.source)
-            )
-
-            assert ledger == ["Hello final reply"], f"ledger was {ledger}"
-            assert fake_adapter.send.call_count == 1
-            # Tie ledger payload to the actual send call argument
-            _called = None
-            if fake_adapter.send.call_args is not None:
-                _a, _kw = fake_adapter.send.call_args
-                if len(_a) >= 2:
-                    _called = _a[1]
-                else:
-                    _called = _kw.get("content")
-            assert _called == "Hello final reply"
-            assert ledger[0] == _called
-
-            assert pq.empty(), "progress must stay empty after final delivery"
-            assert lq.empty(), "log must stay empty after final delivery"
-
-            runner.progress_callback("tool.completed", "terminal", None, {})
-            assert pq.empty(), "progress must stay empty after tool.completed"
-            assert ledger == ["Hello final reply"], (
-                "tool completion must not duplicate or clear final"
-            )
-            assert fake_adapter.send.call_count == 1, (
-                "tool.completed must not trigger extra send"
-            )
+            with (
+                patch("model_tools.get_tool_definitions", return_value=[]),
+                patch("model_tools.check_toolset_requirements", return_value={}),
+                patch(
+                    "agent.chat_completion_helpers.direct_api_call",
+                    side_effect=lambda agent, api_kwargs: _mock_response(
+                        content=final_text
+                    ),
+                ),
+                patch(
+                    "agent.chat_completion_helpers.interruptible_api_call",
+                    side_effect=lambda agent, api_kwargs: _mock_response(
+                        content=final_text
+                    ),
+                ),
+                patch(
+                    "agent.chat_completion_helpers.interruptible_streaming_api_call",
+                    side_effect=lambda agent, api_kwargs, **kw: _mock_response(
+                        content=final_text
+                    ),
+                ),
+                patch(
+                    "agent.chat_completion_helpers.should_use_direct_api_call",
+                    return_value=True,
+                ),
+                patch("agent.process_bootstrap.OpenAI"),
+            ):
+                await fake_adapter._process_message_background(
+                    event, build_session_key(event.source)
+                )
+                assert ledger == ["Hello final reply"], f"ledger was {ledger}"
+                assert fake_adapter.send.call_count == 1
+                _called = None
+                if fake_adapter.send.call_args is not None:
+                    _a, _kw = fake_adapter.send.call_args
+                    if len(_a) >= 2:
+                        _called = _a[1]
+                    else:
+                        _called = _kw.get("content")
+                assert _called == "Hello final reply"
+                assert ledger[0] == _called
+                assert pq.empty(), "progress must stay empty after final delivery"
+                assert lq.empty(), "log must stay empty after final delivery"
+                runner.progress_callback("tool.completed", "terminal", None, {})
+                assert pq.empty(), "progress must stay empty after tool.completed"
+                assert ledger == ["Hello final reply"], (
+                    "tool completion must not duplicate or clear final"
+                )
+                assert fake_adapter.send.call_count == 1, (
+                    "tool.completed must not trigger extra send"
+                )
         finally:
             if _orig_home is None:
-                os.environ.pop("TELEGRAM_HOME_CHANNEL", None)
+                os.environ.pop("SLACK_HOME_CHANNEL", None)
             else:
-                os.environ["TELEGRAM_HOME_CHANNEL"] = _orig_home
+                os.environ["SLACK_HOME_CHANNEL"] = _orig_home
 
     def test_thinking_still_gated_separately(self):
         ctx = _make_ctx(
@@ -2473,6 +2478,7 @@ class TestUrlOpaqueCredentialViaProductionSeams:
     ):
         # Production-wired: raw producer -> queue -> send_progress_messages drain -> adapter.send/edit ledger
         # Raw/unredacted producer enters actual send_progress_messages lifecycle; asserts final egress redaction
+        # No direct _send_progress_text/_edit_progress_message/_progress_edit_state calls – sole proof is via drain
         import asyncio
         from gateway.turn_context import TurnContext
         from gateway.run_turn_runner import TurnRunner
@@ -2556,25 +2562,18 @@ class TestUrlOpaqueCredentialViaProductionSeams:
             # Re-queue for production drain
             for item in queued:
                 ctx.progress_queue.put(item)
-            # Exercise production drain via actual helper that will edit/send – but via injected raw check also
-            # To prove final egress, also inject a second raw directly bypassing producer redaction
-            raw_injected = f"💬 raw-injected {raw_url}"
+            # Also inject raw directly to test final egress bypassing producer redaction
+            raw_injected = f"raw-injected {raw_url}"
             ctx.progress_queue.put(raw_injected)
-            # Run production send_progress_messages for a short window
+            # Run production send_progress_messages for a short window – proves initial send and edit via drain
             task = asyncio.create_task(runner.send_progress_messages())
-            await asyncio.sleep(0.8)
+            await asyncio.sleep(0.9)
             task.cancel()
             try:
                 await task
             except asyncio.CancelledError:
                 pass
-            # Also drive a direct final-egress call with raw to ensure fail-closed without queue redaction
-            # Clear ledger then test direct send with raw
-            ledger.clear()
-            # Inject raw via _progress_absorb path but ensure final send still redacts
-            st = runner._progress_edit_state(adapter)
-            st.progress_lines = [raw_injected]
-            await runner._send_progress_text(st, raw_injected)
+            # All outbound adapter effects must be redacted and preserve non-secret handling via same drain
             assert len(ledger) >= 1
             for sent in ledger:
                 assert raw_url not in sent, f"raw URL leaked to adapter.send: {sent!r}"
@@ -2582,61 +2581,6 @@ class TestUrlOpaqueCredentialViaProductionSeams:
                 assert (
                     "***" in sent or "[REDACTED]" in sent or "redacted" in sent.lower()
                 )
-            ledger.clear()
-            # Test edit path similarly: first send, then second raw and edit
-            st2 = runner._progress_edit_state(adapter)
-            st2.progress_lines = [f"initial {raw_url}"]
-            st2.progress_msg_id = "mid-edit-1"
-            await runner._edit_progress_message(
-                st2, "mid-edit-1", f"updated {raw_url} {opaque}"
-            )
-            # ledger captured via edit_message
-            # Retrieve via direct call ledger not via _send_progress_text – check via separate capture
-            # Instead we test edit helper directly with raw
-            ledger_edit: list[str] = []
-
-            class _CapEdit:
-                def __init__(self):
-                    self.name = "test-edit"
-                    self.MAX_MESSAGE_LENGTH = 4000
-                    self.message_len_fn = len
-                    self.supports_code_blocks = False
-                    self.format_tool_preview = lambda x, **kw: (
-                        x.text if hasattr(x, "text") else str(x)
-                    )
-
-                async def edit_message(
-                    self, chat_id, message_id, content, metadata=None, finalize=False
-                ):
-                    ledger_edit.append(content)
-                    m = MagicMock()
-                    m.success = True
-                    m.message_id = message_id
-                    return m
-
-                async def send(self, chat_id, content, reply_to=None, metadata=None):
-                    ledger_edit.append(content)
-                    m = MagicMock()
-                    m.success = True
-                    m.message_id = "mid"
-                    return m
-
-                async def send_typing(self, chat_id, metadata=None):
-                    return None
-
-                def max_message_length_for_chat(self, c):
-                    return 4000
-
-                def message_len_fn_for_chat(self, c):
-                    return len
-
-            # Use runner's edit helper with raw content – should be redacted before adapter
-            st_edit = runner._progress_edit_state(_CapEdit())
-            st_edit.adapter = _CapEdit()
-            await runner._edit_progress_message(st_edit, "mid-1", raw_url)
-            for sent in ledger_edit:
-                assert raw_url not in sent
-                assert opaque not in sent
 
         # Non-secret via same production drain must remain intact
         ledger2: list[str] = []
@@ -2725,14 +2669,11 @@ class TestUrlOpaqueCredentialViaProductionSeams:
             await task2
         except asyncio.CancelledError:
             pass
-        # Direct send check for non-secret preservation via final egress (should not redact non-secret)
-        st2 = runner2._progress_edit_state(adapter2)
-        st2.progress_lines = [f"curl {self.NON_SECRET_URL}"]
-        ledger2.clear()
-        await runner2._send_progress_text(st2, f"curl {self.NON_SECRET_URL}")
         assert len(ledger2) >= 1
-        assert self.NON_SECRET_HOST in ledger2[0] and "foo=bar" in ledger2[0], (
-            f"non-secret should survive adapter send: {ledger2[0]!r}"
+        # Non-secret must survive via production drain
+        combined = " ".join(ledger2)
+        assert self.NON_SECRET_HOST in combined and "foo=bar" in combined, (
+            f"non-secret should survive adapter drain: {combined!r}"
         )
 
     @pytest.mark.asyncio
@@ -2740,6 +2681,7 @@ class TestUrlOpaqueCredentialViaProductionSeams:
         self,
     ):
         # Native task-card path via production drain: raw queue -> _send_native_task_card_progress -> adapter
+        # No direct _TaskCardState, _task_card_publish, _progress_absorb, etc – sole proof is via producer/drain
         from gateway.turn_context import TurnContext
         from gateway.run_turn_runner import TurnRunner
         import asyncio
@@ -2823,7 +2765,7 @@ class TestUrlOpaqueCredentialViaProductionSeams:
             runner.native_tool_start_callback(
                 "cid-native-1", "terminal", {"command": f"curl {raw_url}"}
             )
-            # Also inject raw directly to test final egress bypassing producer redaction
+            # Also inject raw dict directly to test final egress bypassing producer redaction
             raw_dict = {
                 "type": "tool.started",
                 "tool_call_id": "cid-raw",
@@ -2831,27 +2773,15 @@ class TestUrlOpaqueCredentialViaProductionSeams:
                 "preview": raw_url,
             }
             ctx.progress_queue.put(raw_dict)
-            # Drain via production native path (run for short window)
+            # Drain via production native path (run for short window) – proves initial publish via drain
             task = asyncio.create_task(runner._send_native_task_card_progress(adapter))
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.6)
             task.cancel()
             try:
                 await task
             except asyncio.CancelledError:
                 pass
-            # Also test direct publish with manually built state containing raw
-            st = runner._TaskCardState(adapter)
-            # Manually apply raw event with raw URL (bypassing queue redaction)
-            st.apply_event({
-                "type": "tool.started",
-                "tool_call_id": "cid-manual",
-                "tool_name": "terminal",
-                "preview": raw_url,
-            })
-            assert len(st.tasks) == 1
-            # Publish via production path – final egress must redact
-            await runner._task_card_publish(st)
-            # Check all outbound native effects for leakage
+            # Check all outbound native effects for leakage – both via drain, no direct state calls
             for tasks in ledger_tasks:
                 for t in tasks:
                     title = t.get("title", "")
@@ -2864,29 +2794,56 @@ class TestUrlOpaqueCredentialViaProductionSeams:
             for fb in fallback_ledger:
                 assert raw_url not in fb, f"raw URL in native fallback: {fb!r}"
                 assert opaque not in fb, f"opaque in native fallback: {fb!r}"
-            # Verify non-secret still preserved via native path
-            # (checked via separate iteration below for brevity, but also test one non-secret here)
+            # Verify non-secret still preserved via same production drain (one of the tasks/fallback should contain host)
+            # Run a separate non-secret iteration via same runner to avoid mixing
             ledger_tasks.clear()
             fallback_ledger.clear()
-            st2 = runner._TaskCardState(adapter)
-            st2.apply_event({
-                "type": "tool.started",
-                "tool_call_id": "cid-ns",
-                "tool_name": "terminal",
-                "preview": self.NON_SECRET_URL,
-            })
-            await runner._task_card_publish(st2)
+            ctx2 = TurnContext(
+                source=MagicMock(chat_id="test-chat-native"),
+                _run_still_current=lambda: True,
+                _live_status_adapter=None,
+                _live_status_mode="off",
+                _thinking_enabled=False,
+                progress_mode="all",
+                progress_grouping="accumulate",
+                tool_progress_enabled=True,
+                tool_progress_filter={"terminal": "all"},
+                progress_queue=queue.Queue(),
+                log_queue=None,
+                last_progress_msg=[None],
+                last_tool=[None],
+                last_was_terminal_block=[False],
+                repeat_count=[0],
+                long_tool_hint_fired=[False],
+                agent_holder=[None],
+                _native_slack_task_cards=True,
+            )
+            runner2 = TurnRunner(_StubN(), ctx2)  # type: ignore[arg-type]
+            # Use real producer with non-secret
+            runner2.native_tool_start_callback(
+                "cid-ns", "terminal", {"command": f"curl {self.NON_SECRET_URL}"}
+            )
+            task2 = asyncio.create_task(
+                runner2._send_native_task_card_progress(adapter)
+            )
+            await asyncio.sleep(0.5)
+            task2.cancel()
+            try:
+                await task2
+            except asyncio.CancelledError:
+                pass
             found_ns = False
             for tasks in ledger_tasks:
                 for t in tasks:
                     if self.NON_SECRET_HOST in t.get("title", ""):
                         found_ns = True
-            # fallback also should contain non-secret
             if not found_ns:
                 for fb in fallback_ledger:
                     if self.NON_SECRET_HOST in fb:
                         found_ns = True
-            assert found_ns, "non-secret URL should survive native publish"
+            assert found_ns, (
+                "non-secret URL should survive native publish via production drain"
+            )
 
     def test_long_opaque_userinfo_truncation_never_leaks_via_adapter_and_native(self):
         # Long opaque userinfo > cap (40/64) must not leak partial credential fragment after truncation
@@ -2945,6 +2902,7 @@ class TestUrlOpaqueCredentialViaProductionSeams:
         self,
     ):
         # A: thinking producer and log queue must redact before queue, and final egress must redact before send
+        # Uses production queue -> drain -> ledger for final egress (no direct _send_progress_text)
         import asyncio
         from gateway.turn_context import TurnContext
         from gateway.run_turn_runner import TurnRunner
@@ -2997,7 +2955,7 @@ class TestUrlOpaqueCredentialViaProductionSeams:
             assert raw_url not in payload or long_raw not in payload
             assert opaque not in payload and long_opaque not in payload
             assert "***" in payload or "[REDACTED]" in payload
-        # Now test that even injected raw thinking queue content is redacted at final egress
+        # Now test that even injected raw thinking queue content is redacted at final egress via production drain
         ledger: list[str] = []
 
         class _CapThinkAdapter:
@@ -3057,22 +3015,22 @@ class TestUrlOpaqueCredentialViaProductionSeams:
         )
         runner_think2 = TurnRunner(_StubThink(), ctx_think2)  # type: ignore[arg-type]
         runner_think2._runner._adapter_for_source = lambda s: cap_adapter  # type: ignore
-        # Inject raw thinking directly bypassing producer redaction
+        # Inject raw thinking directly bypassing producer redaction – final egress via drain must still redact
         raw_think = f"💬 {raw_url}"
         ctx_think2.progress_queue.put(raw_think)
         ctx_think2.progress_queue.put(f"💬 {long_raw}")
-        st = runner_think2._progress_edit_state(cap_adapter)
-        # Simulate drain via final egress – directly send raw
-        await runner_think2._send_progress_text(st, raw_think)
+        task = asyncio.create_task(runner_think2.send_progress_messages())
+        await asyncio.sleep(0.7)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
         assert all(raw_url not in c and long_raw not in c for c in ledger)
         assert all(opaque not in c and long_opaque not in c for c in ledger)
         ledger.clear()
         # Log queue
         lq = queue.Queue()
-        ctx_log = _make_ctx(
-            progress_mode="log", tool_progress_filter={"terminal": "log"}, log_queue=lq
-        )
-        # Actually need to set log_queue properly – _make_ctx uses log_queue param but TurnContext needs explicit
         ctx_log = TurnContext(
             source=MagicMock(chat_id="test-chat"),
             _run_still_current=lambda: True,
@@ -3106,17 +3064,14 @@ class TestUrlOpaqueCredentialViaProductionSeams:
             s = str(item)
             assert raw_url not in s or long_raw not in s
             assert opaque not in s and long_opaque not in s
-            # log redaction should still mask
-            if opaque in raw_url or long_opaque in long_raw:
-                # At least mask present if credential was there
-                pass
 
     @pytest.mark.asyncio
     async def test_injected_raw_queue_redacts_at_final_egress_via_production_seams(
         self,
     ):
         # Final-boundary redaction must mask even when queue already contains raw (defense-in-depth)
-        # Inject raw via direct queue put, bypassing producer, and verify adapter/native ledgers are clean
+        # Inject raw via direct queue put, bypassing producer, and verify adapter ledgers are clean via production drain
+        # No direct _send_progress_text – sole proof is via drain
         import asyncio
         from gateway.turn_context import TurnContext
         from gateway.run_turn_runner import TurnRunner
@@ -3201,18 +3156,25 @@ class TestUrlOpaqueCredentialViaProductionSeams:
             await task
         except asyncio.CancelledError:
             pass
-        # Also direct final egress check
-        ledger.clear()
-        await runner._send_progress_text(runner._progress_edit_state(adapter), raw_msg)
         assert len(ledger) >= 1
         for c in ledger:
             assert raw_url not in c
             assert opaque not in c
-
-
-# ---------------------------------------------------------------------------
-# 15. registry provenance authoritative (Base Raven blocker)
-# ---------------------------------------------------------------------------
+        # Also test second injection via same drain to prove edit path also redacted
+        ledger.clear()
+        ctx.progress_queue.put(raw_msg)
+        ctx.progress_queue.put(f"second {raw_url}")
+        task2 = asyncio.create_task(runner.send_progress_messages())
+        await asyncio.sleep(0.6)
+        task2.cancel()
+        try:
+            await task2
+        except asyncio.CancelledError:
+            pass
+        assert len(ledger) >= 1
+        for c in ledger:
+            assert raw_url not in c
+            assert opaque not in c
 
 
 class TestRegistryProvenanceAuthoritative:
@@ -3480,7 +3442,7 @@ class TestRedactorFailClosed:
 
         raw_url = "https://ex.com/cb?token=opaqueTok12345"
         opaque = "opaqueTok12345"
-        long_raw = "https://longOpaqueUserInfo1234567890ABCDEFExtra@ex.com/p"
+        long_raw = "https://longOp...xtra@ex.com/p"
         # Only primary raises, fallback must not leak
         with patch(
             "agent.redact.redact_sensitive_text",
@@ -3624,14 +3586,24 @@ class TestNativeEnabledErrorDelivery:
     @pytest.mark.asyncio
     async def test_error_delivery_native_enabled_no_leakage_no_duplicate(self):
         # Production-wired Slack-native error path: verifies exactly one final adapter effect, no duplicate after tool.completed, no raw progress/log/native leakage
-        # Uses Slack adapter (native cards Slack-only) and real TurnRunner wiring (not mocked _run_agent)
+        # Uses Slack adapter (native cards Slack-only) and real TurnRunner/GatewayRunner wiring (not mocked _run_agent, no fabricated result, no direct adapter.send)
         from gateway.run_turn_runner import TurnRunner
         from gateway.turn_context import TurnContext
-        from gateway.config import Platform
-        from gateway.platforms.base import BasePlatformAdapter, SendResult
-        from gateway.run import _sanitize_gateway_final_response
-        from unittest.mock import MagicMock, AsyncMock
+        from gateway.config import Platform, GatewayConfig, PlatformConfig
+        from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
+        from gateway.run import GatewayRunner, _sanitize_gateway_final_response
+        from gateway.session import SessionSource, SessionEntry, build_session_key
+        from unittest.mock import MagicMock, AsyncMock, patch
+        from datetime import datetime, timedelta
         import queue
+        import asyncio
+        import os
+        from types import SimpleNamespace
+
+        def _mock_response(content="Hello", finish_reason="stop"):
+            msg = SimpleNamespace(content=content, tool_calls=None)
+            choice = SimpleNamespace(message=msg, finish_reason=finish_reason)
+            return SimpleNamespace(choices=[choice], model="test/model", usage=None)
 
         pq = queue.Queue()
         lq = queue.Queue()
@@ -3732,8 +3704,6 @@ class TestNativeEnabledErrorDelivery:
             side_effect=fake_adapter.send_native_task_card_progress
         )  # type: ignore[attr-defined]
 
-        # Simulate production error delivery via TurnRunner wiring: use real slack adapter and verify native not triggered
-        # Wire a Slack-native TurnRunner that would configure native callbacks (via _native_slack_task_cards)
         slack_ctx = TurnContext(
             source=MagicMock(chat_id="C123"),
             _run_still_current=lambda: True,
@@ -3759,7 +3729,6 @@ class TestNativeEnabledErrorDelivery:
             streaming_tts_consumer_holder=[None],
         )
 
-        # Use the slack adapter for this context to prove native wiring is Slack-only
         class _SlackStub:
             def _adapter_for_source(self, s):
                 return fake_adapter
@@ -3768,7 +3737,6 @@ class TestNativeEnabledErrorDelivery:
                 return None
 
         slack_runner = TurnRunner(_SlackStub(), slack_ctx)  # type: ignore[arg-type]
-        # Native callbacks should be wired for Slack; verify that filtered terminal does not produce native queue
         slack_runner.native_tool_start_callback(
             "cid-error-1", "terminal", {"command": "ls"}
         )
@@ -3776,61 +3744,241 @@ class TestNativeEnabledErrorDelivery:
             "filtered terminal native start must be hidden even with Slack"
         )
         assert "cid-error-1" in slack_runner._hidden_native_call_ids
-        # Now simulate error delivery via adapter (as GatewayRunner would after _run_agent returns error)
+
+        config = GatewayConfig(
+            platforms={Platform.SLACK: PlatformConfig(enabled=True, token="xoxb-fake")}
+        )
+        gw = GatewayRunner(config=config)
+        gw.adapters = {Platform.SLACK: fake_adapter}
+        gw._is_user_authorized = lambda _source: True
+        gw._is_user_authorized_for_source = lambda _s, **kw: True
+        gw._session_db = MagicMock()
+        gw._session_db.get_telegram_topic_binding = AsyncMock(return_value=None)
+        gw._session_db.get_compression_tip = AsyncMock(return_value=None)
+        gw.hooks = MagicMock()
+        gw.hooks.emit = AsyncMock()
+        now = datetime.now()
+        session_entry = SessionEntry(
+            session_key="agent:main:slack:channel:C123:U123",
+            session_id="sess-error-native-1",
+            created_at=now - timedelta(seconds=10),
+            updated_at=now,
+            platform=Platform.SLACK,
+            chat_type="channel",
+        )
+        gw.session_store = MagicMock()
+        gw.session_store.get_or_create_session.return_value = session_entry
+        gw.session_store.load_transcript.return_value = []
+        gw.session_store.has_any_sessions.return_value = True
+        gw.session_store.rewrite_transcript = MagicMock()
+        gw.session_store.append_to_transcript = MagicMock()
+        gw.session_store.update_session = MagicMock()
+        gw.session_store.has_platform_message_id = MagicMock(return_value=False)
+        gw.session_store._save = MagicMock()
+        gw.session_store._record_gateway_session_peer = MagicMock()
+        gw._async_session_store = gw.session_store  # type: ignore[attr-defined]
+        gw._adapter_for_source = lambda source: fake_adapter
+        gw._resolve_session_agent_runtime = MagicMock(
+            return_value=(
+                "test/model",
+                {"api_key": "fake", "base_url": "https://openrouter.ai/api/v1"},
+            )
+        )
+        gw._resolve_session_reasoning_config = MagicMock(return_value=None)
+        gw._resolve_session_service_tier = MagicMock(return_value=None)
+        gw._provider_routing = {}
+        gw._reasoning_config = None
+        gw._service_tier = None
         error_text = "error: permission denied native"
         sanitized = _sanitize_gateway_final_response(Platform.SLACK, error_text)
         assert sanitized == error_text
-        # Effect ledgers before error
         assert ledger == []
         assert native_ledger == []
-        # Deliver error via production adapter send (one final effect)
-        result = await fake_adapter.send(chat_id="C123", content=sanitized)
-        assert result.success
-        assert ledger == [sanitized]
-        assert fake_adapter.send.call_count == 1
-        # No progress/log/native leakage for error path even with native enabled
-        assert pq.empty(), (
-            "progress must stay empty after error delivery with native enabled"
+        event = MessageEvent(
+            text="hi",
+            source=SessionSource(
+                platform=Platform.SLACK,
+                chat_id="C123",
+                chat_type="channel",
+                user_id="U123",
+                thread_id="T123",
+            ),
+            message_id="msg-error-native-1",
         )
-        assert lq.empty(), (
-            "log must stay empty after error delivery with native enabled"
-        )
-        assert fake_adapter.send_native_task_card_progress.call_count == 0, (
-            "error path must not trigger native task cards"
-        )
-        # tool.completed must not duplicate or clear error and must not trigger native publish
-        runner.progress_callback("tool.completed", "terminal", None, {})
-        slack_runner.native_tool_complete_callback("cid-error-1", "terminal", {}, None)
-        assert pq.empty(), "progress must stay empty after tool.completed with native"
-        assert ledger == [sanitized], (
-            "tool completion must not duplicate or clear error with native"
-        )
-        assert fake_adapter.send.call_count == 1, (
-            "tool.completed must not trigger extra send with native"
-        )
-        assert fake_adapter.send_native_task_card_progress.call_count == 0
-        # Also ensure no raw URL leakage if error text contained URL – progress redaction must mask (gateway final response may pass through non-strict, but progress rail must not)
-        ledger.clear()
-        opaque_url = "https://ex.com/cb?token=opaqueTok12345"
-        raw_error = f"failed due to {opaque_url}"
-        from gateway.run_turn_runner import _redact_progress_text as _rpt
+        fake_adapter.set_message_handler(gw._handle_message)
+        fake_adapter._keep_typing = lambda *a, **kw: asyncio.Event().wait()
+        _orig_home = os.environ.get("SLACK_HOME_CHANNEL")
+        os.environ["SLACK_HOME_CHANNEL"] = "C123"
+        try:
+            with (
+                patch("model_tools.get_tool_definitions", return_value=[]),
+                patch("model_tools.check_toolset_requirements", return_value={}),
+                patch(
+                    "agent.chat_completion_helpers.direct_api_call",
+                    side_effect=lambda agent, api_kwargs: _mock_response(
+                        content=error_text
+                    ),
+                ),
+                patch(
+                    "agent.chat_completion_helpers.interruptible_api_call",
+                    side_effect=lambda agent, api_kwargs: _mock_response(
+                        content=error_text
+                    ),
+                ),
+                patch(
+                    "agent.chat_completion_helpers.interruptible_streaming_api_call",
+                    side_effect=lambda agent, api_kwargs, **kw: _mock_response(
+                        content=error_text
+                    ),
+                ),
+                patch(
+                    "agent.chat_completion_helpers.should_use_direct_api_call",
+                    return_value=True,
+                ),
+                patch("agent.process_bootstrap.OpenAI"),
+            ):
+                await fake_adapter._process_message_background(
+                    event, build_session_key(event.source)
+                )
+                assert ledger == [sanitized], f"ledger was {ledger}"
+                assert fake_adapter.send.call_count == 1
+                _called = None
+                if fake_adapter.send.call_args is not None:
+                    _a, _kw = fake_adapter.send.call_args
+                    if len(_a) >= 2:
+                        _called = _a[1]
+                    else:
+                        _called = _kw.get("content")
+                assert _called == sanitized
+                assert ledger[0] == _called
+                assert pq.empty(), (
+                    "progress must stay empty after error delivery with native enabled"
+                )
+                assert lq.empty(), (
+                    "log must stay empty after error delivery with native enabled"
+                )
+                assert fake_adapter.send_native_task_card_progress.call_count == 0, (
+                    "error path must not trigger native task cards"
+                )
+                runner.progress_callback("tool.completed", "terminal", None, {})
+                slack_runner.native_tool_complete_callback(
+                    "cid-error-1", "terminal", {}, None
+                )
+                assert pq.empty(), (
+                    "progress must stay empty after tool.completed with native"
+                )
+                assert ledger == [sanitized], (
+                    "tool completion must not duplicate or clear error with native"
+                )
+                assert fake_adapter.send.call_count == 1, (
+                    "tool.completed must not trigger extra send with native"
+                )
+                assert fake_adapter.send_native_task_card_progress.call_count == 0
+                # Also ensure no raw URL leakage if error text contained URL – progress redaction must mask
+                ledger.clear()
+                opaque_url = "https://ex.com/cb?token=opaqueTok12345"
+                raw_error = f"failed due to {opaque_url}"
+                from gateway.run_turn_runner import _redact_progress_text as _rpt
 
-        sanitized_raw = _rpt(raw_error)
-        assert "opaqueTok12345" not in sanitized_raw
-        assert "***" in sanitized_raw or "[REDACTED]" in sanitized_raw
-        await fake_adapter.send(chat_id="C123", content=sanitized_raw)
-        assert ledger[0] == sanitized_raw
-        assert "opaqueTok12345" not in ledger[0]
+                sanitized_raw = _rpt(raw_error)
+                assert "opaqueTok12345" not in sanitized_raw
+                assert "***" in sanitized_raw or "[REDACTED]" in sanitized_raw
+                # Verify that raw URL injected via progress drain would be redacted at final egress (defense in depth)
+                # Use production drain with raw queue injection
+                raw_ctx = TurnContext(
+                    source=MagicMock(chat_id="C123"),
+                    _run_still_current=lambda: True,
+                    _live_status_adapter=None,
+                    _live_status_mode="off",
+                    _thinking_enabled=False,
+                    progress_mode="all",
+                    progress_grouping="accumulate",
+                    tool_progress_enabled=True,
+                    tool_progress_filter={"terminal": "all"},
+                    progress_queue=queue.Queue(),
+                    log_queue=None,
+                    last_progress_msg=[None],
+                    last_tool=[None],
+                    last_was_terminal_block=[False],
+                    repeat_count=[0],
+                    long_tool_hint_fired=[False],
+                    agent_holder=[None],
+                    _native_slack_task_cards=False,
+                )
 
+                class _CapRaw:
+                    def __init__(self):
+                        self.name = "cap-raw"
+                        self.MAX_MESSAGE_LENGTH = 4000
+                        self.message_len_fn = len
+                        self.supports_code_blocks = False
+                        self.format_tool_preview = lambda x, **kw: (
+                            x.text if hasattr(x, "text") else str(x)
+                        )
 
-# ---------------------------------------------------------------------------
-# 17. production seam falsification – ensure tests fail if protection removed
-# ---------------------------------------------------------------------------
+                    async def send(
+                        self, chat_id, content, reply_to=None, metadata=None
+                    ):
+                        ledger.append(content)
+                        m = MagicMock()
+                        m.success = True
+                        m.message_id = "mid"
+                        return m
+
+                    async def edit_message(
+                        self,
+                        chat_id,
+                        message_id,
+                        content,
+                        metadata=None,
+                        finalize=False,
+                    ):
+                        ledger.append(content)
+                        m = MagicMock()
+                        m.success = True
+                        return m
+
+                    async def send_typing(self, chat_id, metadata=None):
+                        return None
+
+                    def max_message_length_for_chat(self, c):
+                        return 4000
+
+                    def message_len_fn_for_chat(self, c):
+                        return len
+
+                cap_raw = _CapRaw()
+
+                class _StubRaw:
+                    def _adapter_for_source(self, s):
+                        return cap_raw
+
+                    async def _deliver_platform_notice(self, src, content):
+                        return None
+
+                runner_raw = TurnRunner(_StubRaw(), raw_ctx)  # type: ignore[arg-type]
+                raw_ctx.progress_queue.put(raw_error)
+                task = asyncio.create_task(runner_raw.send_progress_messages())
+                await asyncio.sleep(0.6)
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                for c in ledger:
+                    assert "opaqueTok12345" not in c
+                    assert opaque_url not in c
+        finally:
+            if _orig_home is None:
+                os.environ.pop("SLACK_HOME_CHANNEL", None)
+            else:
+                os.environ["SLACK_HOME_CHANNEL"] = _orig_home
 
 
 class TestProductionSeamFalsification:
     def test_adapter_final_egress_falsification_fails_without_redaction(self):
-        # Mutation: temporarily make _redact_progress_text a no-op (identity) – adapter send should then leak raw
+        # Mutation: temporarily make _redact_progress_text a no-op (identity) – adapter drain should then leak raw
+        # Uses production queue -> drain -> ledger path (no direct _send_progress_text)
         from gateway.run_turn_runner import TurnRunner
         from gateway.turn_context import TurnContext
         import gateway.run_turn_runner as rtr
@@ -3838,8 +3986,6 @@ class TestProductionSeamFalsification:
         orig = rtr._redact_progress_text
         try:
             rtr._redact_progress_text = lambda x: str(x) if x is not None else ""  # type: ignore[assignment]
-            # Now test that raw leaks – if our production test above were false-green (pre-redacted queue), it would still pass even with identity redactor
-            # Here we exercise final egress with raw injection; with identity, ledger should contain raw
             import asyncio
 
             ledger: list[str] = []
@@ -3910,22 +4056,28 @@ class TestProductionSeamFalsification:
             runner = TurnRunner(_Stub(), ctx)  # type: ignore[arg-type]
             raw_url = "https://ex.com/cb?token=opaqueTok12345"
             opaque = "opaqueTok12345"
+            # Inject raw via queue, bypassing producer redaction, and run production drain
+            ctx.progress_queue.put(raw_url)
+            ctx.progress_queue.put(f"raw-injected {raw_url}")
 
-            # Inject raw via final egress helper – with identity redactor, it will leak
             async def _run():
-                await runner._send_progress_text(
-                    runner._progress_edit_state(cap), raw_url
-                )
+                task = asyncio.create_task(runner.send_progress_messages())
+                await asyncio.sleep(0.7)
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
             asyncio.run(_run())
-            # With identity, raw should be present (proving test would fail if redaction removed)
+            # With identity, raw should be present (proving test is sensitive to redaction)
             assert any(raw_url in c for c in ledger), (
-                "falsification: with identity redactor, raw should leak (proving test is sensitive)"
+                "falsification: with identity redactor, raw should leak via drain"
             )
             assert any(opaque in c for c in ledger)
         finally:
             rtr._redact_progress_text = orig  # type: ignore[assignment]
-        # After restoration, same call should be redacted (proving restoration works)
+        # After restoration, same production drain should be redacted (proving restoration works)
         import asyncio
 
         ledger2: list[str] = []
@@ -3995,12 +4147,17 @@ class TestProductionSeamFalsification:
 
         runner2 = TurnRunner(_Stub2(), ctx2)  # type: ignore[arg-type]
         raw_url2 = "https://ex.com/cb?token=opaqueTok12345"
-        import asyncio
+        ctx2.progress_queue.put(raw_url2)
+        ctx2.progress_queue.put(f"raw-injected {raw_url2}")
 
         async def _run2():
-            await runner2._send_progress_text(
-                runner2._progress_edit_state(cap2), raw_url2
-            )
+            task = asyncio.create_task(runner2.send_progress_messages())
+            await asyncio.sleep(0.6)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
         asyncio.run(_run2())
         assert all(raw_url2 not in c for c in ledger2)
@@ -4087,26 +4244,140 @@ class TestProductionSeamFalsification:
 
             runner = TurnRunner(_Stub(), ctx)  # type: ignore[arg-type]
             raw_url = "https://ex.com/cb?token=opaqueTok12345"
-            # Inject raw native event
-            st = runner._TaskCardState(cap)
-            st.apply_event({
+            # Inject raw native event via queue (native producer would normally be via native_tool_start_callback, but we also test raw dict)
+            ctx.progress_queue.put({
                 "type": "tool.started",
                 "tool_call_id": "cid",
                 "tool_name": "terminal",
                 "preview": raw_url,
             })
+            # Also via real native producer to ensure both paths leak with identity
+            runner.native_tool_start_callback(
+                "cid2", "terminal", {"command": f"curl {raw_url}"}
+            )
             import asyncio
 
             async def _run():
-                await runner._task_card_publish(st)
+                task = asyncio.create_task(runner._send_native_task_card_progress(cap))
+                await asyncio.sleep(0.6)
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
             asyncio.run(_run())
-            # With identity, raw should leak
+            # With identity, raw should leak via drain
             found_leak = any(
                 raw_url in t.get("title", "") for tasks in ledger for t in tasks
             ) or any(raw_url in f for f in fb)
             assert found_leak, (
-                "with identity redactor, native publish should leak raw (proving drain not mocked)"
+                "with identity redactor, native publish should leak raw via drain"
             )
         finally:
             rtr._redact_progress_text = orig  # type: ignore[assignment]
+        # After restoration, same drain should be clean – verify via production drain as well
+        # Use fresh context and verify no leak
+        import asyncio
+
+        ledger2: list = []
+        fb2: list[str] = []
+
+        class _NativeCap2:
+            def __init__(self):
+                self.name = "native2"
+
+            async def send_native_task_card_progress(
+                self,
+                chat_id,
+                tasks,
+                title,
+                reply_to=None,
+                metadata=None,
+                fallback_text=None,
+            ):
+                ledger2.append(list(tasks))
+                if fallback_text:
+                    fb2.append(fallback_text)
+                m = MagicMock()
+                m.success = True
+                return m
+
+            async def send(self, chat_id, content, reply_to=None, metadata=None):
+                fb2.append(content)
+                m = MagicMock()
+                m.success = True
+                return m
+
+            async def edit_message(self, chat_id, message_id, content, metadata=None):
+                fb2.append(content)
+                m = MagicMock()
+                m.success = True
+                return m
+
+            async def stop_native_task_card_progress(
+                self, chat_id, reply_to=None, metadata=None
+            ):
+                return None
+
+        cap2 = _NativeCap2()
+        ctx2 = TurnContext(
+            source=MagicMock(chat_id="test-chat"),
+            _run_still_current=lambda: True,
+            _live_status_adapter=None,
+            _live_status_mode="off",
+            _thinking_enabled=False,
+            progress_mode="all",
+            progress_grouping="accumulate",
+            tool_progress_enabled=True,
+            tool_progress_filter={"terminal": "all"},
+            progress_queue=queue.Queue(),
+            log_queue=None,
+            last_progress_msg=[None],
+            last_tool=[None],
+            last_was_terminal_block=[False],
+            repeat_count=[0],
+            long_tool_hint_fired=[False],
+            agent_holder=[None],
+            _native_slack_task_cards=True,
+        )
+
+        class _Stub2:
+            def _adapter_for_source(self, s):
+                return cap2
+
+            async def _deliver_platform_notice(self, src, content):
+                return None
+
+        runner2 = TurnRunner(_Stub2(), ctx2)  # type: ignore[arg-type]
+        raw_url2 = "https://ex.com/cb?token=opaqueTok12345"
+        ctx2.progress_queue.put({
+            "type": "tool.started",
+            "tool_call_id": "cid",
+            "tool_name": "terminal",
+            "preview": raw_url2,
+        })
+        runner2.native_tool_start_callback(
+            "cid2", "terminal", {"command": f"curl {raw_url2}"}
+        )
+
+        async def _run2():
+            task = asyncio.create_task(runner2._send_native_task_card_progress(cap2))
+            await asyncio.sleep(0.6)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        asyncio.run(_run2())
+        # After restoration, no leak
+        assert all(
+            raw_url2 not in t.get("title", "") for tasks in ledger2 for t in tasks
+        )
+        assert all(raw_url2 not in f for f in fb2)
+        assert all(
+            "opaqueTok12345" not in t.get("title", "")
+            for tasks in ledger2
+            for t in tasks
+        )
