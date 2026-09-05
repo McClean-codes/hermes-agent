@@ -35,6 +35,95 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 logger = logging.getLogger("gateway.run")
 
 
+def _canonicalize_split_credentials(text: str) -> str:
+    """Merge whitespace that splits a URL credential across a literal newline/space/tab.
+
+    A credential like https://alice:longOpaque\\nOpaque@host or
+    https://ex.com/cb?token=opaque\\nTok123 is split by the model's
+    streaming whitespace. The authoritative redactors treat each whitespace-
+    separated token independently, so neither fragment is recognised as a
+    credential-bearing URL and the secret leaks. This helper merges only
+    whitespace that is inside a credential-bearing URL (userinfo or sensitive
+    query value) so the redactor sees the contiguous credential and can mask
+    it. Benign URLs (non-sensitive query keys, no userinfo) are left untouched
+    so they continue to be preserved.
+    """
+    if not text or "://" not in text:
+        return text
+
+    def _is_credential_bearing(fragment: str) -> bool:
+        low = fragment.lower()
+        # userinfo with password before @
+        if re.search(r"https?://[^/\s:]+:[^\s@]*$", fragment):
+            return True
+        if re.search(r"//[^/\s:]+:[^\s@]*$", fragment):
+            return True
+        if "?" in fragment:
+            for kw in (
+                "token=",
+                "api_key=",
+                "apikey=",
+                "signature=",
+                "secret=",
+                "password=",
+                "auth=",
+                "key=",
+                "code=",
+            ):
+                if kw in low:
+                    return True
+        if "@" in fragment and "://" in fragment:
+            return True
+        return False
+
+    def _looks_like_fragment(s: str) -> bool:
+        if not s or len(s) < 4:
+            return False
+        if "@" in s:
+            return True
+        # continuation of a query value – any alphanum token of length >=4
+        if re.fullmatch(r"[A-Za-z0-9_\-]{4,}", s):
+            return True
+        return False
+
+    for _ in range(5):
+
+        def _repl_userinfo(m: re.Match) -> str:
+            prefix = m.group(1)
+            suffix = m.group(2)
+            if _is_credential_bearing(prefix) or _looks_like_fragment(suffix):
+                return prefix + suffix
+            combined = prefix + suffix
+            if _is_credential_bearing(combined):
+                return combined
+            return m.group(0)
+
+        new = re.sub(
+            r"(https?://[^\s]*)\s+([^\s]*@)", _repl_userinfo, text, flags=re.IGNORECASE
+        )
+        new = re.sub(r"(//[^\s]*)\s+([^\s]*@)", _repl_userinfo, new)
+
+        def _repl_query(m: re.Match) -> str:
+            prefix = m.group(1)
+            suffix = m.group(2)
+            if not _looks_like_fragment(suffix):
+                return m.group(0)
+            if _is_credential_bearing(prefix):
+                return prefix + suffix
+            combined = prefix + suffix
+            if _is_credential_bearing(combined):
+                return combined
+            return m.group(0)
+
+        new = re.sub(r"(\?[^#\s]*[?&;][^=]*=[^\s&;]*)\s+([^\s&;\s]+)", _repl_query, new)
+        new = re.sub(r"(\?[^#\s]*=[^\s&;]*)\s+([^\s&;\s]+)", _repl_query, new)
+
+        if new == text:
+            break
+        text = new
+    return text
+
+
 def _redact_progress_text(text: str | None) -> str:
     """Fail-closed secret redaction for progress/preview/status text before chat publication.
 
@@ -98,20 +187,25 @@ class _StatefulStreamRedactor:
 
     def _sanitize(self, text: str) -> str:
         try:
-            return _redact_progress_text(text)
+            # Canonicalize whitespace-split credentials before authoritative redaction
+            # so a URL like https://alice:long\nOpaque@host is seen as contiguous
+            canonical = _canonicalize_split_credentials(text)
+            return _redact_progress_text(canonical)
         except Exception:
             logger.debug("stateful stream sanitize primary failed", exc_info=True)
             try:
                 from gateway.run import _redact_gateway_user_facing_secrets
 
-                redacted = _redact_gateway_user_facing_secrets(text)
+                # Also canonicalize for fallback path
+                canonical_fb = _canonicalize_split_credentials(text)
+                redacted = _redact_gateway_user_facing_secrets(canonical_fb)
                 try:
                     from agent.redact import _redact_strict_url_credentials
 
                     return _redact_strict_url_credentials(redacted)
                 except Exception:
-                    if "://" in text:
-                        if text != redacted and (
+                    if "://" in canonical_fb:
+                        if canonical_fb != redacted and (
                             "***" in redacted or "[REDACTED]" in redacted
                         ):
                             return redacted
@@ -157,6 +251,34 @@ class _StatefulStreamRedactor:
     def _find_safe_len(self, sanitized: str) -> int:
         if sanitized == "[REDACTED]":
             return len(sanitized)
+        # Literal newline/whitespace inside a credential-bearing URL must not flush.
+        # If the sanitized output still contains a newline and is still risky/unmasked,
+        # it indicates a split credential that the canonicalizer did not fully merge
+        # (e.g., due to benign-vs-hostile ambiguity). Fail closed by holding back
+        # from the first URL-like token.
+        if ("\n" in sanitized or "\r" in sanitized) and self._has_risk(sanitized):
+            if "***" not in sanitized and sanitized != "[REDACTED]":
+                # Check for userinfo or query split pattern still present
+                if re.search(
+                    r"https?://[^\s]*\s+[^\s]*@", sanitized, re.IGNORECASE
+                ) or re.search(r"\?[^#\s]*=[^\s]*\s+[^\s]+", sanitized):
+                    n = len(sanitized)
+                    tokens_tmp: list[tuple[int, int]] = []
+                    i = 0
+                    while i < n:
+                        if sanitized[i] in " \t\n\r":
+                            i += 1
+                            continue
+                        s = i
+                        while i < n and sanitized[i] not in " \t\n\r":
+                            i += 1
+                        e = i
+                        tokens_tmp.append((s, e))
+                    for s, e in tokens_tmp:
+                        if "://" in sanitized[s:e]:
+                            return s
+                    # Fallback to 0 if no URL token found but still risky
+                    return 0
         if not self._has_risk(sanitized):
             return len(sanitized)
         # Token-aware holdback: any unmasked risky token must not flush.

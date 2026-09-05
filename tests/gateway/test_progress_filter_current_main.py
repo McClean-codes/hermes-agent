@@ -7713,3 +7713,223 @@ class TestStatefulStreamedEgress:
         assert len(send_ledger) <= 2 and len(edit_ledger) <= 2, (
             f"unexpected duplicate {send_ledger!r} {edit_ledger!r}"
         )
+
+    @pytest.mark.asyncio
+    async def test_stateful_newline_split_userinfo_no_leakage_across_send_edit_final(
+        self,
+    ):
+        """Newline-split hostile userinfo must not leak via any concrete send/edit/final.
+
+        Regression for the Raven-reported seam where
+        send('prefix ') → edit('prefix https://alice:longOpaque\\nOpaque@host')
+        leaked a raw newline-split opaque userinfo. This test drives the real
+        TurnRunner → GatewayStreamConsumer → capture adapter ledger with a
+        literal newline inside the URL and asserts exact effect content/ordering
+        and absence of raw URL, opaque fragments and dangerous prefixes.
+        """
+        import queue, asyncio
+        from unittest.mock import MagicMock
+        from gateway.turn_context import TurnContext
+        from gateway.run_turn_runner import TurnRunner
+        from gateway.stream_consumer import StreamConsumerConfig
+        from gateway.platforms.base import SendResult
+        from gateway.config import (
+            Platform,
+            GatewayConfig,
+            PlatformConfig,
+            StreamingConfig,
+        )
+
+        ledger: list[tuple[str, str]] = []
+
+        class Cap:
+            async def send(self, chat_id, content, reply_to=None, metadata=None):
+                ledger.append(("send", content))
+                return SendResult(success=True, message_id=f"m-nl-{len(ledger)}")
+
+            async def edit_message(
+                self, chat_id, message_id, content, metadata=None, finalize=False
+            ):
+                ledger.append(("edit", content))
+                m = MagicMock()
+                m.success = True
+                m.message_id = message_id
+                return m
+
+            async def send_typing(self, chat_id, metadata=None):
+                return None
+
+            async def get_chat_info(self, chat_id):
+                return {"id": chat_id}
+
+            def supports_draft_streaming(self, **kw):
+                return False
+
+            def supports_native_streaming(self, **kw):
+                return False
+
+        cap = Cap()
+        ctx = TurnContext(
+            source=MagicMock(chat_id="C123", platform=Platform.SLACK),
+            _run_still_current=lambda: True,
+            progress_mode="all",
+            tool_progress_enabled=True,
+            tool_progress_filter={},
+            progress_queue=queue.Queue(),
+            log_queue=None,
+            last_progress_msg=[None],
+            last_tool=[None],
+            last_was_terminal_block=[False],
+            repeat_count=[0],
+            long_tool_hint_fired=[False],
+            agent_holder=[None],
+            _native_slack_task_cards=False,
+            result_holder=[None],
+            tools_holder=[None],
+            stream_consumer_holder=[None],
+            streaming_tts_consumer_holder=[None],
+            user_config={"display": {}},
+            resolve_display_setting=lambda cfg, plat, key: None,
+            event_message_id="evt-nl",
+            _status_thread_metadata={},
+        )
+
+        class Stub:
+            def __init__(self):
+                self.config = GatewayConfig(
+                    platforms={Platform.SLACK: PlatformConfig(enabled=True, token="x")}
+                )
+                self.config.streaming = StreamingConfig(
+                    enabled=True,
+                    transport="edit",
+                    edit_interval=0.05,
+                    buffer_threshold=1,
+                )
+
+            def _adapter_for_source(self, s):
+                return cap
+
+            def _build_stream_consumer_config(
+                self, source, scfg, adapter, on_missing_cursor="raise"
+            ):
+                return StreamConsumerConfig(
+                    edit_interval=0.05,
+                    buffer_threshold=1,
+                    cursor="",
+                    transport="edit",
+                    chat_type="channel",
+                ), None
+
+        runner = TurnRunner(Stub(), ctx)
+        sc, delta_cb, _, _ = runner._setup_stream_consumer("slack")
+        assert sc is not None and delta_cb is not None
+        task = asyncio.create_task(sc.run())
+        await asyncio.sleep(0.08)
+        # The exact Raven-reported shape: prefix + newline-split userinfo
+        # Also covers whitespace-split variant
+        newline_hostile = f"prefix https://alice:{self.LONG_OPAQUE}\nOpaqueUserInfo1234567890ABCDEFExtraLongTail1234567890@ex.com/p"
+        # Also test space-split variant
+        space_hostile = f"prefix https://alice:{self.LONG_OPAQUE} OpaqueUserInfo1234567890ABCDEFExtraLongTail1234567890@ex.com/p"
+        query_newline = (
+            f"prefix https://ex.com/cb?token={self.OPAQUE_TOKEN}\nTokExtra123 end"
+        )
+        for hostile in (newline_hostile, space_hostile, query_newline):
+            ledger.clear()
+            # Initial send via first delta prefix
+            delta_cb("prefix ")
+            await asyncio.sleep(0.15)
+            # Incremental edit via second delta with split hostile
+            # The hostile after prefix is the URL part (without the prefix already sent)
+            url_part = hostile[len("prefix ") :]
+            delta_cb(url_part)
+            await asyncio.sleep(0.22)
+            # All interim effects must be free of raw
+            for kind, content in list(ledger):
+                self._assert_no_leak(content)
+            # Final reconciliation via finish()
+            runner._finish_stream_consumer(
+                {
+                    "final_response": hostile,
+                    "failed": False,
+                    "interrupted": False,
+                    "completed": True,
+                },
+                [],
+                sc,
+            )
+            await asyncio.sleep(0.35)
+            # Drain and check final ledger
+            for kind, content in ledger:
+                self._assert_no_leak(content)
+            assert any("***" in c or "[REDACTED]" in c for _, c in ledger), (
+                f"expected mask in {ledger!r}"
+            )
+            # Exact ordering: first effect is send of prefix, second is edit with masked hostile
+            assert ledger[0][0] == "send", f"first should be send {ledger[0]}"
+            assert ledger[0][1] == "prefix ", (
+                f"first send should be exact prefix, got {ledger[0][1]!r}"
+            )
+            # The edit must be prefix + masked URL, not raw newline-split
+            edit_contents = [c for k, c in ledger if k == "edit"]
+            assert len(edit_contents) >= 1, f"expected at least one edit, got {ledger}"
+            for ec in edit_contents:
+                assert (
+                    "https://alice:" not in ec or "***" in ec or "[REDACTED]" in ec
+                ), f"raw userinfo leaked in edit {ec!r}"
+                assert self.LONG_OPAQUE not in ec, f"opaque leaked in edit {ec!r}"
+                assert (
+                    self.DANGEROUS_PREFIX not in ec or "***" in ec or "[REDACTED]" in ec
+                )
+                assert "\nOpaque" not in ec, f"newline-split fragment leaked {ec!r}"
+            # Reset consumer for next hostile variant
+            # Need a fresh consumer for next iteration
+            try:
+                await asyncio.wait_for(task, timeout=1.5)
+            except asyncio.TimeoutError:
+                task.cancel()
+                try:
+                    await task
+                except:
+                    pass
+            # Recreate for next variant if not last
+            if hostile != query_newline:
+                # Fresh ledger and consumer
+                ledger.clear()
+                ctx2 = TurnContext(
+                    source=MagicMock(chat_id="C123", platform=Platform.SLACK),
+                    _run_still_current=lambda: True,
+                    progress_mode="all",
+                    tool_progress_enabled=True,
+                    tool_progress_filter={},
+                    progress_queue=queue.Queue(),
+                    log_queue=None,
+                    last_progress_msg=[None],
+                    last_tool=[None],
+                    last_was_terminal_block=[False],
+                    repeat_count=[0],
+                    long_tool_hint_fired=[False],
+                    agent_holder=[None],
+                    _native_slack_task_cards=False,
+                    result_holder=[None],
+                    tools_holder=[None],
+                    stream_consumer_holder=[None],
+                    streaming_tts_consumer_holder=[None],
+                    user_config={"display": {}},
+                    resolve_display_setting=lambda cfg, plat, key: None,
+                    event_message_id="evt-nl2",
+                    _status_thread_metadata={},
+                )
+                runner2 = TurnRunner(Stub(), ctx2)
+                sc, delta_cb, _, _ = runner2._setup_stream_consumer("slack")
+                task = asyncio.create_task(sc.run())
+                await asyncio.sleep(0.08)
+                runner = runner2
+        # Final cleanup
+        try:
+            await asyncio.wait_for(task, timeout=1.5)
+        except asyncio.TimeoutError:
+            task.cancel()
+            try:
+                await task
+            except:
+                pass
