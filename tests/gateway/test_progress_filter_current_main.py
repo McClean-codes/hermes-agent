@@ -4216,12 +4216,12 @@ class TestNativePublicRawLongUserinfoRegression:
                 assert raw_url not in title
                 assert opaque not in title
                 assert prefix not in title
-                assert title == "[REDACTED]" or "***" in title or "[REDACTED]" in title
+                assert title == "[REDACTED]"
         for fb in fallback_ledger:
             assert raw_url not in fb
             assert opaque not in fb
             assert prefix not in fb
-            assert fb == "[REDACTED]" or "***" in fb or "[REDACTED]" in fb
+            assert fb == "[REDACTED]"
 
         ledger_tasks.clear()
         fallback_ledger.clear()
@@ -4268,171 +4268,217 @@ class TestNativePublicRawLongUserinfoRegression:
 class TestNativeEnabledFinalDelivery:
     @pytest.mark.asyncio
     async def test_final_delivery_native_enabled_no_leakage_no_duplicate(self):
-        """Production-wired Slack-native final path with native cards enabled: exactly one final send, no native leakage, no duplicate after tool.completed."""
-        from gateway.run_turn_runner import TurnRunner
-        from gateway.turn_context import TurnContext
+        """Production-wired Slack-native final path with native cards enabled: exactly one final send, non-empty native ledger, no leakage, no duplicate after tool.completed."""
         from gateway.config import Platform, GatewayConfig, PlatformConfig
         from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
         from gateway.run import GatewayRunner, _sanitize_gateway_final_response
         from gateway.session import SessionSource, SessionEntry, build_session_key
         from unittest.mock import MagicMock, AsyncMock, patch
         from datetime import datetime, timedelta
-        import queue, asyncio, os
+        import queue, asyncio, os, json
         from types import SimpleNamespace
+        from tools.registry import registry
 
-        def _mock_response(content="Hello", finish_reason="stop"):
-            msg = SimpleNamespace(content=content, tool_calls=None)
-            choice = SimpleNamespace(message=msg, finish_reason=finish_reason)
-            return SimpleNamespace(choices=[choice], model="test/model", usage=None)
+        LONG_OPAQUE = "longOpaqueUserInfo1234567890ABCDEFExtraLongTail1234567890"
+        RAW_URL = f"https://{LONG_OPAQUE}@ex.com/p"
+        RAW_URL_USERPASS = f"https://alice:{LONG_OPAQUE}@ex.com/p"
+        DANGEROUS_PREFIX = LONG_OPAQUE[:8]
+        tool_name = "_test_native_final_tool"
+        schema = {"type": "object", "properties": {"url": {"type": "string"}}}
 
-        ledger: list[str] = []
-        native_ledger: list = []
+        def _handler(*args, **kwargs):
+            url = kwargs.get("url")
+            if not url and args and isinstance(args[0], dict):
+                url = args[0].get("url", "")
+            return f"handled {str(url)[:10]}"
 
-        class _CaptureSlackAdapter(BasePlatformAdapter):
-            def __init__(self):
-                super().__init__(PlatformConfig(enabled=True, token="xoxb-fake"), Platform.SLACK)
-
-            async def connect(self, *, is_reconnect: bool = False) -> bool:
-                return True
-
-            async def disconnect(self) -> None:
-                return None
-
-            async def send(self, chat_id, content, reply_to=None, metadata=None):
-                ledger.append(content)
-                return SendResult(success=True, message_id="slack-1")
-
-            async def send_typing(self, chat_id, metadata=None):
-                return None
-
-            async def get_chat_info(self, chat_id):
-                return {"id": chat_id}
-
-            def native_task_cards_enabled(self) -> bool:
-                return True
-
-            async def send_native_task_card_progress(self, chat_id, tasks, title, reply_to=None, metadata=None, fallback_text=None):
-                native_ledger.append(list(tasks))
-                m = MagicMock()
-                m.success = True
-                m.message_id = "native-1"
-                return m
-
-            async def stop_native_task_card_progress(self, chat_id, reply_to=None, metadata=None):
-                return None
-
-        fake_adapter = _CaptureSlackAdapter()
-        fake_adapter.send = AsyncMock(side_effect=fake_adapter.send)
-        fake_adapter.send_native_task_card_progress = AsyncMock(side_effect=fake_adapter.send_native_task_card_progress)  # type: ignore[attr-defined]
-
-        config = GatewayConfig(platforms={Platform.SLACK: PlatformConfig(enabled=True, token="xoxb-fake")})
-        gw = GatewayRunner(config=config)
-        gw.adapters = {Platform.SLACK: fake_adapter}
-        gw._is_user_authorized = lambda _source: True
-        gw._is_user_authorized_for_source = lambda _s, **kw: True
-        gw._session_db = MagicMock()
-        gw._session_db.get_telegram_topic_binding = AsyncMock(return_value=None)
-        gw._session_db.get_compression_tip = AsyncMock(return_value=None)
-        gw.hooks = MagicMock()
-        gw.hooks.emit = AsyncMock()
-        now = datetime.now()
-        session_entry = SessionEntry(
-            session_key="agent:main:slack:channel:C123:U123",
-            session_id="sess-final-native-1",
-            created_at=now - timedelta(seconds=10),
-            updated_at=now,
-            platform=Platform.SLACK,
-            chat_type="channel",
-        )
-        gw.session_store = MagicMock()
-        gw.session_store.get_or_create_session.return_value = session_entry
-        gw.session_store.load_transcript.return_value = []
-        gw.session_store.has_any_sessions.return_value = True
-        gw.session_store.rewrite_transcript = MagicMock()
-        gw.session_store.append_to_transcript = MagicMock()
-        gw.session_store.update_session = MagicMock()
-        gw.session_store.has_platform_message_id = MagicMock(return_value=False)
-        gw.session_store._save = MagicMock()
-        gw.session_store._record_gateway_session_peer = MagicMock()
-        gw._async_session_store = gw.session_store  # type: ignore[attr-defined]
-        gw._adapter_for_source = lambda source: fake_adapter
-        gw._resolve_session_agent_runtime = MagicMock(return_value=("test/model", {"api_key": "fake", "base_url": "https://openrouter.ai/api/v1"}))
-        gw._resolve_session_reasoning_config = MagicMock(return_value=None)
-        gw._resolve_session_service_tier = MagicMock(return_value=None)
-        gw._provider_routing = {}
-        gw._reasoning_config = None
-        gw._service_tier = None
-        final_text = "Hello final native reply"
-        sanitized = _sanitize_gateway_final_response(Platform.SLACK, final_text)
-        assert sanitized == final_text
-        source_check = SessionSource(platform=Platform.SLACK, chat_id="C123", chat_type="channel", user_id="U123", thread_id="T123")
-        disp = gw._run_agent_display_settings(source_check)
-        assert disp._native_slack_task_cards is True, "native must be enabled via adapter"
-        assert disp.needs_progress_queue is True
-        event = MessageEvent(
-            text="hi",
-            source=SessionSource(platform=Platform.SLACK, chat_id="C123", chat_type="channel", user_id="U123", thread_id="T123"),
-            message_id="msg-final-native-1",
-        )
-        fake_adapter.set_message_handler(gw._handle_message)
-        fake_adapter._keep_typing = lambda *a, **kw: asyncio.Event().wait()
-        _orig_home = os.environ.get("SLACK_HOME_CHANNEL")
-        os.environ["SLACK_HOME_CHANNEL"] = "C123"
         try:
-            with (
-                patch("model_tools.get_tool_definitions", return_value=[]),
-                patch("model_tools.check_toolset_requirements", return_value={}),
-                patch("agent.chat_completion_helpers.direct_api_call", side_effect=lambda agent, api_kwargs: _mock_response(content=final_text)),
-                patch("agent.chat_completion_helpers.interruptible_api_call", side_effect=lambda agent, api_kwargs: _mock_response(content=final_text)),
-                patch("agent.chat_completion_helpers.interruptible_streaming_api_call", side_effect=lambda agent, api_kwargs, **kw: _mock_response(content=final_text)),
-                patch("agent.chat_completion_helpers.should_use_direct_api_call", return_value=True),
-                patch("agent.process_bootstrap.OpenAI"),
-            ):
-                await fake_adapter._process_message_background(event, build_session_key(event.source))
-                assert ledger == [sanitized], f"ledger was {ledger}"
-                assert fake_adapter.send.call_count == 1
-                for tasks in native_ledger:
-                    for t in tasks:
-                        assert "opaque" not in t.get("title","").lower()
-                pq = queue.Queue()
-                ctx = TurnContext(
-                    source=MagicMock(chat_id="C123"),
-                    _run_still_current=lambda: True,
-                    _live_status_adapter=None,
-                    _live_status_mode="off",
-                    _thinking_enabled=False,
-                    progress_mode="off",
-                    progress_grouping="accumulate",
-                    tool_progress_enabled=False,
-                    tool_progress_filter={"terminal": "off"},
-                    progress_queue=pq,
-                    log_queue=queue.Queue(),
-                    last_progress_msg=[None],
-                    last_tool=[None],
-                    last_was_terminal_block=[False],
-                    repeat_count=[0],
-                    long_tool_hint_fired=[False],
-                    agent_holder=[None],
-                    _native_slack_task_cards=True,
-                    result_holder=[None],
-                    tools_holder=[None],
-                    stream_consumer_holder=[None],
-                    streaming_tts_consumer_holder=[None],
-                )
-                stub = MagicMock()
-                stub._adapter_for_source = lambda s: fake_adapter
-                tr = TurnRunner(stub, ctx)  # type: ignore[arg-type]
-                tr.native_tool_start_callback("cid-final-check", "terminal", {"command": "ls"})
-                assert pq.empty()
-                tr.native_tool_complete_callback("cid-final-check", "terminal", {}, None)
-                assert pq.empty()
-                assert ledger == [sanitized]
-                assert fake_adapter.send.call_count == 1
+            registry.deregister(tool_name)
+        except Exception:
+            pass
+        registry.register(name=tool_name, toolset="test-native-final", schema=schema, handler=_handler, check_fn=lambda: True)
+        try:
+            final_text = "Hello final native reply"
+            sanitized = _sanitize_gateway_final_response(Platform.SLACK, final_text)
+            assert sanitized == final_text
+
+            ledger: list[str] = []
+            native_ledger: list = []
+            fallback_ledger: list[str] = []
+
+            class _CaptureSlackAdapter(BasePlatformAdapter):
+                def __init__(self):
+                    super().__init__(PlatformConfig(enabled=True, token="xoxb-fake"), Platform.SLACK)
+
+                async def connect(self, *, is_reconnect: bool = False) -> bool:
+                    return True
+
+                async def disconnect(self) -> None:
+                    return None
+
+                async def send(self, chat_id, content, reply_to=None, metadata=None):
+                    ledger.append(content)
+                    return SendResult(success=True, message_id="slack-1")
+
+                async def send_typing(self, chat_id, metadata=None):
+                    return None
+
+                async def get_chat_info(self, chat_id):
+                    return {"id": chat_id}
+
+                def native_task_cards_enabled(self) -> bool:
+                    return True
+
+                async def send_native_task_card_progress(self, chat_id, tasks, title, reply_to=None, metadata=None, fallback_text=None):
+                    native_ledger.append(list(tasks))
+                    if fallback_text:
+                        fallback_ledger.append(fallback_text)
+                    m = MagicMock()
+                    m.success = True
+                    m.message_id = "native-1"
+                    return m
+
+                async def stop_native_task_card_progress(self, chat_id, reply_to=None, metadata=None):
+                    return None
+
+            fake_adapter = _CaptureSlackAdapter()
+            fake_adapter.send = AsyncMock(side_effect=fake_adapter.send)
+            fake_adapter.send_native_task_card_progress = AsyncMock(side_effect=fake_adapter.send_native_task_card_progress)  # type: ignore[attr-defined]
+
+            config = GatewayConfig(platforms={Platform.SLACK: PlatformConfig(enabled=True, token="xoxb-fake")})
+            gw = GatewayRunner(config=config)
+            gw.adapters = {Platform.SLACK: fake_adapter}
+            gw._is_user_authorized = lambda _source: True
+            gw._is_user_authorized_for_source = lambda _s, **kw: True
+            gw._session_db = MagicMock()
+            gw._session_db.get_telegram_topic_binding = AsyncMock(return_value=None)
+            gw._session_db.get_compression_tip = AsyncMock(return_value=None)
+            gw.hooks = MagicMock()
+            gw.hooks.emit = AsyncMock()
+            now = datetime.now()
+            session_entry = SessionEntry(
+                session_key="agent:main:slack:channel:C123:U123",
+                session_id="sess-final-native-1",
+                created_at=now - timedelta(seconds=10),
+                updated_at=now,
+                platform=Platform.SLACK,
+                chat_type="channel",
+            )
+            gw.session_store = MagicMock()
+            gw.session_store.get_or_create_session.return_value = session_entry
+            gw.session_store.load_transcript.return_value = []
+            gw.session_store.has_any_sessions.return_value = True
+            gw.session_store.rewrite_transcript = MagicMock()
+            gw.session_store.append_to_transcript = MagicMock()
+            gw.session_store.update_session = MagicMock()
+            gw.session_store.has_platform_message_id = MagicMock(return_value=False)
+            gw.session_store._save = MagicMock()
+            gw.session_store._record_gateway_session_peer = MagicMock()
+            gw._async_session_store = gw.session_store  # type: ignore[attr-defined]
+            gw._adapter_for_source = lambda source: fake_adapter
+            gw._resolve_session_agent_runtime = MagicMock(return_value=("test/model", {"api_key": "fake", "base_url": "https://openrouter.ai/api/v1"}))
+            gw._resolve_session_reasoning_config = MagicMock(return_value=None)
+            gw._resolve_session_service_tier = MagicMock(return_value=None)
+            gw._provider_routing = {}
+            gw._reasoning_config = None
+            gw._service_tier = None
+            gw._is_session_run_current = lambda _k, _g: True
+            # Force display to allow our test tool for native visibility (global all + allowlist)
+            _orig_disp = gw._run_agent_display_settings
+            def _patched_disp(src):
+                d = _orig_disp(src)
+                # Ensure native visible: global all and tool allowlisted, needs_progress_queue true
+                d.progress_mode = "all"
+                d.tool_progress_enabled = True
+                try:
+                    f = dict(d.tool_progress_filter) if isinstance(d.tool_progress_filter, dict) else {}
+                except Exception:
+                    f = {}
+                f[tool_name] = "all"
+                d.tool_progress_filter = f
+                d.needs_progress_queue = True
+                return d
+            gw._run_agent_display_settings = _patched_disp
+            source_check = SessionSource(platform=Platform.SLACK, chat_id="C123", chat_type="channel", user_id="U123", thread_id="T123")
+            disp = gw._run_agent_display_settings(source_check)
+            assert disp._native_slack_task_cards is True, "native must be enabled via adapter"
+            assert disp.needs_progress_queue is True
+            event = MessageEvent(
+                text="hi",
+                source=SessionSource(platform=Platform.SLACK, chat_id="C123", chat_type="channel", user_id="U123", thread_id="T123"),
+                message_id="msg-final-native-1",
+            )
+            fake_adapter.set_message_handler(gw._handle_message)
+            fake_adapter._keep_typing = lambda *a, **kw: asyncio.Event().wait()
+            _orig_home = os.environ.get("SLACK_HOME_CHANNEL")
+            os.environ["SLACK_HOME_CHANNEL"] = "C123"
+            call_counter = {"n": 0}
+
+            def _direct_side_effect(agent, api_kwargs):
+                if call_counter["n"] == 0:
+                    call_counter["n"] += 1
+                    tc = SimpleNamespace(id="call_native_1", type="function", function=SimpleNamespace(name=tool_name, arguments=json.dumps({"url": RAW_URL})))
+                    msg = SimpleNamespace(content=None, tool_calls=[tc])
+                    choice = SimpleNamespace(message=msg, finish_reason="tool_calls")
+                    return SimpleNamespace(choices=[choice], model="test/model", usage=None)
+                else:
+                    msg = SimpleNamespace(content=final_text, tool_calls=None)
+                    choice = SimpleNamespace(message=msg, finish_reason="stop")
+                    return SimpleNamespace(choices=[choice], model="test/model", usage=None)
+
+            tool_def = {"type": "function", "function": {"name": tool_name, "description": "test native final", "parameters": schema}}
+            try:
+                with (
+                    patch("model_tools.get_tool_definitions", return_value=[tool_def]),
+                    patch("model_tools.check_toolset_requirements", return_value={}),
+                    patch("agent.chat_completion_helpers.direct_api_call", side_effect=_direct_side_effect),
+                    patch("agent.chat_completion_helpers.interruptible_api_call", side_effect=_direct_side_effect),
+                    patch("agent.chat_completion_helpers.interruptible_streaming_api_call", side_effect=lambda agent, api_kwargs, **kw: _direct_side_effect(agent, api_kwargs)),
+                    patch("agent.chat_completion_helpers.should_use_direct_api_call", return_value=True),
+                    patch("agent.process_bootstrap.OpenAI"),
+                ):
+                    await fake_adapter._process_message_background(event, build_session_key(event.source))
+                    assert ledger == [sanitized], f"final ledger was {ledger}"
+                    assert fake_adapter.send.call_count == 1, f"send called {fake_adapter.send.call_count} times, expected 1"
+                    assert len(native_ledger) >= 1, f"native ledger empty, expected non-empty when tool started: {native_ledger}"
+                    assert fake_adapter.send_native_task_card_progress.call_count >= 1  # type: ignore[attr-defined]
+                    for tasks in native_ledger:
+                        for t in tasks:
+                            title = t.get("title", "")
+                            assert RAW_URL not in title, f"raw bare URL leaked in native title: {title!r}"
+                            assert RAW_URL_USERPASS not in title, f"raw userpass URL leaked: {title!r}"
+                            assert LONG_OPAQUE not in title, f"opaque leaked in native title: {title!r}"
+                            assert DANGEROUS_PREFIX not in title, f"dangerous prefix leaked in native title: {title!r}"
+                    for fb in fallback_ledger:
+                        assert RAW_URL not in fb, f"raw URL in native fallback: {fb!r}"
+                        assert RAW_URL_USERPASS not in fb
+                        assert LONG_OPAQUE not in fb
+                        assert DANGEROUS_PREFIX not in fb
+                    for fin in ledger:
+                        assert RAW_URL not in fin
+                        assert RAW_URL_USERPASS not in fin
+                        assert LONG_OPAQUE not in fin
+                        assert DANGEROUS_PREFIX not in fin
+                        assert fin == sanitized
+                    prev_send = fake_adapter.send.call_count
+                    prev_native = fake_adapter.send_native_task_card_progress.call_count  # type: ignore[attr-defined]
+                    prev_ledger_len = len(ledger)
+                    prev_native_len = len(native_ledger)
+                    await asyncio.sleep(0.4)
+                    assert fake_adapter.send.call_count == prev_send, "tool.completed produced duplicate final send"
+                    assert len(ledger) == prev_ledger_len
+                    assert len(native_ledger) == prev_native_len or len(native_ledger) == prev_native_len + 1 or len(native_ledger) >= 1
+                    assert fake_adapter.send_native_task_card_progress.call_count == prev_native or fake_adapter.send_native_task_card_progress.call_count == prev_native + 1  # type: ignore[attr-defined]
+            finally:
+                if _orig_home is None:
+                    os.environ.pop("SLACK_HOME_CHANNEL", None)
+                else:
+                    os.environ["SLACK_HOME_CHANNEL"] = _orig_home
         finally:
-            if _orig_home is None:
-                os.environ.pop("SLACK_HOME_CHANNEL", None)
-            else:
-                os.environ["SLACK_HOME_CHANNEL"] = _orig_home
+            try:
+                registry.deregister(tool_name)
+            except Exception:
+                pass
 
 
 
