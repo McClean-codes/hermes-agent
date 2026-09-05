@@ -2492,19 +2492,15 @@ async def test_registered_token_invalid_callbacks_noop():
     await ad.on_tool_call_start(wrong_msg_tok, "read_file")
     assert raw.ledger() == before
     assert raw2.ledger() == [("add","🤖")]
-    # 6. Retired token: complete first turn (actually second turn is current, so complete it to retire)
+    # 6. Retired token: capture token for evt2 before retirement, then verify retired is no-op
+    tok2 = ad._rxn_get_token(src, "201")
+    assert tok2 is not None
     await ad.on_processing_complete(evt2, ProcessingOutcome.SUCCESS)
-    # Now tok for evt2 should be retired
-    tok2 = tok_valid  # old, but also need new token for evt2
-    # Get token for evt2 before retirement
-    # Actually we need to get token for evt2 before retirement, but we already have raw2's token is now retired after complete
-    # So any call with that token should be no-op
-    # Let's get the token that was used for evt2 (we can retrieve via second turn's token)
-    # For this test, we will use a token that is now retired (the one for 201)
-    # We need to capture it before retirement; we have tok2 is old, not new. Let's capture new token before complete
-    # Instead, test retired by using the token that was just retired (we need to capture before)
-    # We'll create a new token for 201 before complete and test after
-    # For simplicity, test retired by using the old valid token which is already stale/retired
+    # Now tok2 should be retired
+    await ad.on_tool_call_start(tok2, "read_file")
+    assert raw.ledger() == before
+    assert raw2.ledger() == [("add","🤖")]
+    # Also verify stale old token remains no-op
     await ad.on_tool_call_start(tok_valid, "read_file")
     assert raw.ledger() == before
     assert raw2.ledger() == [("add","🤖")]
@@ -2554,6 +2550,7 @@ async def test_pre_lock_race_guard_prevents_cross_targeting():
     # Hold the guard for key
     key = ad._reaction_msg_key(evt1)
     guard = await ad._rxn_acquire_guard(key)
+    assert guard.lock.locked()
     try:
         # Queue old callback and replacement start while guard held
         # Old callback will wait for guard, replacement start will also wait
@@ -2751,7 +2748,6 @@ async def test_durable_ack_proof(tmp_path, monkeypatch):
         ad2 = DiscordAdapter(cfg2)
         ad2._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=99999, name="HermesBot"))
         src2 = _make_source(chat_id="123")
-        raw2 = LedgerMessage(msg_id=801)
         # Make raw without add_reaction capability to force False
         raw_no_cap = SimpleNamespace(id=801)
         evt2 = _make_event("801", raw_no_cap, source=src2)
@@ -2858,6 +2854,11 @@ async def test_bound_pressure_caps():
     w = weakref.ref(raw_sup)
     del raw_sup
     gc.collect()
+    if ack is False:
+        assert w() is None, "weakref should be dead after suppressed turn retirement"
+    else:
+        # When not suppressed, current holds strong ref, weak stays alive until retirement
+        assert w() is not None
     # The suppressed turn's raw was not retained, so weak should be dead (but we don't have strong, so it's dead)
     # For new turn that was suppressed, its native_ref is None, so no strong, weak dead is expected
     # Now test recovery drains: create a new turn that will retry pending (but we are at cap, so it will be suppressed again, not drain)

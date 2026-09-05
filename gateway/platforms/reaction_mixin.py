@@ -651,22 +651,6 @@ class DynamicReactionMixin:
                     msg_ref = None
             # If still None, we cannot retry this record now; keep it
             if msg_ref is None:
-                # For Discord production, we could try to create a synthetic message via channel
-                # but that requires channel lookup; we skip for now and keep pending
-                # Try generic fallback: if adapter has method to create handle from locator
-                # Use _reaction_resolve_message with synthetic event?
-                try:
-                    # Build synthetic event with source containing chat_id
-                    from gateway.platforms.base import SessionSource
-                    from gateway.config import Platform
-
-                    src = SessionSource(platform=Platform.DISCORD, chat_id=locator.channel_id, chat_type="dm", user_id="0", user_name="")
-                    synth = type("S", (), {"source": src, "message_id": locator.message_id, "raw_message": None})()
-                    # try to resolve via adapter's logic that may lookup channel
-                    # but for now, keep pending if no msg_ref
-                    pass
-                except Exception:
-                    pass
                 new_pending.append(rec)
                 continue
             # Attempt removal for each emoji
@@ -769,6 +753,7 @@ class DynamicReactionMixin:
         # We will recheck after lock
         # Acquire guard
         guard = await self._rxn_acquire_guard(key)
+        assert guard.lock.locked()
         try:
             # ---- Under guard: retry pending, handle same-key replacement ----
             # Retry existing pending first
@@ -1021,6 +1006,7 @@ class DynamicReactionMixin:
                 return
 
         guard = await self._rxn_acquire_guard(key)
+        assert guard.lock.locked()
         try:
             # Re-validate after acquiring guard before cooldown/provider calls
             if token is not None:
@@ -1248,6 +1234,7 @@ class DynamicReactionMixin:
         # For legacy, keep old logic?
 
         guard = await self._rxn_acquire_guard(key)
+        assert guard.lock.locked()
         try:
             # After acquiring guard, repeat complete predicate
             if getattr(self, "_rxn_token_aware", False):
