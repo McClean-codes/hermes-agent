@@ -155,22 +155,33 @@ class _StatefulStreamRedactor:
         return False
 
     def _find_safe_len(self, sanitized: str) -> int:
-        # Exact [REDACTED] or already masked is safe to flush fully
-        if sanitized == "[REDACTED]" or "***" in sanitized:
+        if sanitized == "[REDACTED]":
             return len(sanitized)
         if not self._has_risk(sanitized):
             return len(sanitized)
-        # Risk present but not yet masked -> hold back trailing token after last whitespace
-        last_ws = -1
-        for i in range(len(sanitized) - 1, -1, -1):
+        # Token-aware holdback: any unmasked risky token must not flush.
+        n = len(sanitized)
+        tokens = []
+        i = 0
+        while i < n:
             if sanitized[i] in " \t\n\r":
-                last_ws = i
+                i += 1
+                continue
+            start = i
+            while i < n and sanitized[i] not in " \t\n\r":
+                i += 1
+            end = i
+            tokens.append((start, end))
+        earliest = -1
+        for start, end in tokens:
+            tok = sanitized[start:end]
+            if "***" in tok or tok == "[REDACTED]":
+                continue
+            if self._has_risk(tok):
+                earliest = start
                 break
-        if last_ws == -1:
-            return 0
-        trailing = sanitized[last_ws + 1 :]
-        if self._has_risk(trailing):
-            return last_ws + 1
+        if earliest != -1:
+            return earliest
         return len(sanitized)
 
     def on_delta(self, text: str) -> str | None:
@@ -207,6 +218,13 @@ class _StatefulStreamRedactor:
         # Record for consistency; flushed state is not used after finish
         self._sanitized_full = sanitized
         return sanitized
+
+    def on_segment_break(self) -> None:
+        # Tool boundary sentinel: clear state so next segment does not inherit split risk
+        # Flush is not needed; already-flushed prefix was delivered, pending tail was risky and must not carry over
+        self._raw = ""
+        self._sanitized_flushed = ""
+        self._sanitized_full = ""
 
     def pending_sanitized_tail(self) -> str:
         # Sanitized full that hasn't been flushed yet (for debugging)
@@ -1731,6 +1749,17 @@ class TurnRunner:
             def stream_delta_cb(text: str) -> None:
                 if not ctx._run_still_current():
                     return
+                if text is None:
+                    for sink in delta_sinks:
+                        try:
+                            sink.on_delta(None)
+                        except Exception:
+                            logger.debug("sink on_delta None failed", exc_info=True)
+                    try:
+                        _stream_redactor.on_segment_break()
+                    except Exception:
+                        logger.debug("redactor segment break failed", exc_info=True)
+                    return
                 # Stateful sanitization: only forward the newly-safe sanitized prefix
                 try:
                     sanitized = _stream_redactor.on_delta(text)
@@ -1768,7 +1797,7 @@ class TurnRunner:
                 not already_streamed and ctx._status_adapter and str(text or "").strip()
             ):
                 self._send_status_text(
-                    text,
+                    sanitized_commentary,
                     ctx._status_thread_metadata,
                     "interim_assistant_callback scheduling error",
                 )
@@ -2678,6 +2707,12 @@ class TurnRunner:
         except Exception:
             logger.debug("stream final sanitize failed", exc_info=True)
             _sanitized_final = "[REDACTED]"
+        # Canonicalize result for downstream delivered_final_matches so hostile sanitized delivery matches
+        try:
+            if isinstance(result, dict) and isinstance(_sanitized_final, str):
+                result["final_response"] = _sanitized_final
+        except Exception:
+            logger.debug("canonicalize final_response failed", exc_info=True)
         # Duck-type safe: test doubles / older consumers may expose a zero-arg finish().
         try:
             stream_consumer.finish(_sanitized_final)

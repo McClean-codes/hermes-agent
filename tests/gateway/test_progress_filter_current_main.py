@@ -2875,7 +2875,9 @@ class TestUrlOpaqueCredentialViaProductionSeams:
             assert opaque not in payload
             # Strict partial-prefix: dangerous prefix must be absent (no mask-plus-leak allowance)
             assert opaque[:8] not in payload, f"partial long opaque leaked: {payload!r}"
-            assert "***" in payload or "[REDACTED]" in payload, f"expected mask in {payload!r}"
+            assert "***" in payload or "[REDACTED]" in payload, (
+                f"expected mask in {payload!r}"
+            )
             # Also test native long preview
             ctx2 = _make_ctx(
                 progress_mode="off",
@@ -2894,8 +2896,12 @@ class TestUrlOpaqueCredentialViaProductionSeams:
             assert raw_url not in payload2
             assert opaque not in payload2
             # Strict: no dangerous prefix leak even when truncated, and mask must be present
-            assert opaque[:8] not in payload2, f"partial prefix leaked in native preview: {payload2!r}"
-            assert "***" in payload2 or "[REDACTED]" in payload2, f"expected mask in native {payload2!r}"
+            assert opaque[:8] not in payload2, (
+                f"partial prefix leaked in native preview: {payload2!r}"
+            )
+            assert "***" in payload2 or "[REDACTED]" in payload2, (
+                f"expected mask in native {payload2!r}"
+            )
 
     @pytest.mark.asyncio
     async def test_thinking_and_log_queue_redact_raw_opaque_before_persistence_and_send(
@@ -2955,7 +2961,9 @@ class TestUrlOpaqueCredentialViaProductionSeams:
             assert raw_url not in payload, f"raw URL leaked in thinking: {payload!r}"
             assert long_raw not in payload, f"long raw leaked in thinking: {payload!r}"
             assert opaque not in payload, f"opaque leaked in thinking: {payload!r}"
-            assert long_opaque not in payload, f"long opaque leaked in thinking: {payload!r}"
+            assert long_opaque not in payload, (
+                f"long opaque leaked in thinking: {payload!r}"
+            )
             assert "***" in payload or "[REDACTED]" in payload
         # Now test that even injected raw thinking queue content is redacted at final egress via production drain
         ledger: list[str] = []
@@ -4000,7 +4008,6 @@ class TestNativeEnabledErrorDelivery:
                 os.environ["SLACK_HOME_CHANNEL"] = _orig_home
 
 
-
 class TestNativePublicRawLongUserinfoRegression:
     """SEC-PF-006 regression: public native queue -> send_progress_messages -> enabled native ledger must not leak long opaque userinfo prefix.
 
@@ -4033,7 +4040,15 @@ class TestNativePublicRawLongUserinfoRegression:
             def __init__(self):
                 self.name = "native-regress"
 
-            async def send_native_task_card_progress(self, chat_id, tasks, title, reply_to=None, metadata=None, fallback_text=None):
+            async def send_native_task_card_progress(
+                self,
+                chat_id,
+                tasks,
+                title,
+                reply_to=None,
+                metadata=None,
+                fallback_text=None,
+            ):
                 ledger_tasks.append(list(tasks))
                 if fallback_text:
                     fallback_ledger.append(fallback_text)
@@ -4049,13 +4064,17 @@ class TestNativePublicRawLongUserinfoRegression:
                 m.message_id = "mid-fb"
                 return m
 
-            async def edit_message(self, chat_id, message_id, content, metadata=None, finalize=False):
+            async def edit_message(
+                self, chat_id, message_id, content, metadata=None, finalize=False
+            ):
                 fallback_ledger.append(content)
                 m = MagicMock()
                 m.success = True
                 return m
 
-            async def stop_native_task_card_progress(self, chat_id, reply_to=None, metadata=None):
+            async def stop_native_task_card_progress(
+                self, chat_id, reply_to=None, metadata=None
+            ):
                 return None
 
         adapter = _NativeAdapter()
@@ -4116,11 +4135,23 @@ class TestNativePublicRawLongUserinfoRegression:
         for tasks in ledger_tasks:
             for t in tasks:
                 title = t.get("title", "")
-                assert raw_url not in title, f"raw bare URL leaked in native title: {title!r}"
-                assert self.RAW_URL_USERPASS not in title, f"raw userpass URL leaked: {title!r}"
-                assert opaque not in title, f"opaque credential leaked in title: {title!r}"
-                assert prefix not in title, f"dangerous prefix leaked in title: {title!r}"
-                assert "***" in title or "[REDACTED]" in title or "redacted" in title.lower(), f"expected mask in {title!r}"
+                assert raw_url not in title, (
+                    f"raw bare URL leaked in native title: {title!r}"
+                )
+                assert self.RAW_URL_USERPASS not in title, (
+                    f"raw userpass URL leaked: {title!r}"
+                )
+                assert opaque not in title, (
+                    f"opaque credential leaked in title: {title!r}"
+                )
+                assert prefix not in title, (
+                    f"dangerous prefix leaked in title: {title!r}"
+                )
+                assert (
+                    "***" in title
+                    or "[REDACTED]" in title
+                    or "redacted" in title.lower()
+                ), f"expected mask in {title!r}"
         for fb in fallback_ledger:
             assert raw_url not in fb, f"raw bare URL in fallback: {fb!r}"
             assert self.RAW_URL_USERPASS not in fb, f"raw userpass in fallback: {fb!r}"
@@ -4155,7 +4186,10 @@ class TestNativePublicRawLongUserinfoRegression:
 
         from unittest.mock import patch
 
-        with patch("agent.redact.redact_sensitive_text", side_effect=RuntimeError("primary boom")):
+        with patch(
+            "agent.redact.redact_sensitive_text",
+            side_effect=RuntimeError("primary boom"),
+        ):
             task2 = asyncio.create_task(runner2.send_progress_messages())
             await asyncio.sleep(0.6)
             task2.cancel()
@@ -4201,8 +4235,14 @@ class TestNativePublicRawLongUserinfoRegression:
         runner3._runner._adapter_for_source = lambda s: adapter  # type: ignore[attr-defined]
         ctx3.progress_queue.put(raw_dict)
         with (
-            patch("agent.redact.redact_sensitive_text", side_effect=RuntimeError("primary boom")),
-            patch("gateway.run._redact_gateway_user_facing_secrets", side_effect=RuntimeError("gateway boom")),
+            patch(
+                "agent.redact.redact_sensitive_text",
+                side_effect=RuntimeError("primary boom"),
+            ),
+            patch(
+                "gateway.run._redact_gateway_user_facing_secrets",
+                side_effect=RuntimeError("gateway boom"),
+            ),
         ):
             task3 = asyncio.create_task(runner3.send_progress_messages())
             await asyncio.sleep(0.6)
@@ -4262,7 +4302,9 @@ class TestNativePublicRawLongUserinfoRegression:
             await task_ns
         except asyncio.CancelledError:
             pass
-        found = any("ex.com" in t.get("title","") for tasks in ledger_tasks for t in tasks) or any("ex.com" in fb for fb in fallback_ledger)
+        found = any(
+            "ex.com" in t.get("title", "") for tasks in ledger_tasks for t in tasks
+        ) or any("ex.com" in fb for fb in fallback_ledger)
         assert found, "non-secret URL should survive native public drain"
 
 
@@ -4298,7 +4340,13 @@ class TestNativeEnabledFinalDelivery:
             registry.deregister(tool_name)
         except Exception:
             pass
-        registry.register(name=tool_name, toolset="test-native-final", schema=schema, handler=_handler, check_fn=lambda: True)
+        registry.register(
+            name=tool_name,
+            toolset="test-native-final",
+            schema=schema,
+            handler=_handler,
+            check_fn=lambda: True,
+        )
         try:
             final_text = "Hello final native reply"
             sanitized = _sanitize_gateway_final_response(Platform.SLACK, final_text)
@@ -4310,7 +4358,9 @@ class TestNativeEnabledFinalDelivery:
 
             class _CaptureSlackAdapter(BasePlatformAdapter):
                 def __init__(self):
-                    super().__init__(PlatformConfig(enabled=True, token="xoxb-fake"), Platform.SLACK)
+                    super().__init__(
+                        PlatformConfig(enabled=True, token="xoxb-fake"), Platform.SLACK
+                    )
 
                 async def connect(self, *, is_reconnect: bool = False) -> bool:
                     return True
@@ -4331,7 +4381,15 @@ class TestNativeEnabledFinalDelivery:
                 def native_task_cards_enabled(self) -> bool:
                     return True
 
-                async def send_native_task_card_progress(self, chat_id, tasks, title, reply_to=None, metadata=None, fallback_text=None):
+                async def send_native_task_card_progress(
+                    self,
+                    chat_id,
+                    tasks,
+                    title,
+                    reply_to=None,
+                    metadata=None,
+                    fallback_text=None,
+                ):
                     native_ledger.append(list(tasks))
                     if fallback_text:
                         fallback_ledger.append(fallback_text)
@@ -4340,14 +4398,22 @@ class TestNativeEnabledFinalDelivery:
                     m.message_id = "native-1"
                     return m
 
-                async def stop_native_task_card_progress(self, chat_id, reply_to=None, metadata=None):
+                async def stop_native_task_card_progress(
+                    self, chat_id, reply_to=None, metadata=None
+                ):
                     return None
 
             fake_adapter = _CaptureSlackAdapter()
             fake_adapter.send = AsyncMock(side_effect=fake_adapter.send)
-            fake_adapter.send_native_task_card_progress = AsyncMock(side_effect=fake_adapter.send_native_task_card_progress)  # type: ignore[attr-defined]
+            fake_adapter.send_native_task_card_progress = AsyncMock(
+                side_effect=fake_adapter.send_native_task_card_progress
+            )  # type: ignore[attr-defined]
 
-            config = GatewayConfig(platforms={Platform.SLACK: PlatformConfig(enabled=True, token="xoxb-fake")})
+            config = GatewayConfig(
+                platforms={
+                    Platform.SLACK: PlatformConfig(enabled=True, token="xoxb-fake")
+                }
+            )
             gw = GatewayRunner(config=config)
             gw.adapters = {Platform.SLACK: fake_adapter}
             gw._is_user_authorized = lambda _source: True
@@ -4378,7 +4444,12 @@ class TestNativeEnabledFinalDelivery:
             gw.session_store._record_gateway_session_peer = MagicMock()
             gw._async_session_store = gw.session_store  # type: ignore[attr-defined]
             gw._adapter_for_source = lambda source: fake_adapter
-            gw._resolve_session_agent_runtime = MagicMock(return_value=("test/model", {"api_key": "fake", "base_url": "https://openrouter.ai/api/v1"}))
+            gw._resolve_session_agent_runtime = MagicMock(
+                return_value=(
+                    "test/model",
+                    {"api_key": "fake", "base_url": "https://openrouter.ai/api/v1"},
+                )
+            )
             gw._resolve_session_reasoning_config = MagicMock(return_value=None)
             gw._resolve_session_service_tier = MagicMock(return_value=None)
             gw._provider_routing = {}
@@ -4387,27 +4458,47 @@ class TestNativeEnabledFinalDelivery:
             gw._is_session_run_current = lambda _k, _g: True
             # Force display to allow our test tool for native visibility (global all + allowlist)
             _orig_disp = gw._run_agent_display_settings
+
             def _patched_disp(src):
                 d = _orig_disp(src)
                 # Ensure native visible: global all and tool allowlisted, needs_progress_queue true
                 d.progress_mode = "all"
                 d.tool_progress_enabled = True
                 try:
-                    f = dict(d.tool_progress_filter) if isinstance(d.tool_progress_filter, dict) else {}
+                    f = (
+                        dict(d.tool_progress_filter)
+                        if isinstance(d.tool_progress_filter, dict)
+                        else {}
+                    )
                 except Exception:
                     f = {}
                 f[tool_name] = "all"
                 d.tool_progress_filter = f
                 d.needs_progress_queue = True
                 return d
+
             gw._run_agent_display_settings = _patched_disp
-            source_check = SessionSource(platform=Platform.SLACK, chat_id="C123", chat_type="channel", user_id="U123", thread_id="T123")
+            source_check = SessionSource(
+                platform=Platform.SLACK,
+                chat_id="C123",
+                chat_type="channel",
+                user_id="U123",
+                thread_id="T123",
+            )
             disp = gw._run_agent_display_settings(source_check)
-            assert disp._native_slack_task_cards is True, "native must be enabled via adapter"
+            assert disp._native_slack_task_cards is True, (
+                "native must be enabled via adapter"
+            )
             assert disp.needs_progress_queue is True
             event = MessageEvent(
                 text="hi",
-                source=SessionSource(platform=Platform.SLACK, chat_id="C123", chat_type="channel", user_id="U123", thread_id="T123"),
+                source=SessionSource(
+                    platform=Platform.SLACK,
+                    chat_id="C123",
+                    chat_type="channel",
+                    user_id="U123",
+                    thread_id="T123",
+                ),
                 message_id="msg-final-native-1",
             )
             fake_adapter.set_message_handler(gw._handle_message)
@@ -4419,38 +4510,83 @@ class TestNativeEnabledFinalDelivery:
             def _direct_side_effect(agent, api_kwargs):
                 if call_counter["n"] == 0:
                     call_counter["n"] += 1
-                    tc = SimpleNamespace(id="call_native_1", type="function", function=SimpleNamespace(name=tool_name, arguments=json.dumps({"url": RAW_URL})))
+                    tc = SimpleNamespace(
+                        id="call_native_1",
+                        type="function",
+                        function=SimpleNamespace(
+                            name=tool_name, arguments=json.dumps({"url": RAW_URL})
+                        ),
+                    )
                     msg = SimpleNamespace(content=None, tool_calls=[tc])
                     choice = SimpleNamespace(message=msg, finish_reason="tool_calls")
-                    return SimpleNamespace(choices=[choice], model="test/model", usage=None)
+                    return SimpleNamespace(
+                        choices=[choice], model="test/model", usage=None
+                    )
                 else:
                     msg = SimpleNamespace(content=final_text, tool_calls=None)
                     choice = SimpleNamespace(message=msg, finish_reason="stop")
-                    return SimpleNamespace(choices=[choice], model="test/model", usage=None)
+                    return SimpleNamespace(
+                        choices=[choice], model="test/model", usage=None
+                    )
 
-            tool_def = {"type": "function", "function": {"name": tool_name, "description": "test native final", "parameters": schema}}
+            tool_def = {
+                "type": "function",
+                "function": {
+                    "name": tool_name,
+                    "description": "test native final",
+                    "parameters": schema,
+                },
+            }
             try:
                 with (
                     patch("model_tools.get_tool_definitions", return_value=[tool_def]),
                     patch("model_tools.check_toolset_requirements", return_value={}),
-                    patch("agent.chat_completion_helpers.direct_api_call", side_effect=_direct_side_effect),
-                    patch("agent.chat_completion_helpers.interruptible_api_call", side_effect=_direct_side_effect),
-                    patch("agent.chat_completion_helpers.interruptible_streaming_api_call", side_effect=lambda agent, api_kwargs, **kw: _direct_side_effect(agent, api_kwargs)),
-                    patch("agent.chat_completion_helpers.should_use_direct_api_call", return_value=True),
+                    patch(
+                        "agent.chat_completion_helpers.direct_api_call",
+                        side_effect=_direct_side_effect,
+                    ),
+                    patch(
+                        "agent.chat_completion_helpers.interruptible_api_call",
+                        side_effect=_direct_side_effect,
+                    ),
+                    patch(
+                        "agent.chat_completion_helpers.interruptible_streaming_api_call",
+                        side_effect=lambda agent, api_kwargs, **kw: _direct_side_effect(
+                            agent, api_kwargs
+                        ),
+                    ),
+                    patch(
+                        "agent.chat_completion_helpers.should_use_direct_api_call",
+                        return_value=True,
+                    ),
                     patch("agent.process_bootstrap.OpenAI"),
                 ):
-                    await fake_adapter._process_message_background(event, build_session_key(event.source))
+                    await fake_adapter._process_message_background(
+                        event, build_session_key(event.source)
+                    )
                     assert ledger == [sanitized], f"final ledger was {ledger}"
-                    assert fake_adapter.send.call_count == 1, f"send called {fake_adapter.send.call_count} times, expected 1"
-                    assert len(native_ledger) >= 1, f"native ledger empty, expected non-empty when tool started: {native_ledger}"
+                    assert fake_adapter.send.call_count == 1, (
+                        f"send called {fake_adapter.send.call_count} times, expected 1"
+                    )
+                    assert len(native_ledger) >= 1, (
+                        f"native ledger empty, expected non-empty when tool started: {native_ledger}"
+                    )
                     assert fake_adapter.send_native_task_card_progress.call_count >= 1  # type: ignore[attr-defined]
                     for tasks in native_ledger:
                         for t in tasks:
                             title = t.get("title", "")
-                            assert RAW_URL not in title, f"raw bare URL leaked in native title: {title!r}"
-                            assert RAW_URL_USERPASS not in title, f"raw userpass URL leaked: {title!r}"
-                            assert LONG_OPAQUE not in title, f"opaque leaked in native title: {title!r}"
-                            assert DANGEROUS_PREFIX not in title, f"dangerous prefix leaked in native title: {title!r}"
+                            assert RAW_URL not in title, (
+                                f"raw bare URL leaked in native title: {title!r}"
+                            )
+                            assert RAW_URL_USERPASS not in title, (
+                                f"raw userpass URL leaked: {title!r}"
+                            )
+                            assert LONG_OPAQUE not in title, (
+                                f"opaque leaked in native title: {title!r}"
+                            )
+                            assert DANGEROUS_PREFIX not in title, (
+                                f"dangerous prefix leaked in native title: {title!r}"
+                            )
                     for fb in fallback_ledger:
                         assert RAW_URL not in fb, f"raw URL in native fallback: {fb!r}"
                         assert RAW_URL_USERPASS not in fb
@@ -4467,10 +4603,15 @@ class TestNativeEnabledFinalDelivery:
                     prev_ledger_len = len(ledger)
                     prev_native_len = len(native_ledger)
                     await asyncio.sleep(0.4)
-                    assert fake_adapter.send.call_count == prev_send, "tool.completed produced duplicate final send"
+                    assert fake_adapter.send.call_count == prev_send, (
+                        "tool.completed produced duplicate final send"
+                    )
                     assert len(ledger) == prev_ledger_len
                     assert len(native_ledger) == prev_native_len
-                    assert fake_adapter.send_native_task_card_progress.call_count == prev_native  # type: ignore[attr-defined]
+                    assert (
+                        fake_adapter.send_native_task_card_progress.call_count
+                        == prev_native
+                    )  # type: ignore[attr-defined]
             finally:
                 if _orig_home is None:
                     os.environ.pop("SLACK_HOME_CHANNEL", None)
@@ -4481,7 +4622,6 @@ class TestNativeEnabledFinalDelivery:
                 registry.deregister(tool_name)
             except Exception:
                 pass
-
 
 
 class TestProductionSeamFalsification:
@@ -4891,9 +5031,11 @@ class TestProductionSeamFalsification:
             for t in tasks
         )
 
+
 # ---------------------------------------------------------------------------
 # SEC-PF-FINAL-URL-EGRESS and SEC-PF-SUBAGENT-NOTICE-EGRESS — consolidated strict redaction
 # ---------------------------------------------------------------------------
+
 
 class TestFinalSlackHostileStrictEgress:
     """SEC-PF-FINAL-URL-EGRESS: real GatewayRunner final Slack delivery must strictly redact opaque userinfo and query credentials."""
@@ -4908,7 +5050,9 @@ class TestFinalSlackHostileStrictEgress:
     RAW_URL_BARE = f"https://{LONG_OPAQUE}@ex.com/p"
     RAW_URL_USERPASS = f"https://alice:{LONG_OPAQUE}@ex.com/p"
     RAW_URL_QUERY = f"https://ex.com/cb?token={OPAQUE_TOKEN}&api_key={OPAQUE_API_KEY}&signature={OPAQUE_SIG}"
-    RAW_URL_COMBINED = f"https://{LONG_OPAQUE}@ex.com/p?token={OPAQUE_TOKEN}&api_key={OPAQUE_API_KEY}"
+    RAW_URL_COMBINED = (
+        f"https://{LONG_OPAQUE}@ex.com/p?token={OPAQUE_TOKEN}&api_key={OPAQUE_API_KEY}"
+    )
 
     @pytest.mark.asyncio
     async def test_final_hostile_via_production_gateway_slack_no_leakage(self):
@@ -4929,7 +5073,9 @@ class TestFinalSlackHostileStrictEgress:
 
         class _CaptureSlackAdapter(BasePlatformAdapter):
             def __init__(self):
-                super().__init__(PlatformConfig(enabled=True, token="xoxb-fake"), Platform.SLACK)
+                super().__init__(
+                    PlatformConfig(enabled=True, token="xoxb-fake"), Platform.SLACK
+                )
 
             async def connect(self, *, is_reconnect: bool = False) -> bool:
                 return True
@@ -4950,7 +5096,15 @@ class TestFinalSlackHostileStrictEgress:
             def native_task_cards_enabled(self) -> bool:
                 return True
 
-            async def send_native_task_card_progress(self, chat_id, tasks, title, reply_to=None, metadata=None, fallback_text=None):
+            async def send_native_task_card_progress(
+                self,
+                chat_id,
+                tasks,
+                title,
+                reply_to=None,
+                metadata=None,
+                fallback_text=None,
+            ):
                 native_ledger.append(list(tasks))
                 if fallback_text:
                     fallback_ledger.append(fallback_text)
@@ -4959,14 +5113,20 @@ class TestFinalSlackHostileStrictEgress:
                 m.message_id = "native-1"
                 return m
 
-            async def stop_native_task_card_progress(self, chat_id, reply_to=None, metadata=None):
+            async def stop_native_task_card_progress(
+                self, chat_id, reply_to=None, metadata=None
+            ):
                 return None
 
         fake_adapter = _CaptureSlackAdapter()
         fake_adapter.send = AsyncMock(side_effect=fake_adapter.send)
-        fake_adapter.send_native_task_card_progress = AsyncMock(side_effect=fake_adapter.send_native_task_card_progress)  # type: ignore[attr-defined]
+        fake_adapter.send_native_task_card_progress = AsyncMock(
+            side_effect=fake_adapter.send_native_task_card_progress
+        )  # type: ignore[attr-defined]
 
-        config = GatewayConfig(platforms={Platform.SLACK: PlatformConfig(enabled=True, token="xoxb-fake")})
+        config = GatewayConfig(
+            platforms={Platform.SLACK: PlatformConfig(enabled=True, token="xoxb-fake")}
+        )
         gw = GatewayRunner(config=config)
         gw.adapters = {Platform.SLACK: fake_adapter}
         gw._is_user_authorized = lambda _source: True
@@ -4997,7 +5157,12 @@ class TestFinalSlackHostileStrictEgress:
         gw.session_store._record_gateway_session_peer = MagicMock()
         gw._async_session_store = gw.session_store  # type: ignore[attr-defined]
         gw._adapter_for_source = lambda source: fake_adapter
-        gw._resolve_session_agent_runtime = MagicMock(return_value=("test/model", {"api_key": "fake", "base_url": "https://openrouter.ai/api/v1"}))
+        gw._resolve_session_agent_runtime = MagicMock(
+            return_value=(
+                "test/model",
+                {"api_key": "fake", "base_url": "https://openrouter.ai/api/v1"},
+            )
+        )
         gw._resolve_session_reasoning_config = MagicMock(return_value=None)
         gw._resolve_session_service_tier = MagicMock(return_value=None)
         gw._provider_routing = {}
@@ -5012,7 +5177,11 @@ class TestFinalSlackHostileStrictEgress:
             d.progress_mode = "all"
             d.tool_progress_enabled = True
             try:
-                f = dict(d.tool_progress_filter) if isinstance(d.tool_progress_filter, dict) else {}
+                f = (
+                    dict(d.tool_progress_filter)
+                    if isinstance(d.tool_progress_filter, dict)
+                    else {}
+                )
             except Exception:
                 f = {}
             f["_test_hostile_final_tool"] = "all"
@@ -5024,7 +5193,13 @@ class TestFinalSlackHostileStrictEgress:
 
         event = MessageEvent(
             text="hi",
-            source=SessionSource(platform=Platform.SLACK, chat_id="C123", chat_type="channel", user_id="U123", thread_id="T123"),
+            source=SessionSource(
+                platform=Platform.SLACK,
+                chat_id="C123",
+                chat_type="channel",
+                user_id="U123",
+                thread_id="T123",
+            ),
             message_id="msg-final-hostile-1",
         )
         fake_adapter.set_message_handler(gw._handle_message)
@@ -5041,33 +5216,73 @@ class TestFinalSlackHostileStrictEgress:
             with (
                 patch("model_tools.get_tool_definitions", return_value=[]),
                 patch("model_tools.check_toolset_requirements", return_value={}),
-                patch("agent.chat_completion_helpers.direct_api_call", side_effect=_direct_side_effect),
-                patch("agent.chat_completion_helpers.interruptible_api_call", side_effect=_direct_side_effect),
-                patch("agent.chat_completion_helpers.interruptible_streaming_api_call", side_effect=lambda agent, api_kwargs, **kw: _direct_side_effect(agent, api_kwargs)),
-                patch("agent.chat_completion_helpers.should_use_direct_api_call", return_value=True),
+                patch(
+                    "agent.chat_completion_helpers.direct_api_call",
+                    side_effect=_direct_side_effect,
+                ),
+                patch(
+                    "agent.chat_completion_helpers.interruptible_api_call",
+                    side_effect=_direct_side_effect,
+                ),
+                patch(
+                    "agent.chat_completion_helpers.interruptible_streaming_api_call",
+                    side_effect=lambda agent, api_kwargs, **kw: _direct_side_effect(
+                        agent, api_kwargs
+                    ),
+                ),
+                patch(
+                    "agent.chat_completion_helpers.should_use_direct_api_call",
+                    return_value=True,
+                ),
                 patch("agent.process_bootstrap.OpenAI"),
             ):
-                await fake_adapter._process_message_background(event, build_session_key(event.source))
+                await fake_adapter._process_message_background(
+                    event, build_session_key(event.source)
+                )
                 # Every final adapter ledger entry must be free of raw hostile values
-                assert len(ledger) >= 1, f"expected at least one final send, got {ledger}"
+                assert len(ledger) >= 1, (
+                    f"expected at least one final send, got {ledger}"
+                )
                 for entry in ledger:
-                    assert self.RAW_URL_BARE not in entry, f"raw bare URL leaked in final: {entry!r}"
-                    assert self.RAW_URL_USERPASS not in entry, f"raw userpass URL leaked in final: {entry!r}"
-                    assert self.RAW_URL_QUERY not in entry, f"raw query URL leaked in final: {entry!r}"
-                    assert self.RAW_URL_COMBINED not in entry, f"raw combined URL leaked in final: {entry!r}"
-                    assert self.LONG_OPAQUE not in entry, f"opaque long userinfo leaked in final: {entry!r}"
-                    assert self.OPAQUE_TOKEN not in entry, f"opaque token leaked in final: {entry!r}"
-                    assert self.OPAQUE_API_KEY not in entry, f"opaque api_key leaked in final: {entry!r}"
-                    assert self.OPAQUE_SIG not in entry, f"opaque signature leaked in final: {entry!r}"
-                    assert self.DANGEROUS_PREFIX not in entry, f"dangerous prefix leaked in final: {entry!r}"
+                    assert self.RAW_URL_BARE not in entry, (
+                        f"raw bare URL leaked in final: {entry!r}"
+                    )
+                    assert self.RAW_URL_USERPASS not in entry, (
+                        f"raw userpass URL leaked in final: {entry!r}"
+                    )
+                    assert self.RAW_URL_QUERY not in entry, (
+                        f"raw query URL leaked in final: {entry!r}"
+                    )
+                    assert self.RAW_URL_COMBINED not in entry, (
+                        f"raw combined URL leaked in final: {entry!r}"
+                    )
+                    assert self.LONG_OPAQUE not in entry, (
+                        f"opaque long userinfo leaked in final: {entry!r}"
+                    )
+                    assert self.OPAQUE_TOKEN not in entry, (
+                        f"opaque token leaked in final: {entry!r}"
+                    )
+                    assert self.OPAQUE_API_KEY not in entry, (
+                        f"opaque api_key leaked in final: {entry!r}"
+                    )
+                    assert self.OPAQUE_SIG not in entry, (
+                        f"opaque signature leaked in final: {entry!r}"
+                    )
+                    assert self.DANGEROUS_PREFIX not in entry, (
+                        f"dangerous prefix leaked in final: {entry!r}"
+                    )
                 # Ensure at least one redaction marker is present (strict egress applied)
                 # For URL-bearing hostile, strict redactor masks credentials; check not empty and not equal to raw
                 for entry in ledger:
-                    assert entry != hostile_final, "final ledger equals raw hostile input — redaction did not apply"
+                    assert entry != hostile_final, (
+                        "final ledger equals raw hostile input — redaction did not apply"
+                    )
                 # No duplicate final after tool.completed — sleep and check counts stable
                 prev = fake_adapter.send.call_count
                 await asyncio.sleep(0.35)
-                assert fake_adapter.send.call_count == prev, "unexpected duplicate final send after tool.completed"
+                assert fake_adapter.send.call_count == prev, (
+                    "unexpected duplicate final send after tool.completed"
+                )
         finally:
             if _orig_home is None:
                 os.environ.pop("SLACK_HOME_CHANNEL", None)
@@ -5091,7 +5306,9 @@ class TestFinalSlackHostileStrictEgress:
 
         class _CaptureSlackAdapter(BasePlatformAdapter):
             def __init__(self):
-                super().__init__(PlatformConfig(enabled=True, token="xoxb-fake"), Platform.SLACK)
+                super().__init__(
+                    PlatformConfig(enabled=True, token="xoxb-fake"), Platform.SLACK
+                )
 
             async def connect(self, *, is_reconnect: bool = False) -> bool:
                 return True
@@ -5111,7 +5328,9 @@ class TestFinalSlackHostileStrictEgress:
 
         fake_adapter = _CaptureSlackAdapter()
         fake_adapter.send = AsyncMock(side_effect=fake_adapter.send)
-        config = GatewayConfig(platforms={Platform.SLACK: PlatformConfig(enabled=True, token="xoxb-fake")})
+        config = GatewayConfig(
+            platforms={Platform.SLACK: PlatformConfig(enabled=True, token="xoxb-fake")}
+        )
         gw = GatewayRunner(config=config)
         gw.adapters = {Platform.SLACK: fake_adapter}
         gw._is_user_authorized = lambda _source: True
@@ -5142,7 +5361,12 @@ class TestFinalSlackHostileStrictEgress:
         gw.session_store._record_gateway_session_peer = MagicMock()
         gw._async_session_store = gw.session_store  # type: ignore[attr-defined]
         gw._adapter_for_source = lambda source: fake_adapter
-        gw._resolve_session_agent_runtime = MagicMock(return_value=("test/model", {"api_key": "fake", "base_url": "https://openrouter.ai/api/v1"}))
+        gw._resolve_session_agent_runtime = MagicMock(
+            return_value=(
+                "test/model",
+                {"api_key": "fake", "base_url": "https://openrouter.ai/api/v1"},
+            )
+        )
         gw._resolve_session_reasoning_config = MagicMock(return_value=None)
         gw._resolve_session_service_tier = MagicMock(return_value=None)
         gw._provider_routing = {}
@@ -5152,13 +5376,20 @@ class TestFinalSlackHostileStrictEgress:
 
         event = MessageEvent(
             text="hi",
-            source=SessionSource(platform=Platform.SLACK, chat_id="C123", chat_type="channel", user_id="U123", thread_id="T123"),
+            source=SessionSource(
+                platform=Platform.SLACK,
+                chat_id="C123",
+                chat_type="channel",
+                user_id="U123",
+                thread_id="T123",
+            ),
             message_id="msg-final-fail-1",
         )
         fake_adapter.set_message_handler(gw._handle_message)
         fake_adapter._keep_typing = lambda *a, **kw: asyncio.Event().wait()
         _orig_home_fail = os.environ.get("SLACK_HOME_CHANNEL")
         os.environ["SLACK_HOME_CHANNEL"] = "C123"
+
         def _direct_side_effect(agent, api_kwargs):
             msg = SimpleNamespace(content=hostile_final, tool_calls=None)
             choice = SimpleNamespace(message=msg, finish_reason="stop")
@@ -5166,24 +5397,50 @@ class TestFinalSlackHostileStrictEgress:
 
         try:
             with (
-                patch("agent.redact.redact_sensitive_text", side_effect=RuntimeError("primary boom")),
-                patch("gateway.run._redact_gateway_user_facing_secrets", side_effect=RuntimeError("gateway boom")),
+                patch(
+                    "agent.redact.redact_sensitive_text",
+                    side_effect=RuntimeError("primary boom"),
+                ),
+                patch(
+                    "gateway.run._redact_gateway_user_facing_secrets",
+                    side_effect=RuntimeError("gateway boom"),
+                ),
                 patch("model_tools.get_tool_definitions", return_value=[]),
                 patch("model_tools.check_toolset_requirements", return_value={}),
-                patch("agent.chat_completion_helpers.direct_api_call", side_effect=_direct_side_effect),
-                patch("agent.chat_completion_helpers.interruptible_api_call", side_effect=_direct_side_effect),
-                patch("agent.chat_completion_helpers.interruptible_streaming_api_call", side_effect=lambda agent, api_kwargs, **kw: _direct_side_effect(agent, api_kwargs)),
-                patch("agent.chat_completion_helpers.should_use_direct_api_call", return_value=True),
+                patch(
+                    "agent.chat_completion_helpers.direct_api_call",
+                    side_effect=_direct_side_effect,
+                ),
+                patch(
+                    "agent.chat_completion_helpers.interruptible_api_call",
+                    side_effect=_direct_side_effect,
+                ),
+                patch(
+                    "agent.chat_completion_helpers.interruptible_streaming_api_call",
+                    side_effect=lambda agent, api_kwargs, **kw: _direct_side_effect(
+                        agent, api_kwargs
+                    ),
+                ),
+                patch(
+                    "agent.chat_completion_helpers.should_use_direct_api_call",
+                    return_value=True,
+                ),
                 patch("agent.process_bootstrap.OpenAI"),
             ):
-                await fake_adapter._process_message_background(event, build_session_key(event.source))
+                await fake_adapter._process_message_background(
+                    event, build_session_key(event.source)
+                )
                 assert len(ledger) >= 1
                 for entry in ledger:
-                    assert hostile_final not in entry, f"raw hostile leaked despite both-layer failure: {entry!r}"
+                    assert hostile_final not in entry, (
+                        f"raw hostile leaked despite both-layer failure: {entry!r}"
+                    )
                     assert self.LONG_OPAQUE not in entry
                     assert self.OPAQUE_TOKEN not in entry
                     assert self.DANGEROUS_PREFIX not in entry
-                    assert entry == "[REDACTED]", f"expected exact [REDACTED] on both-layer failure, got {entry!r}"
+                    assert entry == "[REDACTED]", (
+                        f"expected exact [REDACTED] on both-layer failure, got {entry!r}"
+                    )
         finally:
             if _orig_home_fail is None:
                 os.environ.pop("SLACK_HOME_CHANNEL", None)
@@ -5201,13 +5458,17 @@ class TestFinalSlackHostileStrictEgress:
         import asyncio, os
         from types import SimpleNamespace
 
-        benign_final = "See https://example.com/page?foo=bar&baz=qux for docs — no secrets here."
+        benign_final = (
+            "See https://example.com/page?foo=bar&baz=qux for docs — no secrets here."
+        )
 
         ledger: list[str] = []
 
         class _CaptureSlackAdapter(BasePlatformAdapter):
             def __init__(self):
-                super().__init__(PlatformConfig(enabled=True, token="xoxb-fake"), Platform.SLACK)
+                super().__init__(
+                    PlatformConfig(enabled=True, token="xoxb-fake"), Platform.SLACK
+                )
 
             async def connect(self, *, is_reconnect: bool = False) -> bool:
                 return True
@@ -5227,7 +5488,9 @@ class TestFinalSlackHostileStrictEgress:
 
         fake_adapter = _CaptureSlackAdapter()
         fake_adapter.send = AsyncMock(side_effect=fake_adapter.send)
-        config = GatewayConfig(platforms={Platform.SLACK: PlatformConfig(enabled=True, token="xoxb-fake")})
+        config = GatewayConfig(
+            platforms={Platform.SLACK: PlatformConfig(enabled=True, token="xoxb-fake")}
+        )
         gw = GatewayRunner(config=config)
         gw.adapters = {Platform.SLACK: fake_adapter}
         gw._is_user_authorized = lambda _source: True
@@ -5258,7 +5521,12 @@ class TestFinalSlackHostileStrictEgress:
         gw.session_store._record_gateway_session_peer = MagicMock()
         gw._async_session_store = gw.session_store  # type: ignore[attr-defined]
         gw._adapter_for_source = lambda source: fake_adapter
-        gw._resolve_session_agent_runtime = MagicMock(return_value=("test/model", {"api_key": "fake", "base_url": "https://openrouter.ai/api/v1"}))
+        gw._resolve_session_agent_runtime = MagicMock(
+            return_value=(
+                "test/model",
+                {"api_key": "fake", "base_url": "https://openrouter.ai/api/v1"},
+            )
+        )
         gw._resolve_session_reasoning_config = MagicMock(return_value=None)
         gw._resolve_session_service_tier = MagicMock(return_value=None)
         gw._provider_routing = {}
@@ -5268,13 +5536,20 @@ class TestFinalSlackHostileStrictEgress:
 
         event = MessageEvent(
             text="hi",
-            source=SessionSource(platform=Platform.SLACK, chat_id="C123", chat_type="channel", user_id="U123", thread_id="T123"),
+            source=SessionSource(
+                platform=Platform.SLACK,
+                chat_id="C123",
+                chat_type="channel",
+                user_id="U123",
+                thread_id="T123",
+            ),
             message_id="msg-final-ctrl-1",
         )
         fake_adapter.set_message_handler(gw._handle_message)
         fake_adapter._keep_typing = lambda *a, **kw: asyncio.Event().wait()
         _orig_home_ctrl = os.environ.get("SLACK_HOME_CHANNEL")
         os.environ["SLACK_HOME_CHANNEL"] = "C123"
+
         def _direct_side_effect(agent, api_kwargs):
             msg = SimpleNamespace(content=benign_final, tool_calls=None)
             choice = SimpleNamespace(message=msg, finish_reason="stop")
@@ -5284,16 +5559,34 @@ class TestFinalSlackHostileStrictEgress:
             with (
                 patch("model_tools.get_tool_definitions", return_value=[]),
                 patch("model_tools.check_toolset_requirements", return_value={}),
-                patch("agent.chat_completion_helpers.direct_api_call", side_effect=_direct_side_effect),
-                patch("agent.chat_completion_helpers.interruptible_api_call", side_effect=_direct_side_effect),
-                patch("agent.chat_completion_helpers.interruptible_streaming_api_call", side_effect=lambda agent, api_kwargs, **kw: _direct_side_effect(agent, api_kwargs)),
-                patch("agent.chat_completion_helpers.should_use_direct_api_call", return_value=True),
+                patch(
+                    "agent.chat_completion_helpers.direct_api_call",
+                    side_effect=_direct_side_effect,
+                ),
+                patch(
+                    "agent.chat_completion_helpers.interruptible_api_call",
+                    side_effect=_direct_side_effect,
+                ),
+                patch(
+                    "agent.chat_completion_helpers.interruptible_streaming_api_call",
+                    side_effect=lambda agent, api_kwargs, **kw: _direct_side_effect(
+                        agent, api_kwargs
+                    ),
+                ),
+                patch(
+                    "agent.chat_completion_helpers.should_use_direct_api_call",
+                    return_value=True,
+                ),
                 patch("agent.process_bootstrap.OpenAI"),
             ):
-                await fake_adapter._process_message_background(event, build_session_key(event.source))
+                await fake_adapter._process_message_background(
+                    event, build_session_key(event.source)
+                )
                 assert len(ledger) >= 1
                 for entry in ledger:
-                    assert "example.com" in entry, f"non-secret URL should survive redaction: {entry!r}"
+                    assert "example.com" in entry, (
+                        f"non-secret URL should survive redaction: {entry!r}"
+                    )
                     assert benign_final in entry or "example.com/page?foo=bar" in entry
         finally:
             if _orig_home_ctrl is None:
@@ -5323,7 +5616,9 @@ class TestSubagentNoticeHostileStrictEgress:
 
         class _LedgerSlackAdapter(BasePlatformAdapter):
             def __init__(self):
-                super().__init__(PlatformConfig(enabled=True, token="xoxb-fake"), Platform.SLACK)
+                super().__init__(
+                    PlatformConfig(enabled=True, token="xoxb-fake"), Platform.SLACK
+                )
 
             async def connect(self, *, is_reconnect: bool = False) -> bool:
                 return True
@@ -5341,7 +5636,9 @@ class TestSubagentNoticeHostileStrictEgress:
             async def get_chat_info(self, chat_id):
                 return {"id": chat_id}
 
-            async def send_private_notice(self, chat_id, user_id, content, metadata=None):
+            async def send_private_notice(
+                self, chat_id, user_id, content, metadata=None
+            ):
                 ledger.append(content)
                 m = MagicMock()
                 m.success = True
@@ -5352,7 +5649,9 @@ class TestSubagentNoticeHostileStrictEgress:
         # Keep original for later patching
         orig_send = adapter.send
         adapter.send = AsyncMock(side_effect=orig_send)
-        config = GatewayConfig(platforms={Platform.SLACK: PlatformConfig(enabled=True, token="xoxb-fake")})
+        config = GatewayConfig(
+            platforms={Platform.SLACK: PlatformConfig(enabled=True, token="xoxb-fake")}
+        )
         gw = GatewayRunner(config=config)
         gw.adapters = {Platform.SLACK: adapter}
         return gw, adapter, ledger
@@ -5394,7 +5693,12 @@ class TestSubagentNoticeHostileStrictEgress:
         orig = run_mod.safe_schedule_threadsafe
         run_mod.safe_schedule_threadsafe = _fake_schedule  # type: ignore[assignment]
         try:
-            source = SessionSource(platform=Platform.SLACK, chat_id="C123", chat_type="channel", user_id="U123")
+            source = SessionSource(
+                platform=Platform.SLACK,
+                chat_id="C123",
+                chat_type="channel",
+                user_id="U123",
+            )
             ctx = TurnContext(
                 source=source,
                 _run_still_current=lambda: True,
@@ -5418,7 +5722,9 @@ class TestSubagentNoticeHostileStrictEgress:
             )
             runner = TurnRunner(gw, ctx)  # type: ignore[arg-type]
             # Hostile summary and preview containing both userinfo and query credentials
-            hostile_summary = f"failed due to {self.RAW_URL_BARE} and {self.RAW_URL_QUERY}"
+            hostile_summary = (
+                f"failed due to {self.RAW_URL_BARE} and {self.RAW_URL_QUERY}"
+            )
             hostile_preview = f"preview {self.RAW_URL_BARE}"
             # Also test goal containing hostile
             hostile_goal = f"goal with {self.RAW_URL_BARE}"
@@ -5434,12 +5740,22 @@ class TestSubagentNoticeHostileStrictEgress:
             # After fake schedule, ledger should have exactly one notice
             assert len(ledger) == 1, f"expected one notice ledger entry, got {ledger}"
             for entry in ledger:
-                assert self.RAW_URL_BARE not in entry, f"raw bare URL leaked in notice: {entry!r}"
-                assert self.RAW_URL_QUERY not in entry, f"raw query URL leaked in notice: {entry!r}"
-                assert self.LONG_OPAQUE not in entry, f"opaque leaked in notice: {entry!r}"
+                assert self.RAW_URL_BARE not in entry, (
+                    f"raw bare URL leaked in notice: {entry!r}"
+                )
+                assert self.RAW_URL_QUERY not in entry, (
+                    f"raw query URL leaked in notice: {entry!r}"
+                )
+                assert self.LONG_OPAQUE not in entry, (
+                    f"opaque leaked in notice: {entry!r}"
+                )
                 assert self.OPAQUE_TOKEN not in entry, f"opaque token leaked: {entry!r}"
-                assert self.OPAQUE_API_KEY not in entry, f"opaque api_key leaked: {entry!r}"
-                assert self.DANGEROUS_PREFIX not in entry, f"dangerous prefix leaked: {entry!r}"
+                assert self.OPAQUE_API_KEY not in entry, (
+                    f"opaque api_key leaked: {entry!r}"
+                )
+                assert self.DANGEROUS_PREFIX not in entry, (
+                    f"dangerous prefix leaked: {entry!r}"
+                )
         finally:
             run_mod.safe_schedule_threadsafe = orig  # type: ignore[assignment]
 
@@ -5476,7 +5792,12 @@ class TestSubagentNoticeHostileStrictEgress:
         orig = run_mod.safe_schedule_threadsafe
         run_mod.safe_schedule_threadsafe = _fake_schedule  # type: ignore[assignment]
         try:
-            source = SessionSource(platform=Platform.SLACK, chat_id="C123", chat_type="channel", user_id="U123")
+            source = SessionSource(
+                platform=Platform.SLACK,
+                chat_id="C123",
+                chat_type="channel",
+                user_id="U123",
+            )
             ctx = TurnContext(
                 source=source,
                 _run_still_current=lambda: True,
@@ -5499,11 +5820,19 @@ class TestSubagentNoticeHostileStrictEgress:
                 _loop_for_step=None,
             )
             runner = TurnRunner(gw, ctx)  # type: ignore[arg-type]
-            hostile_summary = f"https://{self.LONG_OPAQUE}@ex.com/p?token={self.OPAQUE_TOKEN}"
+            hostile_summary = (
+                f"https://{self.LONG_OPAQUE}@ex.com/p?token={self.OPAQUE_TOKEN}"
+            )
 
             with (
-                patch("agent.redact.redact_sensitive_text", side_effect=RuntimeError("primary boom")),
-                patch("gateway.run._redact_gateway_user_facing_secrets", side_effect=RuntimeError("gateway boom")),
+                patch(
+                    "agent.redact.redact_sensitive_text",
+                    side_effect=RuntimeError("primary boom"),
+                ),
+                patch(
+                    "gateway.run._redact_gateway_user_facing_secrets",
+                    side_effect=RuntimeError("gateway boom"),
+                ),
             ):
                 runner.progress_callback(
                     "subagent.complete",
@@ -5513,13 +5842,17 @@ class TestSubagentNoticeHostileStrictEgress:
                     summary=hostile_summary,
                     duration_seconds=1,
                 )
-            assert len(ledger) == 1, f"expected one notice even on both-layer failure, got {ledger}"
+            assert len(ledger) == 1, (
+                f"expected one notice even on both-layer failure, got {ledger}"
+            )
             for entry in ledger:
                 assert hostile_summary not in entry
                 assert self.LONG_OPAQUE not in entry
                 assert self.OPAQUE_TOKEN not in entry
                 assert self.DANGEROUS_PREFIX not in entry
-                assert entry == "[REDACTED]", f"expected exact [REDACTED] on both-layer failure, got {entry!r}"
+                assert entry == "[REDACTED]", (
+                    f"expected exact [REDACTED] on both-layer failure, got {entry!r}"
+                )
         finally:
             run_mod.safe_schedule_threadsafe = orig  # type: ignore[assignment]
 
@@ -5556,7 +5889,12 @@ class TestSubagentNoticeHostileStrictEgress:
         orig = run_mod.safe_schedule_threadsafe
         run_mod.safe_schedule_threadsafe = _fake_schedule  # type: ignore[assignment]
         try:
-            source = SessionSource(platform=Platform.SLACK, chat_id="C123", chat_type="channel", user_id="U123")
+            source = SessionSource(
+                platform=Platform.SLACK,
+                chat_id="C123",
+                chat_type="channel",
+                user_id="U123",
+            )
             ctx = TurnContext(
                 source=source,
                 _run_still_current=lambda: True,
@@ -5594,6 +5932,7 @@ class TestSubagentNoticeHostileStrictEgress:
         finally:
             run_mod.safe_schedule_threadsafe = orig  # type: ignore[assignment]
 
+
 # ---------------------------------------------------------------------------
 # SEC-PF-FINAL-REASONING-AUGMENTATION-EGRESS — hostile last_reasoning after
 # sanitization, opaque userinfo + token/api_key/signature query must not
@@ -5601,6 +5940,7 @@ class TestSubagentNoticeHostileStrictEgress:
 # caller, not a sanitizer helper, with primary/fallback/both-layer failure
 # cases for the assembled final path (reasoning + footer + base).
 # ---------------------------------------------------------------------------
+
 
 class TestFinalReasoningSlackHostileStrictEgress:
     """Reasoning-augmented final egress: hostile last_reasoning must be masked before Slack delivery."""
@@ -5614,7 +5954,9 @@ class TestFinalReasoningSlackHostileStrictEgress:
     RAW_URL_BARE = f"https://***@ex.com/p"
     RAW_URL_USERPASS = f"https://alice:{LONG_OPAQUE}@ex.com/p"
     RAW_URL_QUERY = f"https://ex.com/cb?token={OPAQUE_TOKEN}&api_key={OPAQUE_API_KEY}&signature={OPAQUE_SIG}"
-    RAW_URL_COMBINED = f"https://***@ex.com/p?token={OPAQUE_TOKEN}&api_key={OPAQUE_API_KEY}"
+    RAW_URL_COMBINED = (
+        f"https://***@ex.com/p?token={OPAQUE_TOKEN}&api_key={OPAQUE_API_KEY}"
+    )
 
     def _hostile_reasoning(self) -> str:
         return (
@@ -5638,7 +5980,9 @@ class TestFinalReasoningSlackHostileStrictEgress:
 
         class _CaptureSlackAdapter(BasePlatformAdapter):
             def __init__(self):
-                super().__init__(PlatformConfig(enabled=True, token="xoxb-fake"), Platform.SLACK)
+                super().__init__(
+                    PlatformConfig(enabled=True, token="xoxb-fake"), Platform.SLACK
+                )
 
             async def connect(self, *, is_reconnect: bool = False) -> bool:
                 return True
@@ -5659,7 +6003,9 @@ class TestFinalReasoningSlackHostileStrictEgress:
         fake_adapter = _CaptureSlackAdapter()
         fake_adapter.send = AsyncMock(side_effect=fake_adapter.send)
 
-        config = GatewayConfig(platforms={Platform.SLACK: PlatformConfig(enabled=True, token="xoxb-fake")})
+        config = GatewayConfig(
+            platforms={Platform.SLACK: PlatformConfig(enabled=True, token="xoxb-fake")}
+        )
         gw = GatewayRunner(config=config)
         gw.adapters = {Platform.SLACK: fake_adapter}
         gw._is_user_authorized = lambda _source: True
@@ -5690,7 +6036,12 @@ class TestFinalReasoningSlackHostileStrictEgress:
         gw.session_store._record_gateway_session_peer = MagicMock()
         gw._async_session_store = gw.session_store  # type: ignore[attr-defined]
         gw._adapter_for_source = lambda source: fake_adapter
-        gw._resolve_session_agent_runtime = MagicMock(return_value=("test/model", {"api_key": "fake", "base_url": "https://openrouter.ai/api/v1"}))
+        gw._resolve_session_agent_runtime = MagicMock(
+            return_value=(
+                "test/model",
+                {"api_key": "fake", "base_url": "https://openrouter.ai/api/v1"},
+            )
+        )
         gw._resolve_session_reasoning_config = MagicMock(return_value=None)
         gw._resolve_session_service_tier = MagicMock(return_value=None)
         gw._provider_routing = {}
@@ -5704,13 +6055,31 @@ class TestFinalReasoningSlackHostileStrictEgress:
 
             orig_resolve = run_mod._resolve_gateway_display_bool
 
-            def _patched_resolve(cfg, pkey, key, default=False, platform=None, require_platform_override_for=None):
+            def _patched_resolve(
+                cfg,
+                pkey,
+                key,
+                default=False,
+                platform=None,
+                require_platform_override_for=None,
+            ):
                 if key == "show_reasoning" and enable_reasoning:
                     return True
                 try:
-                    return orig_resolve(cfg, pkey, key, default=default, platform=platform, require_platform_override_for=require_platform_override_for)
+                    return orig_resolve(
+                        cfg,
+                        pkey,
+                        key,
+                        default=default,
+                        platform=platform,
+                        require_platform_override_for=require_platform_override_for,
+                    )
                 except Exception:
-                    return bool(default) if key != "show_reasoning" else bool(enable_reasoning)
+                    return (
+                        bool(default)
+                        if key != "show_reasoning"
+                        else bool(enable_reasoning)
+                    )
 
             run_mod._resolve_gateway_display_bool = _patched_resolve  # type: ignore[assignment]
         except Exception:
@@ -5723,7 +6092,11 @@ class TestFinalReasoningSlackHostileStrictEgress:
                 "last_reasoning": last_reasoning,
                 "messages": [
                     {"role": "user", "content": "hi"},
-                    {"role": "assistant", "content": final_response, "reasoning": last_reasoning},
+                    {
+                        "role": "assistant",
+                        "content": final_response,
+                        "reasoning": last_reasoning,
+                    },
                 ],
                 "api_calls": 1,
                 "failed": False,
@@ -5737,7 +6110,13 @@ class TestFinalReasoningSlackHostileStrictEgress:
 
         event = MessageEvent(
             text="hi",
-            source=SessionSource(platform=Platform.SLACK, chat_id="C123", chat_type="channel", user_id="U123", thread_id="T123"),
+            source=SessionSource(
+                platform=Platform.SLACK,
+                chat_id="C123",
+                chat_type="channel",
+                user_id="U123",
+                thread_id="T123",
+            ),
             message_id="msg-reason-hostile-1",
         )
         fake_adapter.set_message_handler(gw._handle_message)
@@ -5748,7 +6127,9 @@ class TestFinalReasoningSlackHostileStrictEgress:
         orig_home = os.environ.get("SLACK_HOME_CHANNEL")
         os.environ["SLACK_HOME_CHANNEL"] = "C123"
         try:
-            await fake_adapter._process_message_background(event, build_session_key(event.source))
+            await fake_adapter._process_message_background(
+                event, build_session_key(event.source)
+            )
         finally:
             if orig_home is None:
                 os.environ.pop("SLACK_HOME_CHANNEL", None)
@@ -5773,14 +6154,28 @@ class TestFinalReasoningSlackHostileStrictEgress:
         )
         assert len(ledger) >= 1, f"expected at least one final send, got {ledger}"
         for entry in ledger:
-            assert self.RAW_URL_USERPASS not in entry, f"raw userpass URL leaked in reasoning egress: {entry!r}"
-            assert self.RAW_URL_QUERY not in entry, f"raw query URL leaked in reasoning egress: {entry!r}"
+            assert self.RAW_URL_USERPASS not in entry, (
+                f"raw userpass URL leaked in reasoning egress: {entry!r}"
+            )
+            assert self.RAW_URL_QUERY not in entry, (
+                f"raw query URL leaked in reasoning egress: {entry!r}"
+            )
             # RAW_URL_BARE/COMBINED with *** are masked forms - check raw opaque prefix instead
-            assert self.LONG_OPAQUE not in entry, f"opaque long userinfo leaked in reasoning egress: {entry!r}"
-            assert self.OPAQUE_TOKEN not in entry, f"opaque token leaked in reasoning egress: {entry!r}"
-            assert self.OPAQUE_API_KEY not in entry, f"opaque api_key leaked in reasoning egress: {entry!r}"
-            assert self.OPAQUE_SIG not in entry, f"opaque signature leaked in reasoning egress: {entry!r}"
-            assert self.DANGEROUS_PREFIX not in entry, f"dangerous prefix leaked in reasoning egress: {entry!r}"
+            assert self.LONG_OPAQUE not in entry, (
+                f"opaque long userinfo leaked in reasoning egress: {entry!r}"
+            )
+            assert self.OPAQUE_TOKEN not in entry, (
+                f"opaque token leaked in reasoning egress: {entry!r}"
+            )
+            assert self.OPAQUE_API_KEY not in entry, (
+                f"opaque api_key leaked in reasoning egress: {entry!r}"
+            )
+            assert self.OPAQUE_SIG not in entry, (
+                f"opaque signature leaked in reasoning egress: {entry!r}"
+            )
+            assert self.DANGEROUS_PREFIX not in entry, (
+                f"dangerous prefix leaked in reasoning egress: {entry!r}"
+            )
             # Must not be the raw assembled response (reasoning+final) and must have marker
             assert hostile_reasoning not in entry
         # Benign final piece should survive (masked reasoning, but final answer remains)
@@ -5792,7 +6187,10 @@ class TestFinalReasoningSlackHostileStrictEgress:
         ledger: list[str] = []
         hostile_reasoning = self._hostile_reasoning()
         benign_final = "Benign answer primary-failure test."
-        with patch("agent.redact.redact_sensitive_text", side_effect=RuntimeError("primary boom")):
+        with patch(
+            "agent.redact.redact_sensitive_text",
+            side_effect=RuntimeError("primary boom"),
+        ):
             await self._run_gateway_with_reasoning(
                 final_response=benign_final,
                 last_reasoning=hostile_reasoning,
@@ -5813,7 +6211,10 @@ class TestFinalReasoningSlackHostileStrictEgress:
         ledger: list[str] = []
         hostile_reasoning = self._hostile_reasoning()
         benign_final = "Benign answer fallback-failure test."
-        with patch("gateway.run._redact_gateway_user_facing_secrets", side_effect=RuntimeError("gateway boom")):
+        with patch(
+            "gateway.run._redact_gateway_user_facing_secrets",
+            side_effect=RuntimeError("gateway boom"),
+        ):
             await self._run_gateway_with_reasoning(
                 final_response=benign_final,
                 last_reasoning=hostile_reasoning,
@@ -5833,8 +6234,14 @@ class TestFinalReasoningSlackHostileStrictEgress:
         hostile_reasoning = self._hostile_reasoning()
         benign_final = "Benign but should be redacted on both-layer failure"
         with (
-            patch("agent.redact.redact_sensitive_text", side_effect=RuntimeError("primary boom")),
-            patch("gateway.run._redact_gateway_user_facing_secrets", side_effect=RuntimeError("gateway boom")),
+            patch(
+                "agent.redact.redact_sensitive_text",
+                side_effect=RuntimeError("primary boom"),
+            ),
+            patch(
+                "gateway.run._redact_gateway_user_facing_secrets",
+                side_effect=RuntimeError("gateway boom"),
+            ),
         ):
             await self._run_gateway_with_reasoning(
                 final_response=benign_final,
@@ -5847,12 +6254,16 @@ class TestFinalReasoningSlackHostileStrictEgress:
             assert self.LONG_OPAQUE not in entry
             assert self.OPAQUE_TOKEN not in entry
             assert self.DANGEROUS_PREFIX not in entry
-            assert entry == "[REDACTED]", f"expected exact [REDACTED] on both-layer failure, got {entry!r}"
+            assert entry == "[REDACTED]", (
+                f"expected exact [REDACTED] on both-layer failure, got {entry!r}"
+            )
 
     @pytest.mark.asyncio
     async def test_reasoning_non_secret_control_preserved(self):
         ledger: list[str] = []
-        benign_reasoning = "Benign reasoning with https://example.com/page?foo=bar&baz=qux for docs."
+        benign_reasoning = (
+            "Benign reasoning with https://example.com/page?foo=bar&baz=qux for docs."
+        )
         benign_final = "Final answer https://example.com/other?x=1 no secrets."
         await self._run_gateway_with_reasoning(
             final_response=benign_final,
@@ -5861,7 +6272,10 @@ class TestFinalReasoningSlackHostileStrictEgress:
         )
         assert len(ledger) >= 1
         for entry in ledger:
-            assert "example.com" in entry, f"non-secret URL should survive reasoning egress: {entry!r}"
+            assert "example.com" in entry, (
+                f"non-secret URL should survive reasoning egress: {entry!r}"
+            )
+
 
 # ---------------------------------------------------------------------------
 # SEC-PF-STREAMED-FINAL-EDIT-EGRESS — streamed final/edit/update must be
@@ -5872,6 +6286,7 @@ class TestFinalReasoningSlackHostileStrictEgress:
 # failure with normal fallback, primary/fallback/both-layer failures (exact
 # [REDACTED]), benign preservation, and no-duplicate/already_sent.
 # ---------------------------------------------------------------------------
+
 
 class TestStreamedFinalEditEgress:
     """Streamed final/edit/update egress: hostile URLs must be masked before Slack edit."""
@@ -5885,7 +6300,9 @@ class TestStreamedFinalEditEgress:
     RAW_URL_BARE = f"https://{LONG_OPAQUE}@ex.com/p"
     RAW_URL_USERPASS = f"https://alice:{LONG_OPAQUE}@ex.com/p"
     RAW_URL_QUERY = f"https://ex.com/cb?token={OPAQUE_TOKEN}&api_key={OPAQUE_API_KEY}&signature={OPAQUE_SIG}"
-    RAW_URL_COMBINED = f"https://{LONG_OPAQUE}@ex.com/p?token={OPAQUE_TOKEN}&api_key={OPAQUE_API_KEY}"
+    RAW_URL_COMBINED = (
+        f"https://{LONG_OPAQUE}@ex.com/p?token={OPAQUE_TOKEN}&api_key={OPAQUE_API_KEY}"
+    )
 
     def _hostile_final(self) -> str:
         return (
@@ -5895,16 +6312,26 @@ class TestStreamedFinalEditEgress:
 
     def _assert_no_leak(self, payload: str, *, must_have_mask: bool = True):
         assert self.RAW_URL_BARE not in payload, f"raw bare URL leaked: {payload!r}"
-        assert self.RAW_URL_USERPASS not in payload, f"raw userpass URL leaked: {payload!r}"
+        assert self.RAW_URL_USERPASS not in payload, (
+            f"raw userpass URL leaked: {payload!r}"
+        )
         assert self.RAW_URL_QUERY not in payload, f"raw query URL leaked: {payload!r}"
-        assert self.RAW_URL_COMBINED not in payload, f"raw combined URL leaked: {payload!r}"
+        assert self.RAW_URL_COMBINED not in payload, (
+            f"raw combined URL leaked: {payload!r}"
+        )
         assert self.LONG_OPAQUE not in payload, f"opaque long leaked: {payload!r}"
         assert self.OPAQUE_TOKEN not in payload, f"opaque token leaked: {payload!r}"
         assert self.OPAQUE_API_KEY not in payload, f"opaque api_key leaked: {payload!r}"
         assert self.OPAQUE_SIG not in payload, f"opaque sig leaked: {payload!r}"
-        assert self.DANGEROUS_PREFIX not in payload, f"dangerous prefix leaked: {payload!r}"
+        assert self.DANGEROUS_PREFIX not in payload, (
+            f"dangerous prefix leaked: {payload!r}"
+        )
         if must_have_mask:
-            assert "***" in payload or "[REDACTED]" in payload or "redacted" in payload.lower(), f"expected mask in {payload!r}"
+            assert (
+                "***" in payload
+                or "[REDACTED]" in payload
+                or "redacted" in payload.lower()
+            ), f"expected mask in {payload!r}"
 
     @pytest.mark.asyncio
     async def test_streamed_edit_hostile_via_direct_edit_no_leakage(self):
@@ -5918,7 +6345,9 @@ class TestStreamedFinalEditEgress:
         ledger: list[str] = []
 
         class _CapSlack:
-            async def edit_message(self, chat_id, message_id, content, metadata=None, finalize=False):
+            async def edit_message(
+                self, chat_id, message_id, content, metadata=None, finalize=False
+            ):
                 ledger.append(content)
                 m = MagicMock()
                 m.success = True
@@ -5926,18 +6355,34 @@ class TestStreamedFinalEditEgress:
                 return m
 
         cap = _CapSlack()
-        source = SessionSource(platform=Platform.SLACK, chat_id="C123", chat_type="channel", user_id="U123", thread_id="T123")
+        source = SessionSource(
+            platform=Platform.SLACK,
+            chat_id="C123",
+            chat_type="channel",
+            user_id="U123",
+            thread_id="T123",
+        )
         from gateway.turn_context import TurnContext
+
         fake_sc = MagicMock()
         fake_sc.adapter = cap
         fake_sc.message_id = "stream-msg-1"
         response: dict = {}
         hostile = self._hostile_final()
         # Create a minimal GatewayRunner host to call the mixin method
-        gw = GatewayRunner(config=GatewayConfig(platforms={Platform.SLACK: PlatformConfig(enabled=True, token="xoxb-fake")}))
+        gw = GatewayRunner(
+            config=GatewayConfig(
+                platforms={
+                    Platform.SLACK: PlatformConfig(enabled=True, token="xoxb-fake")
+                }
+            )
+        )
         # Call edit with raw hostile — must be sanitized before ledger
         await gw._run_agent_edit_streamed_message(
-            fake_sc, source, response, hostile,
+            fake_sc,
+            source,
+            response,
+            hostile,
             _sk="test-sk",
             ok=("ok %s", "test-sk"),
             fail_result=None,
@@ -5945,7 +6390,9 @@ class TestStreamedFinalEditEgress:
         )
         assert len(ledger) == 1, f"expected one edit, got {ledger}"
         self._assert_no_leak(ledger[0])
-        assert response.get("already_sent") is True, "already_sent must be set on success"
+        assert response.get("already_sent") is True, (
+            "already_sent must be set on success"
+        )
 
     @pytest.mark.asyncio
     async def test_streamed_edit_benign_preserved(self):
@@ -5958,7 +6405,9 @@ class TestStreamedFinalEditEgress:
         ledger: list[str] = []
 
         class _CapSlack:
-            async def edit_message(self, chat_id, message_id, content, metadata=None, finalize=False):
+            async def edit_message(
+                self, chat_id, message_id, content, metadata=None, finalize=False
+            ):
                 ledger.append(content)
                 m = MagicMock()
                 m.success = True
@@ -5966,22 +6415,39 @@ class TestStreamedFinalEditEgress:
                 return m
 
         cap = _CapSlack()
-        source = SessionSource(platform=Platform.SLACK, chat_id="C123", chat_type="channel", user_id="U123", thread_id="T123")
+        source = SessionSource(
+            platform=Platform.SLACK,
+            chat_id="C123",
+            chat_type="channel",
+            user_id="U123",
+            thread_id="T123",
+        )
         fake_sc = MagicMock()
         fake_sc.adapter = cap
         fake_sc.message_id = "stream-msg-2"
         response: dict = {}
         benign = "See https://example.com/page?foo=bar&baz=qux for docs — no secrets."
-        gw = GatewayRunner(config=GatewayConfig(platforms={Platform.SLACK: PlatformConfig(enabled=True, token="xoxb-fake")}))
+        gw = GatewayRunner(
+            config=GatewayConfig(
+                platforms={
+                    Platform.SLACK: PlatformConfig(enabled=True, token="xoxb-fake")
+                }
+            )
+        )
         await gw._run_agent_edit_streamed_message(
-            fake_sc, source, response, benign,
+            fake_sc,
+            source,
+            response,
+            benign,
             _sk="test-sk2",
             ok=("ok %s", "test-sk2"),
             fail_result=None,
             fail_exc="fail %s: %s",
         )
         assert len(ledger) == 1
-        assert "example.com" in ledger[0], f"benign URL should survive streamed edit: {ledger[0]!r}"
+        assert "example.com" in ledger[0], (
+            f"benign URL should survive streamed edit: {ledger[0]!r}"
+        )
         assert ledger[0] == benign
 
     @pytest.mark.asyncio
@@ -5995,7 +6461,9 @@ class TestStreamedFinalEditEgress:
         ledger: list[str] = []
 
         class _CapSlack:
-            async def edit_message(self, chat_id, message_id, content, metadata=None, finalize=False):
+            async def edit_message(
+                self, chat_id, message_id, content, metadata=None, finalize=False
+            ):
                 ledger.append(content)
                 m = MagicMock()
                 m.success = True
@@ -6003,16 +6471,34 @@ class TestStreamedFinalEditEgress:
                 return m
 
         cap = _CapSlack()
-        source = SessionSource(platform=Platform.SLACK, chat_id="C123", chat_type="channel", user_id="U123", thread_id="T123")
+        source = SessionSource(
+            platform=Platform.SLACK,
+            chat_id="C123",
+            chat_type="channel",
+            user_id="U123",
+            thread_id="T123",
+        )
         fake_sc = MagicMock()
         fake_sc.adapter = cap
         fake_sc.message_id = "stream-msg-3"
         response: dict = {}
         hostile = self._hostile_final()
-        gw = GatewayRunner(config=GatewayConfig(platforms={Platform.SLACK: PlatformConfig(enabled=True, token="xoxb-fake")}))
-        with patch("agent.redact.redact_sensitive_text", side_effect=RuntimeError("primary boom")):
+        gw = GatewayRunner(
+            config=GatewayConfig(
+                platforms={
+                    Platform.SLACK: PlatformConfig(enabled=True, token="xoxb-fake")
+                }
+            )
+        )
+        with patch(
+            "agent.redact.redact_sensitive_text",
+            side_effect=RuntimeError("primary boom"),
+        ):
             await gw._run_agent_edit_streamed_message(
-                fake_sc, source, response, hostile,
+                fake_sc,
+                source,
+                response,
+                hostile,
                 _sk="test-sk3",
                 ok=("ok %s", "test-sk3"),
                 fail_result=None,
@@ -6033,7 +6519,9 @@ class TestStreamedFinalEditEgress:
         ledger: list[str] = []
 
         class _CapSlack:
-            async def edit_message(self, chat_id, message_id, content, metadata=None, finalize=False):
+            async def edit_message(
+                self, chat_id, message_id, content, metadata=None, finalize=False
+            ):
                 ledger.append(content)
                 m = MagicMock()
                 m.success = True
@@ -6041,26 +6529,49 @@ class TestStreamedFinalEditEgress:
                 return m
 
         cap = _CapSlack()
-        source = SessionSource(platform=Platform.SLACK, chat_id="C123", chat_type="channel", user_id="U123", thread_id="T123")
+        source = SessionSource(
+            platform=Platform.SLACK,
+            chat_id="C123",
+            chat_type="channel",
+            user_id="U123",
+            thread_id="T123",
+        )
         fake_sc = MagicMock()
         fake_sc.adapter = cap
         fake_sc.message_id = "stream-msg-4"
         response: dict = {}
         hostile = self._hostile_final()
-        gw = GatewayRunner(config=GatewayConfig(platforms={Platform.SLACK: PlatformConfig(enabled=True, token="xoxb-fake")}))
+        gw = GatewayRunner(
+            config=GatewayConfig(
+                platforms={
+                    Platform.SLACK: PlatformConfig(enabled=True, token="xoxb-fake")
+                }
+            )
+        )
         with (
-            patch("agent.redact.redact_sensitive_text", side_effect=RuntimeError("primary boom")),
-            patch("gateway.run._redact_gateway_user_facing_secrets", side_effect=RuntimeError("gateway boom")),
+            patch(
+                "agent.redact.redact_sensitive_text",
+                side_effect=RuntimeError("primary boom"),
+            ),
+            patch(
+                "gateway.run._redact_gateway_user_facing_secrets",
+                side_effect=RuntimeError("gateway boom"),
+            ),
         ):
             await gw._run_agent_edit_streamed_message(
-                fake_sc, source, response, hostile,
+                fake_sc,
+                source,
+                response,
+                hostile,
                 _sk="test-sk4",
                 ok=("ok %s", "test-sk4"),
                 fail_result=None,
                 fail_exc="fail %s: %s",
             )
         assert len(ledger) == 1
-        assert ledger[0] == "[REDACTED]", f"expected exact [REDACTED] on both-layer failure, got {ledger[0]!r}"
+        assert ledger[0] == "[REDACTED]", (
+            f"expected exact [REDACTED] on both-layer failure, got {ledger[0]!r}"
+        )
         assert hostile not in ledger[0]
         assert self.LONG_OPAQUE not in ledger[0]
 
@@ -6077,7 +6588,9 @@ class TestStreamedFinalEditEgress:
         ledger: list[str] = []
 
         class _CapSlack:
-            async def edit_message(self, chat_id, message_id, content, metadata=None, finalize=False):
+            async def edit_message(
+                self, chat_id, message_id, content, metadata=None, finalize=False
+            ):
                 ledger.append(content)
                 m = MagicMock()
                 m.success = True
@@ -6085,7 +6598,13 @@ class TestStreamedFinalEditEgress:
                 return m
 
         cap = _CapSlack()
-        source = SessionSource(platform=Platform.SLACK, chat_id="C123", chat_type="channel", user_id="U123", thread_id="T123")
+        source = SessionSource(
+            platform=Platform.SLACK,
+            chat_id="C123",
+            chat_type="channel",
+            user_id="U123",
+            thread_id="T123",
+        )
         # Fake stream consumer that reports stale (delivered_final_matches == False) and is editable
         fake_sc = MagicMock()
         fake_sc.adapter = cap
@@ -6095,14 +6614,31 @@ class TestStreamedFinalEditEgress:
         fake_sc._turn_split_delivery = False
         # Ensure streamed and content delivered triggers stale path
         hostile = self._hostile_final()
-        response = {"final_response": hostile, "failed": False, "response_previewed": False, "response_transformed": False}
-        turn_ctx = TurnContext(source=source, session_key="test-sk-stale", stream_consumer_holder=[fake_sc])
-        gw = GatewayRunner(config=GatewayConfig(platforms={Platform.SLACK: PlatformConfig(enabled=True, token="xoxb-fake")}))
+        response = {
+            "final_response": hostile,
+            "failed": False,
+            "response_previewed": False,
+            "response_transformed": False,
+        }
+        turn_ctx = TurnContext(
+            source=source, session_key="test-sk-stale", stream_consumer_holder=[fake_sc]
+        )
+        gw = GatewayRunner(
+            config=GatewayConfig(
+                platforms={
+                    Platform.SLACK: PlatformConfig(enabled=True, token="xoxb-fake")
+                }
+            )
+        )
         # Mock helper to force streamed=False but content_delivered True leads to stale path; ensure not already_sent
-        with patch.object(gw, "_run_agent_stream_confirmed_final_delivery", return_value=False):
+        with patch.object(
+            gw, "_run_agent_stream_confirmed_final_delivery", return_value=False
+        ):
             await gw._run_agent_mark_streamed_delivery(response, turn_ctx)
         # Stale path should have edited with sanitized hostile
-        assert len(ledger) == 1, f"stale edit should have produced one edit, got {ledger}"
+        assert len(ledger) == 1, (
+            f"stale edit should have produced one edit, got {ledger}"
+        )
         self._assert_no_leak(ledger[0])
         assert response.get("already_sent") is True
         # Verify no duplicate — already_sent set, but we check ledger only once
@@ -6121,7 +6657,9 @@ class TestStreamedFinalEditEgress:
         send_ledger: list[str] = []
 
         class _CapSlackEditFail:
-            async def edit_message(self, chat_id, message_id, content, metadata=None, finalize=False):
+            async def edit_message(
+                self, chat_id, message_id, content, metadata=None, finalize=False
+            ):
                 edit_ledger.append(content)
                 raise RuntimeError("edit boom")
 
@@ -6133,7 +6671,13 @@ class TestStreamedFinalEditEgress:
                 return m
 
         cap = _CapSlackEditFail()
-        source = SessionSource(platform=Platform.SLACK, chat_id="C123", chat_type="channel", user_id="U123", thread_id="T123")
+        source = SessionSource(
+            platform=Platform.SLACK,
+            chat_id="C123",
+            chat_type="channel",
+            user_id="U123",
+            thread_id="T123",
+        )
         fake_sc = MagicMock()
         fake_sc.adapter = cap
         fake_sc.message_id = "stream-fail-1"
@@ -6141,10 +6685,25 @@ class TestStreamedFinalEditEgress:
         fake_sc.delivered_final_matches = MagicMock(return_value=False)
         fake_sc._turn_split_delivery = False
         hostile = self._hostile_final()
-        response = {"final_response": hostile, "failed": False, "response_previewed": False, "response_transformed": False}
-        turn_ctx = TurnContext(source=source, session_key="test-sk-fail", stream_consumer_holder=[fake_sc])
-        gw = GatewayRunner(config=GatewayConfig(platforms={Platform.SLACK: PlatformConfig(enabled=True, token="xoxb-fake")}))
-        with patch.object(gw, "_run_agent_stream_confirmed_final_delivery", return_value=False):
+        response = {
+            "final_response": hostile,
+            "failed": False,
+            "response_previewed": False,
+            "response_transformed": False,
+        }
+        turn_ctx = TurnContext(
+            source=source, session_key="test-sk-fail", stream_consumer_holder=[fake_sc]
+        )
+        gw = GatewayRunner(
+            config=GatewayConfig(
+                platforms={
+                    Platform.SLACK: PlatformConfig(enabled=True, token="xoxb-fake")
+                }
+            )
+        )
+        with patch.object(
+            gw, "_run_agent_stream_confirmed_final_delivery", return_value=False
+        ):
             await gw._run_agent_mark_streamed_delivery(response, turn_ctx)
         # Edit was attempted but failed — ledger has sanitized attempt before exception
         assert len(edit_ledger) == 1
@@ -6154,11 +6713,14 @@ class TestStreamedFinalEditEgress:
         # Simulate fallback normal send via run.py sanitizer (GatewayRunner._handle_message_with_agent wrapper)
         # Directly verify that sanitizing hostile yields no leak
         from gateway.run import _sanitize_gateway_final_response
+
         sanitized = _sanitize_gateway_final_response(Platform.SLACK, hostile)
         self._assert_no_leak(sanitized)
 
     @pytest.mark.asyncio
-    async def test_streamed_gateway_full_reasoning_hostile_via_stale_edit_no_leakage(self):
+    async def test_streamed_gateway_full_reasoning_hostile_via_stale_edit_no_leakage(
+        self,
+    ):
         # Full GatewayRunner path with hostile last_reasoning triggering streamed stale edit
         # Use _run_agent_inner mock to inject hostile reasoning and trigger streamed reconciliation
         from gateway.config import Platform, GatewayConfig, PlatformConfig
@@ -6169,7 +6731,9 @@ class TestStreamedFinalEditEgress:
         from unittest.mock import MagicMock, AsyncMock, patch
         import asyncio, os
 
-        hostile_reasoning = f"Reasoning with {self.RAW_URL_USERPASS} and {self.RAW_URL_QUERY}"
+        hostile_reasoning = (
+            f"Reasoning with {self.RAW_URL_USERPASS} and {self.RAW_URL_QUERY}"
+        )
         benign_final = "Benign final answer."
         # Combined hostile via reasoning
         edit_ledger: list[str] = []
@@ -6177,7 +6741,9 @@ class TestStreamedFinalEditEgress:
 
         class _CapSlackFull(BasePlatformAdapter):
             def __init__(self):
-                super().__init__(PlatformConfig(enabled=True, token="xoxb-fake"), Platform.SLACK)
+                super().__init__(
+                    PlatformConfig(enabled=True, token="xoxb-fake"), Platform.SLACK
+                )
 
             async def connect(self, *, is_reconnect: bool = False) -> bool:
                 return True
@@ -6189,7 +6755,9 @@ class TestStreamedFinalEditEgress:
                 send_ledger.append(content)
                 return SendResult(success=True, message_id="slack-full-1")
 
-            async def edit_message(self, chat_id, message_id, content, metadata=None, finalize=False):
+            async def edit_message(
+                self, chat_id, message_id, content, metadata=None, finalize=False
+            ):
                 edit_ledger.append(content)
                 m = MagicMock()
                 m.success = True
@@ -6206,7 +6774,9 @@ class TestStreamedFinalEditEgress:
         fake_adapter.send = AsyncMock(side_effect=fake_adapter.send)
         fake_adapter.edit_message = AsyncMock(side_effect=fake_adapter.edit_message)  # type: ignore[attr-defined]
 
-        config = GatewayConfig(platforms={Platform.SLACK: PlatformConfig(enabled=True, token="xoxb-fake")})
+        config = GatewayConfig(
+            platforms={Platform.SLACK: PlatformConfig(enabled=True, token="xoxb-fake")}
+        )
         gw = GatewayRunner(config=config)
         gw.adapters = {Platform.SLACK: fake_adapter}
         gw._is_user_authorized = lambda _source: True
@@ -6217,6 +6787,7 @@ class TestStreamedFinalEditEgress:
         gw.hooks = MagicMock()
         gw.hooks.emit = AsyncMock()
         from datetime import datetime, timedelta
+
         now = datetime.now()
         session_entry = SessionEntry(
             session_key="agent:main:slack:channel:C123:U123",
@@ -6238,7 +6809,12 @@ class TestStreamedFinalEditEgress:
         gw.session_store._record_gateway_session_peer = MagicMock()
         gw._async_session_store = gw.session_store  # type: ignore[attr-defined]
         gw._adapter_for_source = lambda source: fake_adapter
-        gw._resolve_session_agent_runtime = MagicMock(return_value=("test/model", {"api_key": "fake", "base_url": "https://openrouter.ai/api/v1"}))
+        gw._resolve_session_agent_runtime = MagicMock(
+            return_value=(
+                "test/model",
+                {"api_key": "fake", "base_url": "https://openrouter.ai/api/v1"},
+            )
+        )
         gw._resolve_session_reasoning_config = MagicMock(return_value=None)
         gw._resolve_session_service_tier = MagicMock(return_value=None)
         gw._provider_routing = {}
@@ -6250,14 +6826,31 @@ class TestStreamedFinalEditEgress:
         orig_resolve = None
         try:
             from gateway import run as run_mod
+
             orig_resolve = run_mod._resolve_gateway_display_bool
-            def _patched_resolve(cfg, pkey, key, default=False, platform=None, require_platform_override_for=None):
+
+            def _patched_resolve(
+                cfg,
+                pkey,
+                key,
+                default=False,
+                platform=None,
+                require_platform_override_for=None,
+            ):
                 if key == "show_reasoning":
                     return True
                 try:
-                    return orig_resolve(cfg, pkey, key, default=default, platform=platform, require_platform_override_for=require_platform_override_for)
+                    return orig_resolve(
+                        cfg,
+                        pkey,
+                        key,
+                        default=default,
+                        platform=platform,
+                        require_platform_override_for=require_platform_override_for,
+                    )
                 except Exception:
                     return bool(default)
+
             run_mod._resolve_gateway_display_bool = _patched_resolve  # type: ignore[assignment]
         except Exception:
             pass
@@ -6267,15 +6860,33 @@ class TestStreamedFinalEditEgress:
         # Simpler: test that even if reasoning hostile is passed as final_response via streamed edit, it is masked
         hostile_via_final = f"{benign_final} plus reasoning-like {hostile_reasoning}"
         from gateway.turn_context import TurnContext
+
         fake_sc2 = MagicMock()
         fake_sc2.adapter = fake_adapter
         fake_sc2.message_id = "stream-reason-1"
         fake_sc2.final_content_delivered = True
         fake_sc2.delivered_final_matches = MagicMock(return_value=False)
         fake_sc2._turn_split_delivery = False
-        response = {"final_response": hostile_via_final, "failed": False, "response_previewed": False, "response_transformed": False}
-        turn_ctx = TurnContext(source=SessionSource(platform=Platform.SLACK, chat_id="C123", chat_type="channel", user_id="U123", thread_id="T123"), session_key="sk-reason", stream_consumer_holder=[fake_sc2])
-        with patch.object(gw, "_run_agent_stream_confirmed_final_delivery", return_value=False):
+        response = {
+            "final_response": hostile_via_final,
+            "failed": False,
+            "response_previewed": False,
+            "response_transformed": False,
+        }
+        turn_ctx = TurnContext(
+            source=SessionSource(
+                platform=Platform.SLACK,
+                chat_id="C123",
+                chat_type="channel",
+                user_id="U123",
+                thread_id="T123",
+            ),
+            session_key="sk-reason",
+            stream_consumer_holder=[fake_sc2],
+        )
+        with patch.object(
+            gw, "_run_agent_stream_confirmed_final_delivery", return_value=False
+        ):
             await gw._run_agent_mark_streamed_delivery(response, turn_ctx)
         assert len(edit_ledger) >= 1
         for payload in edit_ledger:
@@ -6303,7 +6914,9 @@ class TestStreamedFinalEditEgress:
         ledger: list[str] = []
 
         class _CapSlack:
-            async def edit_message(self, chat_id, message_id, content, metadata=None, finalize=False):
+            async def edit_message(
+                self, chat_id, message_id, content, metadata=None, finalize=False
+            ):
                 ledger.append(content)
                 m = MagicMock()
                 m.success = True
@@ -6311,23 +6924,48 @@ class TestStreamedFinalEditEgress:
                 return m
 
         cap = _CapSlack()
-        source = SessionSource(platform=Platform.SLACK, chat_id="C123", chat_type="channel", user_id="U123", thread_id="T123")
+        source = SessionSource(
+            platform=Platform.SLACK,
+            chat_id="C123",
+            chat_type="channel",
+            user_id="U123",
+            thread_id="T123",
+        )
         fake_sc = MagicMock()
         fake_sc.adapter = cap
         fake_sc.message_id = "stream-dedupe-1"
         fake_sc.final_content_delivered = True
-        fake_sc.delivered_final_matches = MagicMock(return_value=True)  # matches, so not stale
+        fake_sc.delivered_final_matches = MagicMock(
+            return_value=True
+        )  # matches, so not stale
         fake_sc._turn_split_delivery = False
         # This case should set already_sent without edit (suppression)
-        response = {"final_response": "Hello world", "failed": False, "response_previewed": True, "response_transformed": False}
-        turn_ctx = TurnContext(source=source, session_key="sk-dedupe", stream_consumer_holder=[fake_sc])
-        gw = GatewayRunner(config=GatewayConfig(platforms={Platform.SLACK: PlatformConfig(enabled=True, token="xoxb-fake")}))
-        with patch.object(gw, "_run_agent_stream_confirmed_final_delivery", return_value=True):
+        response = {
+            "final_response": "Hello world",
+            "failed": False,
+            "response_previewed": True,
+            "response_transformed": False,
+        }
+        turn_ctx = TurnContext(
+            source=source, session_key="sk-dedupe", stream_consumer_holder=[fake_sc]
+        )
+        gw = GatewayRunner(
+            config=GatewayConfig(
+                platforms={
+                    Platform.SLACK: PlatformConfig(enabled=True, token="xoxb-fake")
+                }
+            )
+        )
+        with patch.object(
+            gw, "_run_agent_stream_confirmed_final_delivery", return_value=True
+        ):
             await gw._run_agent_mark_streamed_delivery(response, turn_ctx)
         assert response.get("already_sent") is True
         assert len(ledger) == 0, "suppress case must not edit (no duplicate)"
         # Verify outer deliver would suppress normal send — simulate _hmwa_deliver_turn_response already_sent path
         # The ledger remaining 0 proves no duplicate edit was introduced
+
+
 class TestStatefulStreamedEgress:
     """Stateful streamed egress: hostile split across deltas must not leak via any adapter effect.
 
@@ -6355,7 +6993,11 @@ class TestStatefulStreamedEgress:
         assert self.OPAQUE_TOKEN not in payload, f"token leaked {payload!r}"
         assert self.OPAQUE_API_KEY not in payload, f"api_key leaked {payload!r}"
         assert self.OPAQUE_SIG not in payload, f"sig leaked {payload!r}"
-        assert self.DANGEROUS_PREFIX not in payload or "***" in payload or "[REDACTED]" in payload, f"dangerous prefix leaked {payload!r}"
+        assert (
+            self.DANGEROUS_PREFIX not in payload
+            or "***" in payload
+            or "[REDACTED]" in payload
+        ), f"dangerous prefix leaked {payload!r}"
 
     def _assert_masked(self, payload: str):
         assert "***" in payload or "[REDACTED]" in payload, f"expected mask {payload!r}"
@@ -6369,7 +7011,12 @@ class TestStatefulStreamedEgress:
         from gateway.run_turn_runner import TurnRunner
         from gateway.stream_consumer import StreamConsumerConfig
         from gateway.platforms.base import SendResult
-        from gateway.config import Platform, GatewayConfig, PlatformConfig, StreamingConfig
+        from gateway.config import (
+            Platform,
+            GatewayConfig,
+            PlatformConfig,
+            StreamingConfig,
+        )
 
         ledger: list[tuple[str, str]] = []
 
@@ -6377,35 +7024,80 @@ class TestStatefulStreamedEgress:
             async def send(self, chat_id, content, reply_to=None, metadata=None):
                 ledger.append(("send", content))
                 return SendResult(success=True, message_id="m1")
-            async def edit_message(self, chat_id, message_id, content, metadata=None, finalize=False):
+
+            async def edit_message(
+                self, chat_id, message_id, content, metadata=None, finalize=False
+            ):
                 ledger.append(("edit", content))
-                m = MagicMock(); m.success = True; m.message_id = message_id; return m
+                m = MagicMock()
+                m.success = True
+                m.message_id = message_id
+                return m
+
             async def send_typing(self, chat_id, metadata=None):
                 return None
+
             async def get_chat_info(self, chat_id):
                 return {"id": chat_id}
-            def supports_draft_streaming(self, **kw): return False
-            def supports_native_streaming(self, **kw): return False
+
+            def supports_draft_streaming(self, **kw):
+                return False
+
+            def supports_native_streaming(self, **kw):
+                return False
 
         cap = Cap()
         ctx = TurnContext(
             source=MagicMock(chat_id="C123", platform=Platform.SLACK),
             _run_still_current=lambda: True,
-            progress_mode="all", tool_progress_enabled=True, tool_progress_filter={},
-            progress_queue=queue.Queue(), log_queue=None,
-            last_progress_msg=[None], last_tool=[None], last_was_terminal_block=[False], repeat_count=[0], long_tool_hint_fired=[False],
-            agent_holder=[None], _native_slack_task_cards=False,
-            result_holder=[None], tools_holder=[None], stream_consumer_holder=[None], streaming_tts_consumer_holder=[None],
-            user_config={"display": {}}, resolve_display_setting=lambda cfg, plat, key: None,
-            event_message_id="evt-state-1", _status_thread_metadata={},
+            progress_mode="all",
+            tool_progress_enabled=True,
+            tool_progress_filter={},
+            progress_queue=queue.Queue(),
+            log_queue=None,
+            last_progress_msg=[None],
+            last_tool=[None],
+            last_was_terminal_block=[False],
+            repeat_count=[0],
+            long_tool_hint_fired=[False],
+            agent_holder=[None],
+            _native_slack_task_cards=False,
+            result_holder=[None],
+            tools_holder=[None],
+            stream_consumer_holder=[None],
+            streaming_tts_consumer_holder=[None],
+            user_config={"display": {}},
+            resolve_display_setting=lambda cfg, plat, key: None,
+            event_message_id="evt-state-1",
+            _status_thread_metadata={},
         )
+
         class Stub:
             def __init__(self):
-                self.config = GatewayConfig(platforms={Platform.SLACK: PlatformConfig(enabled=True, token="x")})
-                self.config.streaming = StreamingConfig(enabled=True, transport="edit", edit_interval=0.05, buffer_threshold=1)
-            def _adapter_for_source(self, s): return cap
-            def _build_stream_consumer_config(self, source, scfg, adapter, on_missing_cursor="raise"):
-                return StreamConsumerConfig(edit_interval=0.05, buffer_threshold=1, cursor="", transport="edit", chat_type="channel"), None
+                self.config = GatewayConfig(
+                    platforms={Platform.SLACK: PlatformConfig(enabled=True, token="x")}
+                )
+                self.config.streaming = StreamingConfig(
+                    enabled=True,
+                    transport="edit",
+                    edit_interval=0.05,
+                    buffer_threshold=1,
+                )
+
+            def _adapter_for_source(self, s):
+                return cap
+
+            def _build_stream_consumer_config(
+                self, source, scfg, adapter, on_missing_cursor="raise"
+            ):
+                return StreamConsumerConfig(
+                    edit_interval=0.05,
+                    buffer_threshold=1,
+                    cursor="",
+                    transport="edit",
+                    chat_type="channel",
+                ), None
+
         runner = TurnRunner(Stub(), ctx)
         sc, delta_cb, _, _ = runner._setup_stream_consumer("slack")
         assert sc is not None and delta_cb is not None
@@ -6427,19 +7119,32 @@ class TestStatefulStreamedEgress:
             self._assert_no_leak(content)
         # Finish with full hostile
         hostile_final = f"Final {self.RAW_URL_USERPASS} and {self.RAW_URL_QUERY}"
-        runner._finish_stream_consumer({"final_response": hostile_final, "failed": False, "interrupted": False, "completed": True}, [], sc)
+        runner._finish_stream_consumer(
+            {
+                "final_response": hostile_final,
+                "failed": False,
+                "interrupted": False,
+                "completed": True,
+            },
+            [],
+            sc,
+        )
         await asyncio.sleep(0.35)
         try:
             await asyncio.wait_for(task, timeout=1.5)
         except asyncio.TimeoutError:
             task.cancel()
-            try: await task
-            except: pass
+            try:
+                await task
+            except:
+                pass
         # All concrete effects must be masked and contain no raw
         assert len(ledger) >= 1, f"expected at least one adapter effect, got {ledger}"
         for kind, content in ledger:
             self._assert_no_leak(content)
-        assert any("***" in c or "[REDACTED]" in c for _, c in ledger), f"expected mask in {ledger!r}"
+        assert any("***" in c or "[REDACTED]" in c for _, c in ledger), (
+            f"expected mask in {ledger!r}"
+        )
         # Exact order: first send is masked userpass, final edit is masked combined
         # The ledger should show send then edit, both masked
         assert ledger[0][0] == "send", f"first effect should be send, got {ledger[0]}"
@@ -6455,30 +7160,93 @@ class TestStatefulStreamedEgress:
         from gateway.run_turn_runner import TurnRunner
         from gateway.stream_consumer import StreamConsumerConfig
         from gateway.platforms.base import SendResult
-        from gateway.config import Platform, GatewayConfig, PlatformConfig, StreamingConfig
+        from gateway.config import (
+            Platform,
+            GatewayConfig,
+            PlatformConfig,
+            StreamingConfig,
+        )
+
         ledger: list[tuple[str, str]] = []
+
         class Cap:
             async def send(self, chat_id, content, reply_to=None, metadata=None):
-                ledger.append(("send", content)); return SendResult(success=True, message_id="m2")
-            async def edit_message(self, chat_id, message_id, content, metadata=None, finalize=False):
-                ledger.append(("edit", content)); m=MagicMock(); m.success=True; m.message_id=message_id; return m
-            async def send_typing(self, chat_id, metadata=None): return None
-            async def get_chat_info(self, chat_id): return {"id": chat_id}
-            def supports_draft_streaming(self, **kw): return False
-            def supports_native_streaming(self, **kw): return False
+                ledger.append(("send", content))
+                return SendResult(success=True, message_id="m2")
+
+            async def edit_message(
+                self, chat_id, message_id, content, metadata=None, finalize=False
+            ):
+                ledger.append(("edit", content))
+                m = MagicMock()
+                m.success = True
+                m.message_id = message_id
+                return m
+
+            async def send_typing(self, chat_id, metadata=None):
+                return None
+
+            async def get_chat_info(self, chat_id):
+                return {"id": chat_id}
+
+            def supports_draft_streaming(self, **kw):
+                return False
+
+            def supports_native_streaming(self, **kw):
+                return False
+
         cap = Cap()
-        ctx = TurnContext(source=MagicMock(chat_id="C123", platform=Platform.SLACK), _run_still_current=lambda: True,
-            progress_mode="all", tool_progress_enabled=True, tool_progress_filter={},
-            progress_queue=queue.Queue(), log_queue=None, last_progress_msg=[None], last_tool=[None], last_was_terminal_block=[False], repeat_count=[0], long_tool_hint_fired=[False],
-            agent_holder=[None], _native_slack_task_cards=False, result_holder=[None], tools_holder=[None], stream_consumer_holder=[None], streaming_tts_consumer_holder=[None],
-            user_config={"display": {}}, resolve_display_setting=lambda cfg, plat, key: None, event_message_id="evt-benign", _status_thread_metadata={})
+        ctx = TurnContext(
+            source=MagicMock(chat_id="C123", platform=Platform.SLACK),
+            _run_still_current=lambda: True,
+            progress_mode="all",
+            tool_progress_enabled=True,
+            tool_progress_filter={},
+            progress_queue=queue.Queue(),
+            log_queue=None,
+            last_progress_msg=[None],
+            last_tool=[None],
+            last_was_terminal_block=[False],
+            repeat_count=[0],
+            long_tool_hint_fired=[False],
+            agent_holder=[None],
+            _native_slack_task_cards=False,
+            result_holder=[None],
+            tools_holder=[None],
+            stream_consumer_holder=[None],
+            streaming_tts_consumer_holder=[None],
+            user_config={"display": {}},
+            resolve_display_setting=lambda cfg, plat, key: None,
+            event_message_id="evt-benign",
+            _status_thread_metadata={},
+        )
+
         class Stub:
             def __init__(self):
-                self.config = GatewayConfig(platforms={Platform.SLACK: PlatformConfig(enabled=True, token="x")})
-                self.config.streaming = StreamingConfig(enabled=True, transport="edit", edit_interval=0.05, buffer_threshold=1)
-            def _adapter_for_source(self, s): return cap
-            def _build_stream_consumer_config(self, source, scfg, adapter, on_missing_cursor="raise"):
-                return StreamConsumerConfig(edit_interval=0.05, buffer_threshold=1, cursor="", transport="edit", chat_type="channel"), None
+                self.config = GatewayConfig(
+                    platforms={Platform.SLACK: PlatformConfig(enabled=True, token="x")}
+                )
+                self.config.streaming = StreamingConfig(
+                    enabled=True,
+                    transport="edit",
+                    edit_interval=0.05,
+                    buffer_threshold=1,
+                )
+
+            def _adapter_for_source(self, s):
+                return cap
+
+            def _build_stream_consumer_config(
+                self, source, scfg, adapter, on_missing_cursor="raise"
+            ):
+                return StreamConsumerConfig(
+                    edit_interval=0.05,
+                    buffer_threshold=1,
+                    cursor="",
+                    transport="edit",
+                    chat_type="channel",
+                ), None
+
         runner = TurnRunner(Stub(), ctx)
         sc, delta_cb, _, _ = runner._setup_stream_consumer("slack")
         task = asyncio.create_task(sc.run())
@@ -6488,15 +7256,29 @@ class TestStatefulStreamedEgress:
         await asyncio.sleep(0.15)
         delta_cb(benign[25:])
         await asyncio.sleep(0.15)
-        runner._finish_stream_consumer({"final_response": benign, "failed": False, "interrupted": False, "completed": True}, [], sc)
+        runner._finish_stream_consumer(
+            {
+                "final_response": benign,
+                "failed": False,
+                "interrupted": False,
+                "completed": True,
+            },
+            [],
+            sc,
+        )
         await asyncio.sleep(0.3)
-        try: await asyncio.wait_for(task, timeout=1.5)
+        try:
+            await asyncio.wait_for(task, timeout=1.5)
         except asyncio.TimeoutError:
             task.cancel()
-            try: await task
-            except: pass
+            try:
+                await task
+            except:
+                pass
         assert len(ledger) >= 1
-        assert any("example.com" in c for _, c in ledger), f"benign should survive {ledger!r}"
+        assert any("example.com" in c for _, c in ledger), (
+            f"benign should survive {ledger!r}"
+        )
         # Benign must not be masked
         for _, c in ledger:
             # No credential markers should appear for benign
@@ -6510,49 +7292,128 @@ class TestStatefulStreamedEgress:
         from gateway.run_turn_runner import TurnRunner
         from gateway.stream_consumer import StreamConsumerConfig
         from gateway.platforms.base import SendResult
-        from gateway.config import Platform, GatewayConfig, PlatformConfig, StreamingConfig
+        from gateway.config import (
+            Platform,
+            GatewayConfig,
+            PlatformConfig,
+            StreamingConfig,
+        )
+
         ledger: list[tuple[str, str]] = []
+
         class Cap:
             async def send(self, chat_id, content, reply_to=None, metadata=None):
-                ledger.append(("send", content)); return SendResult(success=True, message_id="m3")
-            async def edit_message(self, chat_id, message_id, content, metadata=None, finalize=False):
-                ledger.append(("edit", content)); m=MagicMock(); m.success=True; m.message_id=message_id; return m
-            async def send_typing(self, chat_id, metadata=None): return None
-            async def get_chat_info(self, chat_id): return {"id": chat_id}
-            def supports_draft_streaming(self, **kw): return False
-            def supports_native_streaming(self, **kw): return False
+                ledger.append(("send", content))
+                return SendResult(success=True, message_id="m3")
+
+            async def edit_message(
+                self, chat_id, message_id, content, metadata=None, finalize=False
+            ):
+                ledger.append(("edit", content))
+                m = MagicMock()
+                m.success = True
+                m.message_id = message_id
+                return m
+
+            async def send_typing(self, chat_id, metadata=None):
+                return None
+
+            async def get_chat_info(self, chat_id):
+                return {"id": chat_id}
+
+            def supports_draft_streaming(self, **kw):
+                return False
+
+            def supports_native_streaming(self, **kw):
+                return False
+
         cap = Cap()
-        ctx = TurnContext(source=MagicMock(chat_id="C123", platform=Platform.SLACK), _run_still_current=lambda: True,
-            progress_mode="all", tool_progress_enabled=True, tool_progress_filter={},
-            progress_queue=queue.Queue(), log_queue=None, last_progress_msg=[None], last_tool=[None], last_was_terminal_block=[False], repeat_count=[0], long_tool_hint_fired=[False],
-            agent_holder=[None], _native_slack_task_cards=False, result_holder=[None], tools_holder=[None], stream_consumer_holder=[None], streaming_tts_consumer_holder=[None],
-            user_config={"display": {}}, resolve_display_setting=lambda cfg, plat, key: None, event_message_id="evt-pfail", _status_thread_metadata={})
+        ctx = TurnContext(
+            source=MagicMock(chat_id="C123", platform=Platform.SLACK),
+            _run_still_current=lambda: True,
+            progress_mode="all",
+            tool_progress_enabled=True,
+            tool_progress_filter={},
+            progress_queue=queue.Queue(),
+            log_queue=None,
+            last_progress_msg=[None],
+            last_tool=[None],
+            last_was_terminal_block=[False],
+            repeat_count=[0],
+            long_tool_hint_fired=[False],
+            agent_holder=[None],
+            _native_slack_task_cards=False,
+            result_holder=[None],
+            tools_holder=[None],
+            stream_consumer_holder=[None],
+            streaming_tts_consumer_holder=[None],
+            user_config={"display": {}},
+            resolve_display_setting=lambda cfg, plat, key: None,
+            event_message_id="evt-pfail",
+            _status_thread_metadata={},
+        )
+
         class Stub:
             def __init__(self):
-                self.config = GatewayConfig(platforms={Platform.SLACK: PlatformConfig(enabled=True, token="x")})
-                self.config.streaming = StreamingConfig(enabled=True, transport="edit", edit_interval=0.05, buffer_threshold=1)
-            def _adapter_for_source(self, s): return cap
-            def _build_stream_consumer_config(self, source, scfg, adapter, on_missing_cursor="raise"):
-                return StreamConsumerConfig(edit_interval=0.05, buffer_threshold=1, cursor="", transport="edit", chat_type="channel"), None
+                self.config = GatewayConfig(
+                    platforms={Platform.SLACK: PlatformConfig(enabled=True, token="x")}
+                )
+                self.config.streaming = StreamingConfig(
+                    enabled=True,
+                    transport="edit",
+                    edit_interval=0.05,
+                    buffer_threshold=1,
+                )
+
+            def _adapter_for_source(self, s):
+                return cap
+
+            def _build_stream_consumer_config(
+                self, source, scfg, adapter, on_missing_cursor="raise"
+            ):
+                return StreamConsumerConfig(
+                    edit_interval=0.05,
+                    buffer_threshold=1,
+                    cursor="",
+                    transport="edit",
+                    chat_type="channel",
+                ), None
+
         runner = TurnRunner(Stub(), ctx)
         sc, delta_cb, _, _ = runner._setup_stream_consumer("slack")
         task = asyncio.create_task(sc.run())
         await asyncio.sleep(0.08)
         hostile = self.RAW_URL_USERPASS
-        part1 = hostile[:18]; part2 = hostile[18:]
-        with patch("agent.redact.redact_sensitive_text", side_effect=RuntimeError("primary boom")):
+        part1 = hostile[:18]
+        part2 = hostile[18:]
+        with patch(
+            "agent.redact.redact_sensitive_text",
+            side_effect=RuntimeError("primary boom"),
+        ):
             delta_cb(part1)
             await asyncio.sleep(0.15)
             delta_cb(part2)
             await asyncio.sleep(0.15)
             # finish also under primary failure
-            runner._finish_stream_consumer({"final_response": hostile, "failed": False, "interrupted": False, "completed": True}, [], sc)
+            runner._finish_stream_consumer(
+                {
+                    "final_response": hostile,
+                    "failed": False,
+                    "interrupted": False,
+                    "completed": True,
+                },
+                [],
+                sc,
+            )
             await asyncio.sleep(0.3)
-        try: await asyncio.wait_for(task, timeout=1.5)
+        try:
+            await asyncio.wait_for(task, timeout=1.5)
         except asyncio.TimeoutError:
             task.cancel()
-            try: await task
-            except: pass
+            try:
+                await task
+            except:
+                pass
         for _, c in ledger:
             self._assert_no_leak(c)
         assert any("***" in c or "[REDACTED]" in c for _, c in ledger)
@@ -6565,49 +7426,132 @@ class TestStatefulStreamedEgress:
         from gateway.run_turn_runner import TurnRunner
         from gateway.stream_consumer import StreamConsumerConfig
         from gateway.platforms.base import SendResult
-        from gateway.config import Platform, GatewayConfig, PlatformConfig, StreamingConfig
+        from gateway.config import (
+            Platform,
+            GatewayConfig,
+            PlatformConfig,
+            StreamingConfig,
+        )
+
         ledger: list[tuple[str, str]] = []
+
         class Cap:
             async def send(self, chat_id, content, reply_to=None, metadata=None):
-                ledger.append(("send", content)); return SendResult(success=True, message_id="m4")
-            async def edit_message(self, chat_id, message_id, content, metadata=None, finalize=False):
-                ledger.append(("edit", content)); m=MagicMock(); m.success=True; m.message_id=message_id; return m
-            async def send_typing(self, chat_id, metadata=None): return None
-            async def get_chat_info(self, chat_id): return {"id": chat_id}
-            def supports_draft_streaming(self, **kw): return False
-            def supports_native_streaming(self, **kw): return False
+                ledger.append(("send", content))
+                return SendResult(success=True, message_id="m4")
+
+            async def edit_message(
+                self, chat_id, message_id, content, metadata=None, finalize=False
+            ):
+                ledger.append(("edit", content))
+                m = MagicMock()
+                m.success = True
+                m.message_id = message_id
+                return m
+
+            async def send_typing(self, chat_id, metadata=None):
+                return None
+
+            async def get_chat_info(self, chat_id):
+                return {"id": chat_id}
+
+            def supports_draft_streaming(self, **kw):
+                return False
+
+            def supports_native_streaming(self, **kw):
+                return False
+
         cap = Cap()
-        ctx = TurnContext(source=MagicMock(chat_id="C123", platform=Platform.SLACK), _run_still_current=lambda: True,
-            progress_mode="all", tool_progress_enabled=True, tool_progress_filter={},
-            progress_queue=queue.Queue(), log_queue=None, last_progress_msg=[None], last_tool=[None], last_was_terminal_block=[False], repeat_count=[0], long_tool_hint_fired=[False],
-            agent_holder=[None], _native_slack_task_cards=False, result_holder=[None], tools_holder=[None], stream_consumer_holder=[None], streaming_tts_consumer_holder=[None],
-            user_config={"display": {}}, resolve_display_setting=lambda cfg, plat, key: None, event_message_id="evt-both", _status_thread_metadata={})
+        ctx = TurnContext(
+            source=MagicMock(chat_id="C123", platform=Platform.SLACK),
+            _run_still_current=lambda: True,
+            progress_mode="all",
+            tool_progress_enabled=True,
+            tool_progress_filter={},
+            progress_queue=queue.Queue(),
+            log_queue=None,
+            last_progress_msg=[None],
+            last_tool=[None],
+            last_was_terminal_block=[False],
+            repeat_count=[0],
+            long_tool_hint_fired=[False],
+            agent_holder=[None],
+            _native_slack_task_cards=False,
+            result_holder=[None],
+            tools_holder=[None],
+            stream_consumer_holder=[None],
+            streaming_tts_consumer_holder=[None],
+            user_config={"display": {}},
+            resolve_display_setting=lambda cfg, plat, key: None,
+            event_message_id="evt-both",
+            _status_thread_metadata={},
+        )
+
         class Stub:
             def __init__(self):
-                self.config = GatewayConfig(platforms={Platform.SLACK: PlatformConfig(enabled=True, token="x")})
-                self.config.streaming = StreamingConfig(enabled=True, transport="edit", edit_interval=0.05, buffer_threshold=1)
-            def _adapter_for_source(self, s): return cap
-            def _build_stream_consumer_config(self, source, scfg, adapter, on_missing_cursor="raise"):
-                return StreamConsumerConfig(edit_interval=0.05, buffer_threshold=1, cursor="", transport="edit", chat_type="channel"), None
+                self.config = GatewayConfig(
+                    platforms={Platform.SLACK: PlatformConfig(enabled=True, token="x")}
+                )
+                self.config.streaming = StreamingConfig(
+                    enabled=True,
+                    transport="edit",
+                    edit_interval=0.05,
+                    buffer_threshold=1,
+                )
+
+            def _adapter_for_source(self, s):
+                return cap
+
+            def _build_stream_consumer_config(
+                self, source, scfg, adapter, on_missing_cursor="raise"
+            ):
+                return StreamConsumerConfig(
+                    edit_interval=0.05,
+                    buffer_threshold=1,
+                    cursor="",
+                    transport="edit",
+                    chat_type="channel",
+                ), None
+
         runner = TurnRunner(Stub(), ctx)
         sc, delta_cb, _, _ = runner._setup_stream_consumer("slack")
         task = asyncio.create_task(sc.run())
         await asyncio.sleep(0.08)
         hostile = self.RAW_URL_USERPASS + " plus " + self.RAW_URL_QUERY
         # Split hostile across deltas
-        with patch("agent.redact.redact_sensitive_text", side_effect=RuntimeError("primary boom")), \
-             patch("gateway.run._redact_gateway_user_facing_secrets", side_effect=RuntimeError("gateway boom")):
+        with (
+            patch(
+                "agent.redact.redact_sensitive_text",
+                side_effect=RuntimeError("primary boom"),
+            ),
+            patch(
+                "gateway.run._redact_gateway_user_facing_secrets",
+                side_effect=RuntimeError("gateway boom"),
+            ),
+        ):
             delta_cb(hostile[:30])
             await asyncio.sleep(0.15)
             delta_cb(hostile[30:])
             await asyncio.sleep(0.15)
-            runner._finish_stream_consumer({"final_response": hostile, "failed": False, "interrupted": False, "completed": True}, [], sc)
+            runner._finish_stream_consumer(
+                {
+                    "final_response": hostile,
+                    "failed": False,
+                    "interrupted": False,
+                    "completed": True,
+                },
+                [],
+                sc,
+            )
             await asyncio.sleep(0.3)
-        try: await asyncio.wait_for(task, timeout=1.5)
+        try:
+            await asyncio.wait_for(task, timeout=1.5)
         except asyncio.TimeoutError:
             task.cancel()
-            try: await task
-            except: pass
+            try:
+                await task
+            except:
+                pass
         # Every effect must be exact [REDACTED] or at least not contain raw and be safe
         assert len(ledger) >= 1
         for _, c in ledger:
@@ -6616,7 +7560,9 @@ class TestStatefulStreamedEgress:
             assert self.LONG_OPAQUE not in c
             assert self.OPAQUE_TOKEN not in c
             # For both-layer, at least one effect should be exact [REDACTED]
-        assert any(c == "[REDACTED]" for _, c in ledger), f"both-layer should be exact [REDACTED] {ledger!r}"
+        assert any(c == "[REDACTED]" for _, c in ledger), (
+            f"both-layer should be exact [REDACTED] {ledger!r}"
+        )
 
     @pytest.mark.asyncio
     async def test_stateful_retry_fallback_and_no_duplicate(self):
@@ -6627,37 +7573,104 @@ class TestStatefulStreamedEgress:
         from gateway.run_turn_runner import TurnRunner
         from gateway.stream_consumer import StreamConsumerConfig
         from gateway.platforms.base import SendResult
-        from gateway.config import Platform, GatewayConfig, PlatformConfig, StreamingConfig
-        send_ledger: list[str] = []; edit_ledger: list[str] = []
+        from gateway.config import (
+            Platform,
+            GatewayConfig,
+            PlatformConfig,
+            StreamingConfig,
+        )
+
+        send_ledger: list[str] = []
+        edit_ledger: list[str] = []
+
         class CapRetry:
             def __init__(self):
                 self.edit_calls = 0
+
             async def send(self, chat_id, content, reply_to=None, metadata=None):
-                send_ledger.append(content); return SendResult(success=True, message_id="fallback-1")
-            async def edit_message(self, chat_id, message_id, content, metadata=None, finalize=False):
+                send_ledger.append(content)
+                return SendResult(success=True, message_id="fallback-1")
+
+            async def edit_message(
+                self, chat_id, message_id, content, metadata=None, finalize=False
+            ):
                 self.edit_calls += 1
                 edit_ledger.append(content)
                 # First edit fails, second succeeds (retry)
                 if self.edit_calls == 1:
-                    m = MagicMock(); m.success = False; m.error = "flood"; return m
-                m = MagicMock(); m.success = True; m.message_id = message_id; return m
-            async def send_typing(self, chat_id, metadata=None): return None
-            async def get_chat_info(self, chat_id): return {"id": chat_id}
-            def supports_draft_streaming(self, **kw): return False
-            def supports_native_streaming(self, **kw): return False
+                    m = MagicMock()
+                    m.success = False
+                    m.error = "flood"
+                    return m
+                m = MagicMock()
+                m.success = True
+                m.message_id = message_id
+                return m
+
+            async def send_typing(self, chat_id, metadata=None):
+                return None
+
+            async def get_chat_info(self, chat_id):
+                return {"id": chat_id}
+
+            def supports_draft_streaming(self, **kw):
+                return False
+
+            def supports_native_streaming(self, **kw):
+                return False
+
         cap = CapRetry()
-        ctx = TurnContext(source=MagicMock(chat_id="C123", platform=Platform.SLACK), _run_still_current=lambda: True,
-            progress_mode="all", tool_progress_enabled=True, tool_progress_filter={},
-            progress_queue=queue.Queue(), log_queue=None, last_progress_msg=[None], last_tool=[None], last_was_terminal_block=[False], repeat_count=[0], long_tool_hint_fired=[False],
-            agent_holder=[None], _native_slack_task_cards=False, result_holder=[None], tools_holder=[None], stream_consumer_holder=[None], streaming_tts_consumer_holder=[None],
-            user_config={"display": {}}, resolve_display_setting=lambda cfg, plat, key: None, event_message_id="evt-retry", _status_thread_metadata={})
+        ctx = TurnContext(
+            source=MagicMock(chat_id="C123", platform=Platform.SLACK),
+            _run_still_current=lambda: True,
+            progress_mode="all",
+            tool_progress_enabled=True,
+            tool_progress_filter={},
+            progress_queue=queue.Queue(),
+            log_queue=None,
+            last_progress_msg=[None],
+            last_tool=[None],
+            last_was_terminal_block=[False],
+            repeat_count=[0],
+            long_tool_hint_fired=[False],
+            agent_holder=[None],
+            _native_slack_task_cards=False,
+            result_holder=[None],
+            tools_holder=[None],
+            stream_consumer_holder=[None],
+            streaming_tts_consumer_holder=[None],
+            user_config={"display": {}},
+            resolve_display_setting=lambda cfg, plat, key: None,
+            event_message_id="evt-retry",
+            _status_thread_metadata={},
+        )
+
         class Stub:
             def __init__(self):
-                self.config = GatewayConfig(platforms={Platform.SLACK: PlatformConfig(enabled=True, token="x")})
-                self.config.streaming = StreamingConfig(enabled=True, transport="edit", edit_interval=0.05, buffer_threshold=1)
-            def _adapter_for_source(self, s): return cap
-            def _build_stream_consumer_config(self, source, scfg, adapter, on_missing_cursor="raise"):
-                return StreamConsumerConfig(edit_interval=0.05, buffer_threshold=1, cursor="", transport="edit", chat_type="channel"), None
+                self.config = GatewayConfig(
+                    platforms={Platform.SLACK: PlatformConfig(enabled=True, token="x")}
+                )
+                self.config.streaming = StreamingConfig(
+                    enabled=True,
+                    transport="edit",
+                    edit_interval=0.05,
+                    buffer_threshold=1,
+                )
+
+            def _adapter_for_source(self, s):
+                return cap
+
+            def _build_stream_consumer_config(
+                self, source, scfg, adapter, on_missing_cursor="raise"
+            ):
+                return StreamConsumerConfig(
+                    edit_interval=0.05,
+                    buffer_threshold=1,
+                    cursor="",
+                    transport="edit",
+                    chat_type="channel",
+                ), None
+
         runner = TurnRunner(Stub(), ctx)
         sc, delta_cb, _, _ = runner._setup_stream_consumer("slack")
         task = asyncio.create_task(sc.run())
@@ -6668,19 +7681,35 @@ class TestStatefulStreamedEgress:
         delta_cb(hostile[20:])
         await asyncio.sleep(0.12)
         # Finish will trigger edit that first fails then fallback
-        runner._finish_stream_consumer({"final_response": hostile, "failed": False, "interrupted": False, "completed": True}, [], sc)
+        runner._finish_stream_consumer(
+            {
+                "final_response": hostile,
+                "failed": False,
+                "interrupted": False,
+                "completed": True,
+            },
+            [],
+            sc,
+        )
         await asyncio.sleep(0.4)
-        try: await asyncio.wait_for(task, timeout=1.5)
+        try:
+            await asyncio.wait_for(task, timeout=1.5)
         except asyncio.TimeoutError:
             task.cancel()
-            try: await task
-            except: pass
+            try:
+                await task
+            except:
+                pass
         # Both edit and send must be masked
-        for c in edit_ledger: self._assert_no_leak(c)
-        for c in send_ledger: self._assert_no_leak(c)
+        for c in edit_ledger:
+            self._assert_no_leak(c)
+        for c in send_ledger:
+            self._assert_no_leak(c)
         # At least one masked
         assert any("***" in c or "[REDACTED]" in c for c in edit_ledger + send_ledger)
         # No duplicate: the final send should have happened, but not duplicated with same content twice
         # Check that send_ledger does not contain duplicate raw
         # And that ledger sizes are bounded
-        assert len(send_ledger) <= 2 and len(edit_ledger) <= 2, f"unexpected duplicate {send_ledger!r} {edit_ledger!r}"
+        assert len(send_ledger) <= 2 and len(edit_ledger) <= 2, (
+            f"unexpected duplicate {send_ledger!r} {edit_ledger!r}"
+        )
