@@ -6170,7 +6170,6 @@ class TestStreamedFinalEditEgress:
         import asyncio, os
 
         hostile_reasoning = f"Reasoning with {self.RAW_URL_USERPASS} and {self.RAW_URL_QUERY}"
-        hostile_footer_host = "ex.com"  # benign part of footer should survive if not hostile
         benign_final = "Benign final answer."
         # Combined hostile via reasoning
         edit_ledger: list[str] = []
