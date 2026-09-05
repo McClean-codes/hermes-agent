@@ -231,11 +231,19 @@ class DynamicReactionMixin:
         key = self._reaction_msg_key(event)
         if key is None:
             return
+        # Confirmed-start predicate: no active session must not create authority
+        # via a raw MessageEvent or raw-cache fallback. A failed/disabled/
+        # missing-capability start leaves active/msg_refs empty.
+        if key not in self._rxn_active:
+            return
 
         async with self._rxn_lock(key):
+            if key not in self._rxn_active:
+                return
             msg_ref = self._rxn_msg_refs.get(key)
             if msg_ref is None:
-                # Try resolving from event directly (fallback)
+                # Fallback only when a confirmed start exists (active present);
+                # source-only callbacks (TurnRunner) still resolve via adapter cache.
                 msg_ref = self._reaction_resolve_message(event)
                 if msg_ref is None:
                     return
@@ -288,8 +296,14 @@ class DynamicReactionMixin:
         key = self._reaction_msg_key(event)
         if key is None:
             return
+        # Confirmed-start predicate: no active session must not authorize a
+        # final reaction. Raw MessageEvent or raw-cache alone is not authority.
+        if key not in self._rxn_active:
+            return
 
         async with self._rxn_lock(key):
+            if key not in self._rxn_active:
+                return
             msg_ref = self._rxn_msg_refs.pop(key, None)
             if msg_ref is None:
                 msg_ref = self._reaction_resolve_message(event)

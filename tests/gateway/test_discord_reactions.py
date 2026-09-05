@@ -777,3 +777,146 @@ async def test_on_processing_start_confirmed_add_records_ack_true(adapter):
     assert adapter._rxn_msg_refs.get(key) is raw
     assert ack_record.call_count == 1
     assert ack_record.call_args.kwargs["emoji_ack"] is True
+
+
+@pytest.mark.asyncio
+async def test_failed_start_false_blocks_tool_and_complete_with_recovered_provider(adapter):
+    """Provider False on start must block later tool and completion even after provider recovers."""
+    adapter.config.extra["persona_emoji"] = "🤖"
+    adapter.config.extra["dynamic_reactions"] = True
+    adapter.config.extra["reaction_cooldown"] = 0
+    adapter._rxn_persona_emoji = "🤖"
+    adapter._rxn_dynamic = True
+    adapter._rxn_cooldown = 0.0
+    raw = LedgerMessage(msg_id=9101)
+    event = _make_event("9101", raw)
+    source = event.source
+    key = adapter._reaction_msg_key(event)
+
+    # Fail the initial start at the provider boundary only
+    orig_add = adapter._reaction_add
+    adapter._reaction_add = AsyncMock(return_value=False)
+    ack_start = MagicMock()
+    adapter._record_discord_processing_start = ack_start
+
+    await adapter.on_processing_start(event)
+
+    assert raw.ledger() == []
+    assert key not in adapter._rxn_active
+    assert key not in adapter._rxn_msg_refs
+    assert key not in adapter._session_raw_messages
+    assert ack_start.call_count == 1
+    assert ack_start.call_args.kwargs["emoji_ack"] is False
+
+    # Recover provider boundary to success (real ledger-backed add)
+    adapter._reaction_add = orig_add
+    # Ensure dynamic still enabled and cooldown 0
+    adapter._rxn_cooldown = 0.0
+
+    # Later source-only tool callback must remain no-op despite recovered provider
+    with patch("agent.display.get_tool_emoji", return_value="⚙️"):
+        await adapter.on_tool_call_start(source, "read_file")
+
+    assert raw.ledger() == []
+    assert key not in adapter._rxn_active
+    assert key not in adapter._rxn_msg_refs
+    assert key not in adapter._session_raw_messages
+    # durable ACK must still be false (no new start recorded)
+    assert ack_start.call_args.kwargs["emoji_ack"] is False
+
+    # Later completion callback must also remain no-op (no final emoji, no untracked add)
+    complete_ack = MagicMock()
+    adapter._record_discord_processing_complete = complete_ack
+    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+    assert raw.ledger() == []
+    assert key not in adapter._rxn_active
+    assert key not in adapter._rxn_msg_refs
+    assert key not in adapter._session_raw_messages
+    assert raw.effective() == set()
+
+    # Control: confirmed start still permits tool and terminal ledger behavior
+    raw2 = LedgerMessage(msg_id=9102)
+    event2 = _make_event("9102", raw2)
+    source2 = event2.source
+    key2 = adapter._reaction_msg_key(event2)
+    ack2 = MagicMock()
+    adapter._record_discord_processing_start = ack2
+    await adapter.on_processing_start(event2)
+    assert raw2.ledger() == [("add", "🤖")]
+    assert ack2.call_args.kwargs["emoji_ack"] is True
+    assert key2 in adapter._rxn_active
+    assert key2 in adapter._session_raw_messages
+    with patch("agent.display.get_tool_emoji", return_value="📄"):
+        await adapter.on_tool_call_start(source2, "read_file")
+    assert ("add", "📄") in raw2.ledger()
+    assert adapter._rxn_active.get(key2) == "📄"
+    await adapter.on_processing_complete(event2, ProcessingOutcome.SUCCESS)
+    # terminal should have restored persona and removed tool
+    assert raw2.effective() == {"🤖"}
+    assert key2 not in adapter._rxn_active
+    assert key2 not in adapter._session_raw_messages
+
+
+@pytest.mark.asyncio
+async def test_failed_start_exception_blocks_tool_and_complete_with_recovered_provider(adapter):
+    """Provider exception on start must block later tool and completion even after provider recovers."""
+    adapter.config.extra["persona_emoji"] = "🤖"
+    adapter.config.extra["dynamic_reactions"] = True
+    adapter.config.extra["reaction_cooldown"] = 0
+    adapter._rxn_persona_emoji = "🤖"
+    adapter._rxn_dynamic = True
+    adapter._rxn_cooldown = 0.0
+    raw = LedgerMessage(msg_id=9201)
+    event = _make_event("9201", raw)
+    source = event.source
+    key = adapter._reaction_msg_key(event)
+
+    orig_add = adapter._reaction_add
+    adapter._reaction_add = AsyncMock(side_effect=RuntimeError("boom"))
+    ack_start = MagicMock()
+    adapter._record_discord_processing_start = ack_start
+
+    await adapter.on_processing_start(event)
+
+    assert raw.ledger() == []
+    assert key not in adapter._rxn_active
+    assert key not in adapter._rxn_msg_refs
+    assert key not in adapter._session_raw_messages
+    assert ack_start.call_count == 1
+    assert ack_start.call_args.kwargs["emoji_ack"] is False
+
+    adapter._reaction_add = orig_add
+    adapter._rxn_cooldown = 0.0
+
+    with patch("agent.display.get_tool_emoji", return_value="⚙️"):
+        await adapter.on_tool_call_start(source, "read_file")
+
+    assert raw.ledger() == []
+    assert key not in adapter._rxn_active
+    assert key not in adapter._rxn_msg_refs
+    assert key not in adapter._session_raw_messages
+
+    complete_ack = MagicMock()
+    adapter._record_discord_processing_complete = complete_ack
+    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+    assert raw.ledger() == []
+    assert key not in adapter._rxn_active
+    assert key not in adapter._rxn_msg_refs
+    assert key not in adapter._session_raw_messages
+    assert raw.effective() == set()
+
+    # Control: confirmed start still permits existing ledger behavior
+    raw2 = LedgerMessage(msg_id=9202)
+    event2 = _make_event("9202", raw2)
+    ack2 = MagicMock()
+    adapter._record_discord_processing_start = ack2
+    await adapter.on_processing_start(event2)
+    assert raw2.ledger() == [("add", "🤖")]
+    assert ack2.call_args.kwargs["emoji_ack"] is True
+    with patch("agent.display.get_tool_emoji", return_value="📄"):
+        await adapter.on_tool_call_start(event2.source, "read_file")
+    assert ("add", "📄") in raw2.ledger()
+    await adapter.on_processing_complete(event2, ProcessingOutcome.FAILURE)
+    assert raw2.effective() == {"❌"}

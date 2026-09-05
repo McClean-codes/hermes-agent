@@ -2784,9 +2784,13 @@ class DiscordAdapter(DynamicReactionMixin, BasePlatformAdapter):
         source = getattr(event, "source", event)
         key = self._session_key_from_source(source)
         raw = getattr(event, "raw_message", None)
-        if raw:
-            self._session_raw_messages[key] = raw
         confirmed = await self._rxn_on_processing_start(event)
+        # Only cache raw after confirmed success; failed/disabled/exception
+        # must leave no raw-cache authority for later tool/complete fallbacks.
+        if confirmed and raw:
+            self._session_raw_messages[key] = raw
+        else:
+            self._session_raw_messages.pop(key, None)
         await asyncio.to_thread(
             self._record_discord_processing_start,
             event,
