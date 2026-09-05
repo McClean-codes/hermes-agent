@@ -3547,20 +3547,38 @@ class TestRedactorFailClosed:
             for q in log_queued:
                 s = str(q)
                 assert raw_url not in s and opaque not in s
-            # Adapter final egress with raw injection while primary fails
+            # Adapter final egress with raw injection while primary fails – via production drain
             ledger.clear()
-            # Direct send with raw while primary is failing – should still be placeholder/masked
-            # Need to run with patch still active
+            # Raw queue injection -> actual progress drain (send_progress_messages) -> adapter ledger while primary raises
+            # No direct _send_progress_text / _progress_edit_state – sole proof is via drain
             import asyncio
 
-            async def _run_send():
-                await runner._send_progress_text(
-                    runner._progress_edit_state(cap), raw_url
-                )
+            ctx.progress_queue.put(raw_url)
+            ctx.progress_queue.put(f"raw-injected {raw_url}")
 
-            asyncio.run(_run_send())
+            async def _run_drain():
+                task = asyncio.create_task(runner.send_progress_messages())
+                await asyncio.sleep(0.7)
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+            asyncio.run(_run_drain())
+            assert len(ledger) >= 1, (
+                f"expected at least one send via drain, got {ledger!r}"
+            )
             for c in ledger:
-                assert raw_url not in c and opaque not in c
+                assert raw_url not in c, (
+                    f"raw URL leaked via drain while primary failing: {c!r}"
+                )
+                assert opaque not in c, (
+                    f"opaque leaked via drain while primary failing: {c!r}"
+                )
+                assert c == "[REDACTED]" or "***" in c or "redacted" in c.lower(), (
+                    f"fallback must be placeholder/masked: {c!r}"
+                )
         # Both layers fail – should be placeholder
         with (
             patch(
