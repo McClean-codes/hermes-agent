@@ -504,11 +504,19 @@ class TurnRunner:
                 raw_error = kwargs.get("summary") or preview
                 # Redact untrusted values before formatting so truncation (60/200 cap) sees redacted text
                 try:
-                    redacted_goal = _strict_notice_redact(raw_goal) if raw_goal is not None else raw_goal
+                    redacted_goal = (
+                        _strict_notice_redact(raw_goal)
+                        if raw_goal is not None
+                        else raw_goal
+                    )
                 except Exception:
                     redacted_goal = "[REDACTED]"
                 try:
-                    redacted_error = _strict_notice_redact(raw_error) if raw_error is not None else ""
+                    redacted_error = (
+                        _strict_notice_redact(raw_error)
+                        if raw_error is not None
+                        else ""
+                    )
                 except Exception:
                     redacted_error = "[REDACTED]"
 
