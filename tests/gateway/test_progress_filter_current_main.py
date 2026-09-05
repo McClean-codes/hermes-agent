@@ -909,6 +909,9 @@ class TestImportantOutputDelivery:
             async def get_chat_info(self, chat_id):
                 return {"id": chat_id}
 
+            def native_task_cards_enabled(self) -> bool:
+                return True
+
             async def send_native_task_card_progress(
                 self,
                 chat_id,
@@ -2774,7 +2777,7 @@ class TestUrlOpaqueCredentialViaProductionSeams:
             }
             ctx.progress_queue.put(raw_dict)
             # Drain via production native path (run for short window) – proves initial publish via drain
-            task = asyncio.create_task(runner._send_native_task_card_progress(adapter))
+            task = asyncio.create_task(runner.send_progress_messages())
             await asyncio.sleep(0.6)
             task.cancel()
             try:
@@ -2823,9 +2826,7 @@ class TestUrlOpaqueCredentialViaProductionSeams:
             runner2.native_tool_start_callback(
                 "cid-ns", "terminal", {"command": f"curl {self.NON_SECRET_URL}"}
             )
-            task2 = asyncio.create_task(
-                runner2._send_native_task_card_progress(adapter)
-            )
+            task2 = asyncio.create_task(runner2.send_progress_messages())
             await asyncio.sleep(0.5)
             task2.cancel()
             try:
@@ -2871,11 +2872,10 @@ class TestUrlOpaqueCredentialViaProductionSeams:
             payload = str(msgs[0])
             # Raw long URL must be absent, and no partial fragment of opaque should appear
             assert raw_url not in payload
-            # Check no prefix of opaque (>8 chars) leaks via truncation
-            assert opaque[:8] not in payload or "***" in payload, (
-                f"partial long opaque leaked: {payload!r}"
-            )
             assert opaque not in payload
+            # Strict partial-prefix: dangerous prefix must be absent (no mask-plus-leak allowance)
+            assert opaque[:8] not in payload, f"partial long opaque leaked: {payload!r}"
+            assert "***" in payload or "[REDACTED]" in payload, f"expected mask in {payload!r}"
             # Also test native long preview
             ctx2 = _make_ctx(
                 progress_mode="off",
@@ -2893,9 +2893,9 @@ class TestUrlOpaqueCredentialViaProductionSeams:
             payload2 = str(msgs2[0].get("preview", ""))
             assert raw_url not in payload2
             assert opaque not in payload2
-            # Ensure truncated preview still contains mask, not partial secret
-            if len(payload2) > 0:
-                assert opaque[:8] not in payload2 or "***" in payload2
+            # Strict: no dangerous prefix leak even when truncated, and mask must be present
+            assert opaque[:8] not in payload2, f"partial prefix leaked in native preview: {payload2!r}"
+            assert "***" in payload2 or "[REDACTED]" in payload2, f"expected mask in native {payload2!r}"
 
     @pytest.mark.asyncio
     async def test_thinking_and_log_queue_redact_raw_opaque_before_persistence_and_send(
@@ -2952,8 +2952,10 @@ class TestUrlOpaqueCredentialViaProductionSeams:
         think_msgs = _drain(ctx_think.progress_queue)
         assert len(think_msgs) == 2
         for payload in [str(m) for m in think_msgs]:
-            assert raw_url not in payload or long_raw not in payload
-            assert opaque not in payload and long_opaque not in payload
+            assert raw_url not in payload, f"raw URL leaked in thinking: {payload!r}"
+            assert long_raw not in payload, f"long raw leaked in thinking: {payload!r}"
+            assert opaque not in payload, f"opaque leaked in thinking: {payload!r}"
+            assert long_opaque not in payload, f"long opaque leaked in thinking: {payload!r}"
             assert "***" in payload or "[REDACTED]" in payload
         # Now test that even injected raw thinking queue content is redacted at final egress via production drain
         ledger: list[str] = []
@@ -3062,8 +3064,10 @@ class TestUrlOpaqueCredentialViaProductionSeams:
         assert len(log_items) >= 2 or len(log_items) == 2
         for item in log_items:
             s = str(item)
-            assert raw_url not in s or long_raw not in s
-            assert opaque not in s and long_opaque not in s
+            assert raw_url not in s, f"raw URL leaked in log: {s!r}"
+            assert long_raw not in s, f"long raw leaked in log: {s!r}"
+            assert opaque not in s, f"opaque leaked in log: {s!r}"
+            assert long_opaque not in s, f"long opaque leaked in log: {s!r}"
 
     @pytest.mark.asyncio
     async def test_injected_raw_queue_redacts_at_final_egress_via_production_seams(
@@ -3696,6 +3700,9 @@ class TestNativeEnabledErrorDelivery:
             async def get_chat_info(self, chat_id):
                 return {"id": chat_id}
 
+            def native_task_cards_enabled(self) -> bool:
+                return True
+
             async def send_native_task_card_progress(
                 self,
                 chat_id,
@@ -3993,6 +4000,442 @@ class TestNativeEnabledErrorDelivery:
                 os.environ["SLACK_HOME_CHANNEL"] = _orig_home
 
 
+
+class TestNativePublicRawLongUserinfoRegression:
+    """SEC-PF-006 regression: public native queue -> send_progress_messages -> enabled native ledger must not leak long opaque userinfo prefix.
+
+    This test uses raw queue injection and the public send_progress_messages drain with native cards enabled,
+    asserting strict absence of full URL, credential, and dangerous prefix under normal, primary-failure,
+    and both-layer-failure conditions. It is designed to fail under a disposable mutation that restores
+    truncate-before-redact in _TaskCardState._compact, proving the fix is load-bearing.
+    """
+
+    LONG_OPAQUE = "longOpaqueUserInfo1234567890ABCDEFExtraLongTail1234567890"
+    RAW_URL_BARE = f"https://{LONG_OPAQUE}@ex.com/p"
+    RAW_URL_USERPASS = f"https://alice:{LONG_OPAQUE}@ex.com/p"
+    DANGEROUS_PREFIX = LONG_OPAQUE[:8]
+
+    @pytest.mark.asyncio
+    async def test_public_native_raw_long_userinfo_strict_via_queue_to_ledger(self):
+        from gateway.turn_context import TurnContext
+        from gateway.run_turn_runner import TurnRunner
+        import asyncio
+
+        raw_url = self.RAW_URL_BARE
+        opaque = self.LONG_OPAQUE
+        prefix = self.DANGEROUS_PREFIX
+
+        ledger_tasks: list = []
+        fallback_ledger: list[str] = []
+
+        class _NativeAdapter:
+            def __init__(self):
+                self.name = "native-regress"
+
+            async def send_native_task_card_progress(self, chat_id, tasks, title, reply_to=None, metadata=None, fallback_text=None):
+                ledger_tasks.append(list(tasks))
+                if fallback_text:
+                    fallback_ledger.append(fallback_text)
+                m = MagicMock()
+                m.success = True
+                m.message_id = "native-1"
+                return m
+
+            async def send(self, chat_id, content, reply_to=None, metadata=None):
+                fallback_ledger.append(content)
+                m = MagicMock()
+                m.success = True
+                m.message_id = "mid-fb"
+                return m
+
+            async def edit_message(self, chat_id, message_id, content, metadata=None, finalize=False):
+                fallback_ledger.append(content)
+                m = MagicMock()
+                m.success = True
+                return m
+
+            async def stop_native_task_card_progress(self, chat_id, reply_to=None, metadata=None):
+                return None
+
+        adapter = _NativeAdapter()
+        ctx = TurnContext(
+            source=MagicMock(chat_id="test-native-regress"),
+            _run_still_current=lambda: True,
+            _live_status_adapter=None,
+            _live_status_mode="off",
+            _thinking_enabled=False,
+            progress_mode="all",
+            progress_grouping="accumulate",
+            tool_progress_enabled=True,
+            tool_progress_filter={"terminal": "all"},
+            progress_queue=queue.Queue(),
+            log_queue=None,
+            last_progress_msg=[None],
+            last_tool=[None],
+            last_was_terminal_block=[False],
+            repeat_count=[0],
+            long_tool_hint_fired=[False],
+            agent_holder=[None],
+            _native_slack_task_cards=True,
+        )
+
+        class _Stub:
+            def _adapter_for_source(self, s):
+                return adapter
+
+            async def _deliver_platform_notice(self, src, content):
+                return None
+
+        runner = TurnRunner(_Stub(), ctx)  # type: ignore[arg-type]
+
+        raw_dict = {
+            "type": "tool.started",
+            "tool_call_id": "cid-raw-long",
+            "tool_name": "terminal",
+            "preview": raw_url,
+        }
+        ctx.progress_queue.put(raw_dict)
+
+        raw_dict2 = {
+            "type": "tool.started",
+            "tool_call_id": "cid-raw-long2",
+            "tool_name": "terminal",
+            "preview": self.RAW_URL_USERPASS,
+        }
+        ctx.progress_queue.put(raw_dict2)
+
+        task = asyncio.create_task(runner.send_progress_messages())
+        await asyncio.sleep(0.7)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        for tasks in ledger_tasks:
+            for t in tasks:
+                title = t.get("title", "")
+                assert raw_url not in title, f"raw bare URL leaked in native title: {title!r}"
+                assert self.RAW_URL_USERPASS not in title, f"raw userpass URL leaked: {title!r}"
+                assert opaque not in title, f"opaque credential leaked in title: {title!r}"
+                assert prefix not in title, f"dangerous prefix leaked in title: {title!r}"
+                assert "***" in title or "[REDACTED]" in title or "redacted" in title.lower(), f"expected mask in {title!r}"
+        for fb in fallback_ledger:
+            assert raw_url not in fb, f"raw bare URL in fallback: {fb!r}"
+            assert self.RAW_URL_USERPASS not in fb, f"raw userpass in fallback: {fb!r}"
+            assert opaque not in fb, f"opaque in fallback: {fb!r}"
+            assert prefix not in fb, f"prefix in fallback: {fb!r}"
+
+        ledger_tasks.clear()
+        fallback_ledger.clear()
+        ctx2 = TurnContext(
+            source=MagicMock(chat_id="test-native-regress2"),
+            _run_still_current=lambda: True,
+            _live_status_adapter=None,
+            _live_status_mode="off",
+            _thinking_enabled=False,
+            progress_mode="all",
+            progress_grouping="accumulate",
+            tool_progress_enabled=True,
+            tool_progress_filter={"terminal": "all"},
+            progress_queue=queue.Queue(),
+            log_queue=None,
+            last_progress_msg=[None],
+            last_tool=[None],
+            last_was_terminal_block=[False],
+            repeat_count=[0],
+            long_tool_hint_fired=[False],
+            agent_holder=[None],
+            _native_slack_task_cards=True,
+        )
+        runner2 = TurnRunner(_Stub(), ctx2)  # type: ignore[arg-type]
+        runner2._runner._adapter_for_source = lambda s: adapter  # type: ignore[attr-defined]
+        ctx2.progress_queue.put(raw_dict)
+
+        from unittest.mock import patch
+
+        with patch("agent.redact.redact_sensitive_text", side_effect=RuntimeError("primary boom")):
+            task2 = asyncio.create_task(runner2.send_progress_messages())
+            await asyncio.sleep(0.6)
+            task2.cancel()
+            try:
+                await task2
+            except asyncio.CancelledError:
+                pass
+
+        for tasks in ledger_tasks:
+            for t in tasks:
+                title = t.get("title", "")
+                assert raw_url not in title
+                assert opaque not in title
+                assert prefix not in title
+        for fb in fallback_ledger:
+            assert raw_url not in fb
+            assert opaque not in fb
+            assert prefix not in fb
+
+        ledger_tasks.clear()
+        fallback_ledger.clear()
+        ctx3 = TurnContext(
+            source=MagicMock(chat_id="test-native-regress3"),
+            _run_still_current=lambda: True,
+            _live_status_adapter=None,
+            _live_status_mode="off",
+            _thinking_enabled=False,
+            progress_mode="all",
+            progress_grouping="accumulate",
+            tool_progress_enabled=True,
+            tool_progress_filter={"terminal": "all"},
+            progress_queue=queue.Queue(),
+            log_queue=None,
+            last_progress_msg=[None],
+            last_tool=[None],
+            last_was_terminal_block=[False],
+            repeat_count=[0],
+            long_tool_hint_fired=[False],
+            agent_holder=[None],
+            _native_slack_task_cards=True,
+        )
+        runner3 = TurnRunner(_Stub(), ctx3)  # type: ignore[arg-type]
+        runner3._runner._adapter_for_source = lambda s: adapter  # type: ignore[attr-defined]
+        ctx3.progress_queue.put(raw_dict)
+        with (
+            patch("agent.redact.redact_sensitive_text", side_effect=RuntimeError("primary boom")),
+            patch("gateway.run._redact_gateway_user_facing_secrets", side_effect=RuntimeError("gateway boom")),
+        ):
+            task3 = asyncio.create_task(runner3.send_progress_messages())
+            await asyncio.sleep(0.6)
+            task3.cancel()
+            try:
+                await task3
+            except asyncio.CancelledError:
+                pass
+        for tasks in ledger_tasks:
+            for t in tasks:
+                title = t.get("title", "")
+                assert raw_url not in title
+                assert opaque not in title
+                assert prefix not in title
+                assert title == "[REDACTED]" or "***" in title or "[REDACTED]" in title
+        for fb in fallback_ledger:
+            assert raw_url not in fb
+            assert opaque not in fb
+            assert prefix not in fb
+            assert fb == "[REDACTED]" or "***" in fb or "[REDACTED]" in fb
+
+        ledger_tasks.clear()
+        fallback_ledger.clear()
+        ctx_ns = TurnContext(
+            source=MagicMock(chat_id="test-native-regress-ns"),
+            _run_still_current=lambda: True,
+            _live_status_adapter=None,
+            _live_status_mode="off",
+            _thinking_enabled=False,
+            progress_mode="all",
+            progress_grouping="accumulate",
+            tool_progress_enabled=True,
+            tool_progress_filter={"terminal": "all"},
+            progress_queue=queue.Queue(),
+            log_queue=None,
+            last_progress_msg=[None],
+            last_tool=[None],
+            last_was_terminal_block=[False],
+            repeat_count=[0],
+            long_tool_hint_fired=[False],
+            agent_holder=[None],
+            _native_slack_task_cards=True,
+        )
+        runner_ns = TurnRunner(_Stub(), ctx_ns)  # type: ignore[arg-type]
+        runner_ns._runner._adapter_for_source = lambda s: adapter  # type: ignore[attr-defined]
+        non_secret = "https://ex.com/p?foo=bar&baz=qux"
+        ctx_ns.progress_queue.put({
+            "type": "tool.started",
+            "tool_call_id": "cid-ns",
+            "tool_name": "terminal",
+            "preview": non_secret,
+        })
+        task_ns = asyncio.create_task(runner_ns.send_progress_messages())
+        await asyncio.sleep(0.5)
+        task_ns.cancel()
+        try:
+            await task_ns
+        except asyncio.CancelledError:
+            pass
+        found = any("ex.com" in t.get("title","") for tasks in ledger_tasks for t in tasks) or any("ex.com" in fb for fb in fallback_ledger)
+        assert found, "non-secret URL should survive native public drain"
+
+
+class TestNativeEnabledFinalDelivery:
+    @pytest.mark.asyncio
+    async def test_final_delivery_native_enabled_no_leakage_no_duplicate(self):
+        """Production-wired Slack-native final path with native cards enabled: exactly one final send, no native leakage, no duplicate after tool.completed."""
+        from gateway.run_turn_runner import TurnRunner
+        from gateway.turn_context import TurnContext
+        from gateway.config import Platform, GatewayConfig, PlatformConfig
+        from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
+        from gateway.run import GatewayRunner, _sanitize_gateway_final_response
+        from gateway.session import SessionSource, SessionEntry, build_session_key
+        from unittest.mock import MagicMock, AsyncMock, patch
+        from datetime import datetime, timedelta
+        import queue, asyncio, os
+        from types import SimpleNamespace
+
+        def _mock_response(content="Hello", finish_reason="stop"):
+            msg = SimpleNamespace(content=content, tool_calls=None)
+            choice = SimpleNamespace(message=msg, finish_reason=finish_reason)
+            return SimpleNamespace(choices=[choice], model="test/model", usage=None)
+
+        ledger: list[str] = []
+        native_ledger: list = []
+
+        class _CaptureSlackAdapter(BasePlatformAdapter):
+            def __init__(self):
+                super().__init__(PlatformConfig(enabled=True, token="xoxb-fake"), Platform.SLACK)
+
+            async def connect(self, *, is_reconnect: bool = False) -> bool:
+                return True
+
+            async def disconnect(self) -> None:
+                return None
+
+            async def send(self, chat_id, content, reply_to=None, metadata=None):
+                ledger.append(content)
+                return SendResult(success=True, message_id="slack-1")
+
+            async def send_typing(self, chat_id, metadata=None):
+                return None
+
+            async def get_chat_info(self, chat_id):
+                return {"id": chat_id}
+
+            def native_task_cards_enabled(self) -> bool:
+                return True
+
+            async def send_native_task_card_progress(self, chat_id, tasks, title, reply_to=None, metadata=None, fallback_text=None):
+                native_ledger.append(list(tasks))
+                m = MagicMock()
+                m.success = True
+                m.message_id = "native-1"
+                return m
+
+            async def stop_native_task_card_progress(self, chat_id, reply_to=None, metadata=None):
+                return None
+
+        fake_adapter = _CaptureSlackAdapter()
+        fake_adapter.send = AsyncMock(side_effect=fake_adapter.send)
+        fake_adapter.send_native_task_card_progress = AsyncMock(side_effect=fake_adapter.send_native_task_card_progress)  # type: ignore[attr-defined]
+
+        config = GatewayConfig(platforms={Platform.SLACK: PlatformConfig(enabled=True, token="xoxb-fake")})
+        gw = GatewayRunner(config=config)
+        gw.adapters = {Platform.SLACK: fake_adapter}
+        gw._is_user_authorized = lambda _source: True
+        gw._is_user_authorized_for_source = lambda _s, **kw: True
+        gw._session_db = MagicMock()
+        gw._session_db.get_telegram_topic_binding = AsyncMock(return_value=None)
+        gw._session_db.get_compression_tip = AsyncMock(return_value=None)
+        gw.hooks = MagicMock()
+        gw.hooks.emit = AsyncMock()
+        now = datetime.now()
+        session_entry = SessionEntry(
+            session_key="agent:main:slack:channel:C123:U123",
+            session_id="sess-final-native-1",
+            created_at=now - timedelta(seconds=10),
+            updated_at=now,
+            platform=Platform.SLACK,
+            chat_type="channel",
+        )
+        gw.session_store = MagicMock()
+        gw.session_store.get_or_create_session.return_value = session_entry
+        gw.session_store.load_transcript.return_value = []
+        gw.session_store.has_any_sessions.return_value = True
+        gw.session_store.rewrite_transcript = MagicMock()
+        gw.session_store.append_to_transcript = MagicMock()
+        gw.session_store.update_session = MagicMock()
+        gw.session_store.has_platform_message_id = MagicMock(return_value=False)
+        gw.session_store._save = MagicMock()
+        gw.session_store._record_gateway_session_peer = MagicMock()
+        gw._async_session_store = gw.session_store  # type: ignore[attr-defined]
+        gw._adapter_for_source = lambda source: fake_adapter
+        gw._resolve_session_agent_runtime = MagicMock(return_value=("test/model", {"api_key": "fake", "base_url": "https://openrouter.ai/api/v1"}))
+        gw._resolve_session_reasoning_config = MagicMock(return_value=None)
+        gw._resolve_session_service_tier = MagicMock(return_value=None)
+        gw._provider_routing = {}
+        gw._reasoning_config = None
+        gw._service_tier = None
+        final_text = "Hello final native reply"
+        sanitized = _sanitize_gateway_final_response(Platform.SLACK, final_text)
+        assert sanitized == final_text
+        source_check = SessionSource(platform=Platform.SLACK, chat_id="C123", chat_type="channel", user_id="U123", thread_id="T123")
+        disp = gw._run_agent_display_settings(source_check)
+        assert disp._native_slack_task_cards is True, "native must be enabled via adapter"
+        assert disp.needs_progress_queue is True
+        event = MessageEvent(
+            text="hi",
+            source=SessionSource(platform=Platform.SLACK, chat_id="C123", chat_type="channel", user_id="U123", thread_id="T123"),
+            message_id="msg-final-native-1",
+        )
+        fake_adapter.set_message_handler(gw._handle_message)
+        fake_adapter._keep_typing = lambda *a, **kw: asyncio.Event().wait()
+        _orig_home = os.environ.get("SLACK_HOME_CHANNEL")
+        os.environ["SLACK_HOME_CHANNEL"] = "C123"
+        try:
+            with (
+                patch("model_tools.get_tool_definitions", return_value=[]),
+                patch("model_tools.check_toolset_requirements", return_value={}),
+                patch("agent.chat_completion_helpers.direct_api_call", side_effect=lambda agent, api_kwargs: _mock_response(content=final_text)),
+                patch("agent.chat_completion_helpers.interruptible_api_call", side_effect=lambda agent, api_kwargs: _mock_response(content=final_text)),
+                patch("agent.chat_completion_helpers.interruptible_streaming_api_call", side_effect=lambda agent, api_kwargs, **kw: _mock_response(content=final_text)),
+                patch("agent.chat_completion_helpers.should_use_direct_api_call", return_value=True),
+                patch("agent.process_bootstrap.OpenAI"),
+            ):
+                await fake_adapter._process_message_background(event, build_session_key(event.source))
+                assert ledger == [sanitized], f"ledger was {ledger}"
+                assert fake_adapter.send.call_count == 1
+                for tasks in native_ledger:
+                    for t in tasks:
+                        assert "opaque" not in t.get("title","").lower()
+                pq = queue.Queue()
+                ctx = TurnContext(
+                    source=MagicMock(chat_id="C123"),
+                    _run_still_current=lambda: True,
+                    _live_status_adapter=None,
+                    _live_status_mode="off",
+                    _thinking_enabled=False,
+                    progress_mode="off",
+                    progress_grouping="accumulate",
+                    tool_progress_enabled=False,
+                    tool_progress_filter={"terminal": "off"},
+                    progress_queue=pq,
+                    log_queue=queue.Queue(),
+                    last_progress_msg=[None],
+                    last_tool=[None],
+                    last_was_terminal_block=[False],
+                    repeat_count=[0],
+                    long_tool_hint_fired=[False],
+                    agent_holder=[None],
+                    _native_slack_task_cards=True,
+                    result_holder=[None],
+                    tools_holder=[None],
+                    stream_consumer_holder=[None],
+                    streaming_tts_consumer_holder=[None],
+                )
+                stub = MagicMock()
+                stub._adapter_for_source = lambda s: fake_adapter
+                tr = TurnRunner(stub, ctx)  # type: ignore[arg-type]
+                tr.native_tool_start_callback("cid-final-check", "terminal", {"command": "ls"})
+                assert pq.empty()
+                tr.native_tool_complete_callback("cid-final-check", "terminal", {}, None)
+                assert pq.empty()
+                assert ledger == [sanitized]
+                assert fake_adapter.send.call_count == 1
+        finally:
+            if _orig_home is None:
+                os.environ.pop("SLACK_HOME_CHANNEL", None)
+            else:
+                os.environ["SLACK_HOME_CHANNEL"] = _orig_home
+
+
+
 class TestProductionSeamFalsification:
     def test_adapter_final_egress_falsification_fails_without_redaction(self):
         # Mutation: temporarily make _redact_progress_text a no-op (identity) – adapter drain should then leak raw
@@ -4276,7 +4719,7 @@ class TestProductionSeamFalsification:
             import asyncio
 
             async def _run():
-                task = asyncio.create_task(runner._send_native_task_card_progress(cap))
+                task = asyncio.create_task(runner.send_progress_messages())
                 await asyncio.sleep(0.6)
                 task.cancel()
                 try:
@@ -4380,7 +4823,7 @@ class TestProductionSeamFalsification:
         )
 
         async def _run2():
-            task = asyncio.create_task(runner2._send_native_task_card_progress(cap2))
+            task = asyncio.create_task(runner2.send_progress_messages())
             await asyncio.sleep(0.6)
             task.cancel()
             try:

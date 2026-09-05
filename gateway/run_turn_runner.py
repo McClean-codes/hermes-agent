@@ -729,7 +729,12 @@ class TurnRunner:
 
         @staticmethod
         def _compact(value: Any, limit: int = 120) -> str:
-            text = re.sub(r"\s+", " ", str(value or "")).strip()
+            # SEC-PF-006: redact complete value before truncation to prevent partial credential leak
+            try:
+                redacted = _redact_progress_text(str(value or ""))
+            except Exception:
+                return "[REDACTED]"
+            text = re.sub(r"\s+", " ", redacted).strip()
             return text if len(text) <= limit else text[: limit - 3].rstrip() + "..."
 
         def visible_tasks(self) -> List[Dict[str, str]]:

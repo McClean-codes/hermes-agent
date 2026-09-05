@@ -682,7 +682,31 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
     if _gateway_surface_passes_raw_text(platform):
         return text
 
-    text = _redact_gateway_user_facing_secrets(text)
+    # SEC-PF-006 live-status: use authoritative progress redaction with strict URL handling and fail-closed
+    try:
+        from gateway.run_turn_runner import _redact_progress_text as _strict_redact  # type: ignore[import]
+
+        text = _strict_redact(text)
+    except Exception:
+        try:
+            redacted = _redact_gateway_user_facing_secrets(text)
+            try:
+                from agent.redact import _redact_strict_url_credentials
+
+                text = _redact_strict_url_credentials(redacted)
+            except Exception:
+                if "://" in str(message or ""):
+                    if redacted != str(message or "") and (
+                        "***" in redacted or "[REDACTED]" in redacted
+                    ):
+                        text = redacted
+                    else:
+                        text = "[REDACTED]"
+                else:
+                    text = redacted
+        except Exception:
+            logger.debug("status redaction unavailable", exc_info=True)
+            text = "[REDACTED]"
     # Opt-in `compression.progress_notices` lets ROUTINE (template-derived) progress through; other noise stays.
     if _TELEGRAM_NOISY_STATUS_RE.search(text) and not (
         _gateway_compression_progress_notices_enabled() and _COMPRESSION_PROGRESS_STATUS_RE.search(text)
