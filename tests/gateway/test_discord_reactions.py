@@ -1213,5 +1213,3 @@ async def test_tool_swap_removal_false_does_not_advance_tracked_state(tmp_path, 
     await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
     assert raw.effective() == {"🤖"}
     assert key not in adapter._rxn_active
-
-
