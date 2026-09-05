@@ -35,138 +35,326 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 logger = logging.getLogger("gateway.run")
 
 
-def _canonicalize_split_credentials(text: str) -> str:
-    """Merge whitespace that splits a URL credential across a literal newline/space/tab.
-
-    A credential like https://alice:longOpaque\\nOpaque@host or
-    https://ex.com/cb?token=opaque\\nTok123 is split by the model's
-    streaming whitespace. The authoritative redactors treat each whitespace-
-    separated token independently, so neither fragment is recognised as a
-    credential-bearing URL and the secret leaks. This helper merges only
-    whitespace that is inside a credential-bearing URL (userinfo or sensitive
-    query value) so the redactor sees the contiguous credential and can mask
-    it. Benign URLs (non-sensitive query keys, no userinfo) are left untouched
-    so they continue to be preserved.
-    """
-    if not text or "://" not in text:
-        return text
-
-    def _is_credential_bearing(fragment: str) -> bool:
-        low = fragment.lower()
-        # userinfo with password before @
-        if re.search(r"https?://[^/\s:]+:[^\s@]*$", fragment):
-            return True
-        if re.search(r"//[^/\s:]+:[^\s@]*$", fragment):
-            return True
-        if "?" in fragment:
-            for kw in (
-                "token=",
-                "api_key=",
-                "apikey=",
-                "signature=",
-                "secret=",
-                "password=",
-                "auth=",
-                "key=",
-                "code=",
-            ):
-                if kw in low:
-                    return True
-        if "@" in fragment and "://" in fragment:
-            return True
-        return False
-
-    def _looks_like_fragment(s: str) -> bool:
-        if not s or len(s) < 4:
-            return False
-        if "@" in s:
-            return True
-        # continuation of a query value – any alphanum token of length >=4
-        if re.fullmatch(r"[A-Za-z0-9_\-]{4,}", s):
-            return True
-        return False
-
-    for _ in range(5):
-
-        def _repl_userinfo(m: re.Match) -> str:
-            prefix = m.group(1)
-            suffix = m.group(2)
-            if _is_credential_bearing(prefix) or _looks_like_fragment(suffix):
-                return prefix + suffix
-            combined = prefix + suffix
-            if _is_credential_bearing(combined):
-                return combined
-            return m.group(0)
-
-        new = re.sub(
-            r"(https?://[^\s]*)\s+([^\s]*@)", _repl_userinfo, text, flags=re.IGNORECASE
-        )
-        new = re.sub(r"(//[^\s]*)\s+([^\s]*@)", _repl_userinfo, new)
-
-        def _repl_query(m: re.Match) -> str:
-            prefix = m.group(1)
-            suffix = m.group(2)
-            if not _looks_like_fragment(suffix):
-                return m.group(0)
-            if _is_credential_bearing(prefix):
-                return prefix + suffix
-            combined = prefix + suffix
-            if _is_credential_bearing(combined):
-                return combined
-            return m.group(0)
-
-        new = re.sub(r"(\?[^#\s]*[?&;][^=]*=[^\s&;]*)\s+([^\s&;\s]+)", _repl_query, new)
-        new = re.sub(r"(\?[^#\s]*=[^\s&;]*)\s+([^\s&;\s]+)", _repl_query, new)
-
-        if new == text:
+def _normalize_param_name(name: str) -> str:
+    """Normalize a query param name for sensitive comparison: 3-round unquote_plus, casefold, hyphen/space to underscore."""
+    from urllib.parse import unquote_plus
+    decoded = name
+    for _ in range(3):
+        try:
+            nxt = unquote_plus(decoded)
+        except Exception:
             break
-        text = new
-    return text
+        if nxt == decoded:
+            break
+        decoded = nxt
+    return decoded.casefold().replace("-", "_").replace(" ", "_")
 
 
-def _redact_progress_text(text: str | None) -> str:
+def _get_normalized_sensitive_set():
+    """Return normalized authoritative sensitive set or None if unavailable (fail-closed)."""
+    try:
+        from agent.redact import _SENSITIVE_QUERY_PARAMS
+        return frozenset(_normalize_param_name(k) for k in _SENSITIVE_QUERY_PARAMS)
+    except Exception:
+        return None
+
+
+def _is_sensitive_key(key: str, normalized_set) -> bool:
+    if normalized_set is None:
+        return True
+    try:
+        return _normalize_param_name(key) in normalized_set
+    except Exception:
+        return True
+
+
+def _find_sensitive_value_end(text: str, start: int) -> int:
+    n = len(text)
+    j = start
+    terminators = {'&', ';', '#', '"', "'", "<", ">", "]", "}", ")"}
+    prose_words = {
+        "and", "or", "the", "with", "for", "a", "an", "in", "on", "at", "by", "to", "of",
+        "is", "are", "was", "were", "be", "been", "has", "have", "had", "do", "does", "did",
+        "will", "would", "could", "should", "may", "might", "must", "can", "cannot", "but",
+        "if", "then", "else", "when", "where", "why", "how", "what", "which", "who", "whom",
+        "whose", "that", "this", "these", "those", "it", "its", "they", "them", "their",
+        "we", "you", "he", "she", "combined", "bare", "query", "reasoning", "userinfo",
+        "benign", "answer", "secrets", "no",
+    }
+    while j < n:
+        c = text[j]
+        if c in terminators:
+            break
+        if c in ' \t\n\r':
+            k = j
+            while k < n and text[k] in ' \t\n\r':
+                k += 1
+            if k >= n:
+                j = n
+                break
+            nxt = text[k]
+            if nxt in terminators:
+                break
+            token_end = k
+            while token_end < n and text[token_end] not in terminators and text[token_end] not in ' \t\n\r':
+                token_end += 1
+            next_token = text[k:token_end]
+            if next_token.startswith("http://") or next_token.startswith("https://") or next_token.startswith("ws://") or next_token.startswith("wss://") or next_token.startswith("ftp://") or next_token.startswith("//"):
+                break
+            if next_token.casefold() in prose_words:
+                break
+            next_amp = text.find('&', k)
+            next_semi = text.find(';', k)
+            next_hash = text.find('#', k)
+            next_ws2 = None
+            for ws in [' ', '\n', '\t', '\r']:
+                idx = text.find(ws, k)
+                if idx != -1:
+                    if next_ws2 is None or idx < next_ws2:
+                        next_ws2 = idx
+            next_term = None
+            for t in [next_amp, next_semi, next_hash]:
+                if t != -1:
+                    if next_term is None or t < next_term:
+                        next_term = t
+            if next_term is not None and (next_ws2 is None or next_term < next_ws2):
+                j = k
+                continue
+            if next_term is None and next_ws2 is None:
+                import re
+                if next_token and len(next_token) <= 20 and next_token.casefold() not in prose_words:
+                    if re.fullmatch(r"[A-Za-z0-9_\-\.\!\+\%]+", next_token):
+                        j = k
+                        continue
+                break
+            else:
+                break
+        else:
+            j += 1
+    return j
+
+
+def _canonicalize_query_whitespace(text: str, normalized_set) -> str:
+    if not text or '?' not in text:
+        if '&' not in text and ';' not in text:
+            return text
+    import re
+    pattern = re.compile(r"([?&#;])\s*([^=\s&;#\"'<>]+?)\s*=")
+    intervals = []
+    for m in pattern.finditer(text):
+        key = m.group(2)
+        if not _is_sensitive_key(key, normalized_set):
+            continue
+        val_start = m.end()
+        val_end = _find_sensitive_value_end(text, val_start)
+        intervals.append((val_start, val_end))
+    if not intervals:
+        return text
+    intervals.sort()
+    merged = []
+    for s, e in intervals:
+        if not merged or s > merged[-1][1]:
+            merged.append([s, e])
+        else:
+            merged[-1][1] = max(merged[-1][1], e)
+    out_parts = []
+    last = 0
+    for s, e in merged:
+        out_parts.append(text[last:s])
+        segment = text[s:e]
+        no_ws = re.sub(r'[ \t\n\r]+', '', segment)
+        out_parts.append(no_ws)
+        last = e
+    out_parts.append(text[last:])
+    return ''.join(out_parts)
+
+
+def _canonicalize_userinfo_whitespace(text: str) -> str:
+    import re
+    new_text = text
+    for _ in range(5):
+        pat1 = re.compile(r'((?:https?|wss?|ftp)://[^/\s?#]*:[^/\s?#@]*)\s+([^\s]*@[^\s]*)', re.IGNORECASE)
+        pat2 = re.compile(r'(//[^/\s?#]*:[^/\s?#@]*)\s+([^\s]*@[^\s]*)')
+        def repl(m):
+            return m.group(1) + m.group(2)
+        tmp = pat1.sub(repl, new_text)
+        tmp = pat2.sub(repl, tmp)
+        if tmp == new_text:
+            break
+        new_text = tmp
+    return new_text
+
+
+def _canonicalize_text(text: str, normalized_set) -> str:
+    t = _canonicalize_userinfo_whitespace(text)
+    t = _canonicalize_query_whitespace(t, normalized_set)
+    return t
+
+
+def _find_safe_prefix_len(text: str, normalized_set) -> int:
+    n = len(text)
+    if n == 0:
+        return 0
+    candidates = []
+    import re
+    pattern = re.compile(r"([?&#;])\s*([^=\s&;#\"'<>]+?)\s*=")
+    for m in pattern.finditer(text):
+        key = m.group(2)
+        if not _is_sensitive_key(key, normalized_set):
+            continue
+        val_start = m.end()
+        val_end = _find_sensitive_value_end(text, val_start)
+        if val_end == n:
+            scheme_pos = text.rfind('://', 0, m.start())
+            if scheme_pos != -1:
+                s = scheme_pos
+                while s > 0 and text[s-1].isalpha():
+                    s -= 1
+                url_start = s
+            else:
+                net_pos = text.rfind('//', 0, m.start())
+                if net_pos != -1:
+                    url_start = net_pos
+                else:
+                    url_start = m.start()
+            candidates.append(url_start)
+    for m in re.finditer(r'(?:https?|wss?|ftp)://', text, re.IGNORECASE):
+        url_start = m.start()
+        auth_start = m.end()
+        ends = []
+        for sep in ['/', '?', '#']:
+            idx = text.find(sep, auth_start)
+            if idx != -1:
+                ends.append(idx)
+        auth_end = min(ends) if ends else n
+        segment = text[auth_start:auth_end]
+        if ':' in segment and '@' not in segment:
+            candidates.append(url_start)
+    for m in re.finditer(r'//', text):
+        if m.start() > 0 and text[m.start()-1] == ':':
+            continue
+        url_start = m.start()
+        auth_start = m.end()
+        ends = []
+        for sep in ['/', '?', '#']:
+            idx = text.find(sep, auth_start)
+            if idx != -1:
+                ends.append(idx)
+        auth_end = min(ends) if ends else n
+        segment = text[auth_start:auth_end]
+        if ':' in segment and '@' not in segment:
+            candidates.append(url_start)
+    if candidates:
+        return min(candidates)
+    return n
+
+
+def _strict_url_param_fixup(text: str, normalized_set) -> str:
+    import re
+    if normalized_set is None:
+        return text
+    pat = re.compile(r"([?#&;])([A-Za-z0-9_.~+%\-]+)=([^#&;\s\"'<>]*)")
+    def repl(m):
+        key = m.group(2)
+        if _is_sensitive_key(key, normalized_set):
+            return f"{m.group(1)}{m.group(2)}=***"
+        return m.group(0)
+    return pat.sub(repl, text)
+
+
+def _strict_url_userinfo_fixup(text: str) -> str:
+    import re
+    pat = re.compile(r"(//)([^/\s?#@]+)@")
+    def repl(m):
+        userinfo = m.group(2)
+        if ":" in userinfo:
+            return f"{m.group(1)}{userinfo.partition(':')[0]}:***@"
+        else:
+            return f"{m.group(1)}***@"
+    return pat.sub(repl, text)
+
+
+def _redact_progress_text(text: str | None, *, final: bool = True) -> str:
     """Fail-closed secret redaction for progress/preview/status text before chat publication.
 
-    Delegates to the authoritative ``agent.redact.redact_sensitive_text`` with
-    ``force=True`` (same boundary as logs/tool-output), so progress previews
-    including terminal full blocks, verbose args, URLs/paths, plugin/MCP previews,
-    Codex/native-card content and live-status phrases never carry raw credentials
-    even when ``security.redact_secrets`` is off. Falls back to strict URL-safe
-    gateway redaction; if strict redaction cannot be established, fails closed
-    to a fixed placeholder. Never weakens to a local marker filter.
+    Shared egress boundary for every model-derived human-facing rail. ``final=True``
+    returns complete sanitized projection for ordinary complete values.
+    ``final=False`` returns only parser-proven safe prefix for streaming.
     """
     if text is None:
         return ""
     s = str(text)
     if not s:
         return s
+    normalized_set = _get_normalized_sensitive_set()
     try:
-        from agent.redact import redact_sensitive_text
-
-        return redact_sensitive_text(s, force=True, redact_url_credentials=True)
-    except Exception:
-        # Primary authoritative redactor unavailable – attempt gateway fallback with strict URL credential redaction
+        if final:
+            canonical = _canonicalize_text(s, normalized_set)
+        else:
+            safe_len = _find_safe_prefix_len(s, normalized_set)
+            safe_raw = s[:safe_len]
+            canonical = _canonicalize_text(safe_raw, normalized_set)
         try:
+            from agent.redact import redact_sensitive_text
+            redacted = redact_sensitive_text(canonical, force=True, redact_url_credentials=True)
+            try:
+                fixed = _strict_url_param_fixup(redacted, normalized_set)
+                fixed = _strict_url_userinfo_fixup(fixed)
+                return fixed
+            except Exception:
+                return redacted
+        except Exception as e:
+            raise
+    except Exception:
+        try:
+            if final:
+                canonical_fb = _canonicalize_text(s, normalized_set)
+            else:
+                safe_len = _find_safe_prefix_len(s, normalized_set)
+                safe_raw = s[:safe_len]
+                canonical_fb = _canonicalize_text(safe_raw, normalized_set)
             from gateway.run import _redact_gateway_user_facing_secrets
-
-            redacted = _redact_gateway_user_facing_secrets(s)
+            redacted = _redact_gateway_user_facing_secrets(canonical_fb)
             try:
                 from agent.redact import _redact_strict_url_credentials
-
-                return _redact_strict_url_credentials(redacted)
+                strict = _redact_strict_url_credentials(redacted)
+                try:
+                    strict = _strict_url_param_fixup(strict, normalized_set)
+                except Exception:
+                    pass
+                if "://" in canonical_fb:
+                    if canonical_fb != redacted and ("***" in strict or "[REDACTED]" in strict):
+                        return strict
+                    if "***" in strict or strict == "[REDACTED]":
+                        return strict
+                return strict
             except Exception:
-                # Strict URL redactor unavailable – fail closed for URL-bearing text, else return gateway output
-                if "://" in s:
-                    # If gateway already applied a visible redaction marker, keep it; otherwise fail closed to guarantee no credential leak
-                    if s != redacted and (
-                        "***" in redacted or "[REDACTED]" in redacted
-                    ):
+                if "://" in canonical_fb or "?" in canonical_fb or "@" in canonical_fb:
+                    if canonical_fb != redacted and ("***" in redacted or "[REDACTED]" in redacted):
                         return redacted
                     return "[REDACTED]"
                 return redacted
         except Exception:
             logger.debug("progress redaction unavailable", exc_info=True)
-            return "[REDACTED]"
+            check_text = s
+            has_url_shape = "://" in check_text or "?" in check_text or "@" in check_text
+            has_credential_shape = False
+            try:
+                from agent.redact import _PREFIX_SUBSTRINGS
+                for p in _PREFIX_SUBSTRINGS:
+                    if p and p in check_text:
+                        has_credential_shape = True
+                        break
+            except Exception:
+                for p in ("sk-", "ghp_", "gho_", "xox", "AIza", "AKIA", "glpat-"):
+                    if p in check_text:
+                        has_credential_shape = True
+                        break
+            if has_url_shape or has_credential_shape:
+                return "[REDACTED]"
+            if check_text.strip():
+                return "[REDACTED]"
+            return ""
 
 
 # ---- stateful streamed egress redaction (SEC-PF-STREAMING-STATEFUL) ---------
@@ -184,36 +372,17 @@ class _StatefulStreamRedactor:
         self._raw: str = ""
         self._sanitized_flushed: str = ""
         self._sanitized_full: str = ""
+        self._failure_latch: str = "none"
+        self._finalized: bool = False
 
-    def _sanitize(self, text: str) -> str:
+    def _sanitize(self, text: str, *, final: bool) -> str:
         try:
-            # Canonicalize whitespace-split credentials before authoritative redaction
-            # so a URL like https://alice:long\nOpaque@host is seen as contiguous
-            canonical = _canonicalize_split_credentials(text)
-            return _redact_progress_text(canonical)
+            return _redact_progress_text(text, final=final)
         except Exception:
             logger.debug("stateful stream sanitize primary failed", exc_info=True)
-            try:
-                from gateway.run import _redact_gateway_user_facing_secrets
-
-                # Also canonicalize for fallback path
-                canonical_fb = _canonicalize_split_credentials(text)
-                redacted = _redact_gateway_user_facing_secrets(canonical_fb)
-                try:
-                    from agent.redact import _redact_strict_url_credentials
-
-                    return _redact_strict_url_credentials(redacted)
-                except Exception:
-                    if "://" in canonical_fb:
-                        if canonical_fb != redacted and (
-                            "***" in redacted or "[REDACTED]" in redacted
-                        ):
-                            return redacted
-                        return "[REDACTED]"
-                    return redacted
-            except Exception:
-                logger.debug("stateful stream sanitize fallback failed", exc_info=True)
+            if "://" in text or "?" in text or "@" in text:
                 return "[REDACTED]"
+            return "[REDACTED]"
 
     def _has_risk(self, s: str) -> bool:
         if not s:
@@ -235,10 +404,8 @@ class _StatefulStreamRedactor:
         ):
             if kw in low:
                 return True
-        # Known vendor prefix substrings are credential-shaped even outside URLs
         try:
             from agent.redact import _PREFIX_SUBSTRINGS
-
             for p in _PREFIX_SUBSTRINGS:
                 if p and p in s:
                     return True
@@ -248,64 +415,6 @@ class _StatefulStreamRedactor:
                     return True
         return False
 
-    def _find_safe_len(self, sanitized: str) -> int:
-        if sanitized == "[REDACTED]":
-            return len(sanitized)
-        # Literal newline/whitespace inside a credential-bearing URL must not flush.
-        # If the sanitized output still contains a newline and is still risky/unmasked,
-        # it indicates a split credential that the canonicalizer did not fully merge
-        # (e.g., due to benign-vs-hostile ambiguity). Fail closed by holding back
-        # from the first URL-like token.
-        if ("\n" in sanitized or "\r" in sanitized) and self._has_risk(sanitized):
-            if "***" not in sanitized and sanitized != "[REDACTED]":
-                # Check for userinfo or query split pattern still present
-                if re.search(
-                    r"https?://[^\s]*\s+[^\s]*@", sanitized, re.IGNORECASE
-                ) or re.search(r"\?[^#\s]*=[^\s]*\s+[^\s]+", sanitized):
-                    n = len(sanitized)
-                    tokens_tmp: list[tuple[int, int]] = []
-                    i = 0
-                    while i < n:
-                        if sanitized[i] in " \t\n\r":
-                            i += 1
-                            continue
-                        s = i
-                        while i < n and sanitized[i] not in " \t\n\r":
-                            i += 1
-                        e = i
-                        tokens_tmp.append((s, e))
-                    for s, e in tokens_tmp:
-                        if "://" in sanitized[s:e]:
-                            return s
-                    # Fallback to 0 if no URL token found but still risky
-                    return 0
-        if not self._has_risk(sanitized):
-            return len(sanitized)
-        # Token-aware holdback: any unmasked risky token must not flush.
-        n = len(sanitized)
-        tokens = []
-        i = 0
-        while i < n:
-            if sanitized[i] in " \t\n\r":
-                i += 1
-                continue
-            start = i
-            while i < n and sanitized[i] not in " \t\n\r":
-                i += 1
-            end = i
-            tokens.append((start, end))
-        earliest = -1
-        for start, end in tokens:
-            tok = sanitized[start:end]
-            if "***" in tok or tok == "[REDACTED]":
-                continue
-            if self._has_risk(tok):
-                earliest = start
-                break
-        if earliest != -1:
-            return earliest
-        return len(sanitized)
-
     def on_delta(self, text: str) -> str | None:
         if text is None:
             return None
@@ -313,21 +422,23 @@ class _StatefulStreamRedactor:
         if not s:
             return None
         self._raw += s
-        sanitized_full = self._sanitize(self._raw)
+        try:
+            sanitized_full = self._sanitize(self._raw, final=False)
+        except Exception:
+            sanitized_full = "[REDACTED]"
         self._sanitized_full = sanitized_full
-        # Both-layer failure is exact [REDACTED] — flush only if nothing sent yet; otherwise let finish() deliver it
         if sanitized_full == "[REDACTED]":
             if not self._sanitized_flushed:
                 self._sanitized_flushed = sanitized_full
+                self._failure_latch = "both_failed"
                 return sanitized_full
-            # Already flushed a benign prefix; do not append "[REDACTED]" as suffix — finish() will replace via adoption
+            self._failure_latch = "both_failed"
             return None
-        safe_len = self._find_safe_len(sanitized_full)
-        if safe_len < len(self._sanitized_flushed):
-            safe_len = len(self._sanitized_flushed)
-        safe_prefix = sanitized_full[:safe_len]
-        new_part = safe_prefix[len(self._sanitized_flushed) :]
-        self._sanitized_flushed = safe_prefix
+        if len(sanitized_full) < len(self._sanitized_flushed) or not sanitized_full.startswith(self._sanitized_flushed):
+            self._failure_latch = "both_failed"
+            return None
+        new_part = sanitized_full[len(self._sanitized_flushed):]
+        self._sanitized_flushed = sanitized_full
         return new_part if new_part else None
 
     def sanitize_final(self, final_text: str | None) -> str | None:
@@ -336,22 +447,21 @@ class _StatefulStreamRedactor:
         s = str(final_text)
         if not s:
             return s
-        sanitized = self._sanitize(s)
-        # Record for consistency; flushed state is not used after finish
+        sanitized = self._sanitize(s, final=True)
         self._sanitized_full = sanitized
+        self._finalized = True
         return sanitized
 
     def on_segment_break(self) -> None:
-        # Tool boundary sentinel: clear state so next segment does not inherit split risk
-        # Flush is not needed; already-flushed prefix was delivered, pending tail was risky and must not carry over
         self._raw = ""
         self._sanitized_flushed = ""
         self._sanitized_full = ""
+        self._failure_latch = "none"
+        self._finalized = False
 
     def pending_sanitized_tail(self) -> str:
-        # Sanitized full that hasn't been flushed yet (for debugging)
         if len(self._sanitized_full) > len(self._sanitized_flushed):
-            return self._sanitized_full[len(self._sanitized_flushed) :]
+            return self._sanitized_full[len(self._sanitized_flushed):]
         return ""
 
 
@@ -364,11 +474,10 @@ def _sanitize_stream_final_text(platform: Any, text: str | None) -> str:
         return s
     try:
         from gateway.run import _sanitize_gateway_final_response
-
         return _sanitize_gateway_final_response(platform, s)
     except Exception:
         try:
-            return _redact_progress_text(s)
+            return _redact_progress_text(s, final=True)
         except Exception:
             logger.debug("stream final sanitize failed", exc_info=True)
             return "[REDACTED]"

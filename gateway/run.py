@@ -666,30 +666,14 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     if str(text).strip().startswith(INTERRUPT_WAITING_FOR_MODEL_PREFIX):
         return ""
 
-    # SEC-PF-FINAL-URL-EGRESS: strict URL-aware fail-closed redaction, same contract as progress/status
-    orig = str(text)
+    # SEC-PF-FINAL-URL-EGRESS: strict URL-aware fail-closed redaction via shared boundary
     try:
         from gateway.run_turn_runner import _redact_progress_text as _strict_redact  # type: ignore[import]
 
-        redacted = _strict_redact(text)
+        redacted = _strict_redact(text, final=True)
     except Exception:
-        try:
-            redacted_tmp = _redact_gateway_user_facing_secrets(text)
-            try:
-                from agent.redact import _redact_strict_url_credentials
-
-                redacted = _redact_strict_url_credentials(redacted_tmp)
-            except Exception:
-                if "://" in orig:
-                    if redacted_tmp != orig and ("***" in redacted_tmp or "[REDACTED]" in redacted_tmp):
-                        redacted = redacted_tmp
-                    else:
-                        redacted = "[REDACTED]"
-                else:
-                    redacted = redacted_tmp
-        except Exception:
-            logger.debug("final response redaction unavailable", exc_info=True)
-            redacted = "[REDACTED]"
+        logger.debug("final response redaction unavailable", exc_info=True)
+        redacted = "[REDACTED]"
     if _looks_like_gateway_provider_error(redacted):
         return _gateway_provider_error_reply(redacted)
     return redacted
@@ -705,31 +689,14 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
     if _gateway_surface_passes_raw_text(platform):
         return text
 
-    # SEC-PF-006 live-status: use authoritative progress redaction with strict URL handling and fail-closed
+    # SEC-PF-006 live-status: use authoritative progress redaction via shared boundary
     try:
         from gateway.run_turn_runner import _redact_progress_text as _strict_redact  # type: ignore[import]
 
-        text = _strict_redact(text)
+        text = _strict_redact(text, final=True)
     except Exception:
-        try:
-            redacted = _redact_gateway_user_facing_secrets(text)
-            try:
-                from agent.redact import _redact_strict_url_credentials
-
-                text = _redact_strict_url_credentials(redacted)
-            except Exception:
-                if "://" in str(message or ""):
-                    if redacted != str(message or "") and (
-                        "***" in redacted or "[REDACTED]" in redacted
-                    ):
-                        text = redacted
-                    else:
-                        text = "[REDACTED]"
-                else:
-                    text = redacted
-        except Exception:
-            logger.debug("status redaction unavailable", exc_info=True)
-            text = "[REDACTED]"
+        logger.debug("status redaction unavailable", exc_info=True)
+        text = "[REDACTED]"
     # Opt-in `compression.progress_notices` lets ROUTINE (template-derived) progress through; other noise stays.
     if _TELEGRAM_NOISY_STATUS_RE.search(text) and not (
         _gateway_compression_progress_notices_enabled() and _COMPRESSION_PROGRESS_STATUS_RE.search(text)

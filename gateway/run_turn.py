@@ -3530,7 +3530,7 @@ class GatewayTurnMixin:
                                             )
 
                                             try:
-                                                _san = _proxy_redact(content)
+                                                _san = _proxy_redact(content, final=False)
                                             except Exception:
                                                 _san = "[REDACTED]"
                                             _stream_consumer.on_delta(_san)
@@ -3540,7 +3540,7 @@ class GatewayTurnMixin:
                                                 _redact_progress_text as _proxy_redact2,
                                             )
 
-                                            _san = _proxy_redact2(content)
+                                            _san = _proxy_redact2(content, final=False)
                                         except Exception:
                                             _san = "[REDACTED]"
                                         try:
@@ -3573,7 +3573,7 @@ class GatewayTurnMixin:
                         )
 
                         try:
-                            _san_fin = _proxy_final_redact(full_response)
+                            _san_fin = _proxy_final_redact(full_response, final=True)
                         except Exception:
                             _san_fin = "[REDACTED]"
                 except Exception:
@@ -3610,7 +3610,7 @@ class GatewayTurnMixin:
             )
 
             _san_ret = (
-                _proxy_ret_redact(full_response) if full_response else full_response
+                _proxy_ret_redact(full_response, final=True) if full_response else full_response
             )
             if _san_ret is None:
                 _san_ret = "[REDACTED]"
