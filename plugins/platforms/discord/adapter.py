@@ -986,8 +986,6 @@ def _read_discord_prompt_timeout() -> int:
 class DiscordAdapter(DynamicReactionMixin, BasePlatformAdapter):
     """Discord bot adapter: guild/DM messages, threads, slash commands, button approvals, reactions."""
 
-    _rxn_token_aware = True
-
     MAX_MESSAGE_LENGTH = 2000
     _SPLIT_THRESHOLD = 1900  # near the 2000-char split point
     supports_code_blocks = True  # Discord markdown renders fenced code blocks natively
@@ -2751,116 +2749,13 @@ class DiscordAdapter(DynamicReactionMixin, BasePlatformAdapter):
 
     def _reactions_enabled(self) -> bool:
         """Check if message reactions are enabled via config/env."""
-        # Normalize env var fail-closed: only documented tokens enable
-        raw_env = os.getenv("DISCORD_REACTIONS", "true")
-        if isinstance(raw_env, str):
-            token = raw_env.strip().lower()
-            if token in ("false", "0", "no", "off"):
-                return False
-            if token in ("true", "1", "yes", "on", ""):
-                # empty or recognized true -> check config gate next
-                pass
-            else:
-                # unrecognized string fail-closed to disabled
-                return False
-        # Normalize config.extra.reactions with the same fail-closed rule
-        extra_val = self.config.extra.get("reactions", True) if isinstance(getattr(self.config, "extra", None), dict) else True
-        if isinstance(extra_val, bool):
-            return extra_val
-        if isinstance(extra_val, str):
-            token = extra_val.strip().lower()
-            if token in ("false", "0", "no", "off"):
-                return False
-            if token in ("true", "1", "yes", "on"):
-                return True
-            if token == "":
-                return True
-            return False
-        if extra_val is None:
-            return True
-        return False
+        return os.getenv("DISCORD_REACTIONS", "true").lower() not in ("false", "0", "no") and self.config.extra.get("reactions", True)
 
     def _session_key_from_source(self, source) -> str:
-        """Derive a canonical, participant- and profile-aware session key.
-
-        Uses :func:`gateway.session.build_session_key` so distinct users or
-        multiplex profiles sharing a channel do not collide on
-        ``_session_raw_messages`` / ``_rxn_*`` state. Preserves the stable
-        active message identity across ``on_processing_start``,
-        ``on_tool_call_start`` and ``on_processing_complete`` by returning
-        the same key for the triggering ``MessageEvent`` and the
-        ``SessionSource`` passed to tool callbacks.
-        """
-        # Unwrap MessageEvent -> SessionSource
-        if hasattr(source, "source") and getattr(source, "source", None) is not None:
-            try:
-                # Prefer the adapter's canonical event key when given an event,
-                # so profile multiplexing stays in sync with the agent runner.
-                from gateway.session import build_session_key as _build
-
-                # Try the base-class helper which already handles group/thread
-                # isolation flags and profile namespace.
-                try:
-                    return self._event_session_key(source)  # type: ignore[arg-type]
-                except Exception:
-                    # Fallback to direct build with source.source
-                    src = source.source
-                    extra = getattr(getattr(self, "config", None), "extra", {}) or {}
-                    def _norm_bool(v, default):
-                        if isinstance(v, bool):
-                            return v
-                        if isinstance(v, str):
-                            t = v.strip().lower()
-                            if t in ("1", "true", "yes", "on"):
-                                return True
-                            if t in ("0", "false", "no", "off", ""):
-                                return False
-                            return default
-                        if v is None:
-                            return default
-                        return bool(v)
-                    g = _norm_bool(extra.get("group_sessions_per_user", True), True)
-                    t = _norm_bool(extra.get("thread_sessions_per_user", False), False)
-                    profile = None
-                    try:
-                        profile = self._session_key_profile(src)
-                    except Exception:
-                        profile = getattr(src, "profile", None)
-                    return _build(src, group_sessions_per_user=g, thread_sessions_per_user=t, profile=profile)
-            except Exception:
-                source = source.source
-        # Now ``source`` should be a SessionSource-like
-        try:
-            from gateway.session import build_session_key as _build
-
-            extra = getattr(getattr(self, "config", None), "extra", {}) or {}
-            def _norm_bool2(v, default):
-                if isinstance(v, bool):
-                    return v
-                if isinstance(v, str):
-                    t = v.strip().lower()
-                    if t in ("1", "true", "yes", "on"):
-                        return True
-                    if t in ("0", "false", "no", "off", ""):
-                        return False
-                    return default
-                if v is None:
-                    return default
-                return bool(v)
-            g2 = _norm_bool2(extra.get("group_sessions_per_user", True), True)
-            t2 = _norm_bool2(extra.get("thread_sessions_per_user", False), False)
-            profile2 = None
-            try:
-                profile2 = self._session_key_profile(source)
-            except Exception:
-                profile2 = getattr(source, "profile", None)
-            return _build(source, group_sessions_per_user=g2, thread_sessions_per_user=t2, profile=profile2)
-        except Exception:
-            # Absolute fallback: include participant and profile to avoid collision
-            try:
-                return f"{getattr(source, 'platform', '')}:{getattr(source, 'chat_id', '')}:{getattr(source, 'thread_id', '') or ''}:{getattr(source, 'user_id', '') or ''}:{getattr(source, 'profile', '') or ''}"
-            except Exception:
-                return str(getattr(source, "chat_id", ""))
+        """Derive a stable session key from a SessionSource or MessageEvent."""
+        if hasattr(source, "source") and source.source is not None:
+            source = source.source
+        return f"{source.platform}:{source.chat_id}:{source.thread_id or ''}"
 
     async def _reaction_add(self, msg_ref, emoji):
         """Add an emoji reaction to a Discord message."""
@@ -2868,19 +2763,6 @@ class DiscordAdapter(DynamicReactionMixin, BasePlatformAdapter):
 
     async def _reaction_remove(self, msg_ref, emoji):
         """Remove the bot's own emoji reaction from a Discord message."""
-        # For pending retry via synthetic locator, msg_ref may be a placeholder with id and channel
-        # Try to resolve via weak map if placeholder
-        if msg_ref is not None and not hasattr(msg_ref, "add_reaction"):
-            # Placeholder from pending retry: try to find real ledger via weak map
-            try:
-                chan = str(getattr(msg_ref, "channel_id", "") or getattr(msg_ref, "channel", "") or "")
-                mid = str(getattr(msg_ref, "id", "") or getattr(msg_ref, "message_id", "") or "")
-                if chan and mid:
-                    real = self._rxn_get_weak((chan, mid))  # type: ignore[attr-defined]
-                    if real is not None:
-                        return await self._remove_reaction(real, emoji)
-            except Exception:
-                pass
         return await self._remove_reaction(msg_ref, emoji)
 
     def _reaction_resolve_message(self, event):
@@ -2897,27 +2779,6 @@ class DiscordAdapter(DynamicReactionMixin, BasePlatformAdapter):
         source = getattr(event, "source", event)
         return self._session_key_from_source(source)
 
-    def _rxn_resolve_pending_message(self, locator):
-        """Resolve pending locator to a message handle for retry.
-
-        Uses weak locator map for tests; falls back to synthetic placeholder
-        that will be resolved via _reaction_remove's weak lookup.
-        """
-        try:
-            # Try weak map first (holds LedgerMessage for tests)
-            msg = self._rxn_get_weak((locator.channel_id, locator.message_id))  # type: ignore[attr-defined]
-            if msg is not None:
-                return msg
-        except Exception:
-            pass
-        # Fallback: create synthetic placeholder with id/channel_id for production-like path
-        # For real Discord, this would be a partial message handle; for tests, _reaction_remove will handle via weak map if available
-        try:
-            placeholder = type("PendingMsg", (), {"id": str(locator.message_id), "channel_id": str(locator.channel_id)})()
-            return placeholder
-        except Exception:
-            return None
-
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Add persona emoji and cache the raw message for tool-call lookups."""
         source = getattr(event, "source", event)
@@ -2925,32 +2786,11 @@ class DiscordAdapter(DynamicReactionMixin, BasePlatformAdapter):
         raw = getattr(event, "raw_message", None)
         if raw:
             self._session_raw_messages[key] = raw
-            # Populate weak locator map for pending retry
-            try:
-                # Derive locator for weak map
-                channel_id = str(getattr(source, "chat_id", "") or "").strip()
-                message_id = str(getattr(event, "message_id", "") or getattr(raw, "id", "") or "").strip()
-                if channel_id and message_id:
-                    # Use weakref if possible
-                    try:
-                        import weakref as _wr
-
-                        # WeakValueDictionary path is via mixin; also store direct weak method
-                        # Try to store in mixin's weak map
-                        try:
-                            self._rxn_store_weak((channel_id, message_id), raw)  # type: ignore[attr-defined]
-                        except TypeError:
-                            # LedgerMessage may not be weakrefable; store strong as fallback but will be cleared at retirement
-                            self._rxn_store_weak((channel_id, message_id), raw)  # type: ignore[attr-defined]
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-        acked = await self._rxn_on_processing_start(event)
+        await self._rxn_on_processing_start(event)
         await asyncio.to_thread(
             self._record_discord_processing_start,
             event,
-            emoji_ack=bool(acked),
+            emoji_ack=True,
         )
 
     async def on_tool_call_start(self, event, tool_name: str) -> None:
