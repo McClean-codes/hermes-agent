@@ -644,8 +644,9 @@ class TestImportantOutputDelivery:
         finally:
             run_mod.safe_schedule_threadsafe = orig  # type: ignore[assignment]
 
-    def test_error_result_not_suppressed(self):
-        # Errors/results must still be delivered even when progress for that tool is off – via real TurnRunner terminalization
+    @pytest.mark.asyncio
+    async def test_error_result_not_suppressed(self):
+        # Errors/results must still be delivered via production gateway message-handling caller even when progress for that tool is filtered off
         pq = queue.Queue()
         lq = queue.Queue()
         ctx = TurnContext(
@@ -684,19 +685,160 @@ class TestImportantOutputDelivery:
         runner = TurnRunner(StubRunner(), ctx)  # type: ignore[arg-type]
         runner.progress_callback("tool.started", "terminal", "ls", {"command": "ls"})
         assert pq.empty(), "filtered progress must not appear"
-        # Deliver error via the authoritative TurnRunner terminalization seam (not direct holder assignment)
-        error_payload = {"tool": "terminal", "is_error": True, "result": "permission denied", "final_response": "error: permission denied", "failed": True, "messages": [], "api_calls": 0}
-        runner._finish_stream_consumer(error_payload, agent_history=[], stream_consumer=None)
-        assert ctx.result_holder[0] is error_payload
-        assert ctx.result_holder[0]["is_error"] is True
-        assert "permission denied" in ctx.result_holder[0]["result"]
-        assert pq.empty(), "progress queue must stay empty after error terminalization"
-        # Error notice path still preparable via production helper
-        from gateway.run import _prepare_gateway_status_message
-        from unittest.mock import MagicMock as _MM
-        msg = _prepare_gateway_status_message(_MM(value="telegram"), "tool.error", "terminal failed: permission denied")
-        assert msg is not None
-        assert "permission denied" in msg
+        assert lq.empty(), "log rail must stay empty for filtered start"
+
+        # Production gateway error delivery via full message-handling path with only adapter send controlled
+        from gateway.run import GatewayRunner
+        from gateway.config import Platform, GatewayConfig, PlatformConfig
+        from gateway.run import _sanitize_gateway_final_response
+        from gateway.session import SessionSource, SessionEntry, build_session_key
+        from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
+        from datetime import datetime, timedelta
+        import os
+
+        ledger: list[str] = []
+
+        class _CaptureTelegramAdapter(BasePlatformAdapter):
+            def __init__(self):
+                super().__init__(PlatformConfig(enabled=True, token="fake-token"), Platform.TELEGRAM)
+
+            async def connect(self, *, is_reconnect: bool = False) -> bool:
+                return True
+
+            async def disconnect(self) -> None:
+                return None
+
+            async def send(self, chat_id, content, reply_to=None, metadata=None):
+                ledger.append(content)
+                return SendResult(success=True, message_id="tg-1")
+
+            async def send_typing(self, chat_id, metadata=None):
+                return None
+
+            async def get_chat_info(self, chat_id):
+                return {"id": chat_id}
+
+        fake_adapter = _CaptureTelegramAdapter()
+        _orig_send = fake_adapter.send
+        fake_adapter.send = AsyncMock(side_effect=_orig_send)
+
+        config = GatewayConfig(platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake-token")})
+        gw = object.__new__(GatewayRunner)
+        gw.config = config
+        gw.adapters = {Platform.TELEGRAM: fake_adapter}
+        gw._voice_mode = {}
+        gw._running_agents = {}
+        gw._running_agents_ts = {}
+        gw._pending_messages = {}
+        gw._pending_approvals = {}
+        gw._is_user_authorized = lambda _source: True
+        gw._set_session_env = lambda _context: None
+        gw._clear_session_env = lambda _tokens: None
+        gw._is_user_authorized_for_source = lambda _s, **kw: True
+        gw._session_db = MagicMock()
+        gw._session_db.get_telegram_topic_binding = AsyncMock(return_value=None)
+        gw._session_db.get_compression_tip = AsyncMock(return_value=None)
+        gw.hooks = MagicMock()
+        gw.hooks.emit = AsyncMock()
+        now = datetime.now()
+        session_entry = SessionEntry(
+            session_key="agent:main:telegram:group:-1001:12345",
+            session_id="sess-error-1",
+            created_at=now - timedelta(seconds=10),
+            updated_at=now,
+            platform=Platform.TELEGRAM,
+            chat_type="group",
+        )
+        gw.session_store = MagicMock()
+        gw.session_store.get_or_create_session.return_value = session_entry
+        gw.session_store.load_transcript.return_value = []
+        gw.session_store.has_any_sessions.return_value = True
+        gw.session_store.rewrite_transcript = MagicMock()
+        gw.session_store.append_to_transcript = MagicMock()
+        gw.session_store.update_session = MagicMock()
+        gw.session_store.has_platform_message_id = MagicMock(return_value=False)
+        gw.session_store._save = MagicMock()
+        gw.session_store._record_gateway_session_peer = MagicMock()
+        gw._adapter_for_source = lambda source: fake_adapter
+        gw._resolve_session_agent_runtime = MagicMock(return_value=("test/model", {"api_key": "fake", "base_url": ""}))
+        gw._resolve_session_reasoning_config = MagicMock(return_value=None)
+        gw._resolve_session_service_tier = MagicMock(return_value=None)
+        gw._provider_routing = {}
+        gw._reasoning_config = None
+        gw._service_tier = None
+        gw._async_session_store = gw.session_store  # type: ignore[attr-defined]
+
+        error_text = "error: permission denied"
+        sanitized = _sanitize_gateway_final_response(Platform.TELEGRAM, error_text)
+        assert sanitized == error_text
+        mock_agent_result = {
+            "final_response": sanitized,
+            "messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": sanitized}],
+            "tools": [],
+            "failed": True,
+            "completed": False,
+            "api_calls": 1,
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+            "session_id": "sess-error-1",
+        }
+        gw._run_agent = AsyncMock(return_value=mock_agent_result)
+
+        event = MessageEvent(
+            text="hi",
+            source=SessionSource(platform=Platform.TELEGRAM, chat_id="-1001", chat_type="group", user_id="12345"),
+            message_id="msg-error-1",
+        )
+
+        gw._turn_leases = None
+        gw._session_sources = {}
+        gw._session_sources_max = 512
+        gw._is_session_running = lambda k: False
+        gw._evict_idle_stale_agent = lambda k: None
+        gw._evict_reaped_agent = lambda k: None
+        gw._persist_active_agents = lambda: None
+        gw._is_session_run_current = lambda k, gen: True
+        gw._begin_session_run_generation = lambda k: 1
+        gw._reply_anchor_for_event = lambda e: None
+        gw._get_guild_id = lambda e: None
+        gw._should_send_voice_reply = lambda *a, **kw: False
+        gw._thread_metadata_for_source = lambda s, anchor=None: None
+        gw._event_session_key = lambda e: build_session_key(e.source)
+        gw._event_thread_metadata = lambda e, s: None
+
+        fake_adapter.set_message_handler(gw._handle_message)
+        fake_adapter._keep_typing = lambda *a, **kw: asyncio.Event().wait()
+
+        _orig_home = os.environ.get("TELEGRAM_HOME_CHANNEL")
+        os.environ["TELEGRAM_HOME_CHANNEL"] = "-1001"
+        try:
+            await fake_adapter._process_message_background(event, build_session_key(event.source))
+
+            assert ledger == [sanitized], f"ledger was {ledger}"
+            assert fake_adapter.send.call_count == 1
+            _called = None
+            if fake_adapter.send.call_args is not None:
+                _a, _kw = fake_adapter.send.call_args
+                if len(_a) >= 2:
+                    _called = _a[1]
+                else:
+                    _called = _kw.get("content")
+            assert _called == sanitized
+            assert ledger[0] == _called
+            assert ledger[0] == error_text
+
+            assert pq.empty(), "progress must stay empty after error delivery"
+            assert lq.empty(), "log must stay empty after error delivery"
+
+            runner.progress_callback("tool.completed", "terminal", None, {})
+            assert pq.empty(), "progress must stay empty after tool.completed"
+            assert ledger == [sanitized], "tool completion must not duplicate or clear error"
+            assert fake_adapter.send.call_count == 1, "tool.completed must not trigger extra send"
+        finally:
+            if _orig_home is None:
+                os.environ.pop("TELEGRAM_HOME_CHANNEL", None)
+            else:
+                os.environ["TELEGRAM_HOME_CHANNEL"] = _orig_home
 
     @pytest.mark.asyncio
     async def test_tool_completed_does_not_block_final_reply(self):
@@ -808,11 +950,11 @@ class TestImportantOutputDelivery:
         gw.session_store.load_transcript.return_value = []
         gw.session_store.has_any_sessions.return_value = True
         gw.session_store.rewrite_transcript = MagicMock()
-        gw.session_store.append_to_transcript = AsyncMock()
-        gw.session_store.update_session = AsyncMock()
+        gw.session_store.append_to_transcript = MagicMock()
+        gw.session_store.update_session = MagicMock()
         gw.session_store.has_platform_message_id = MagicMock(return_value=False)
-        gw.session_store._save = AsyncMock()
-        gw.session_store._record_gateway_session_peer = AsyncMock()
+        gw.session_store._save = MagicMock()
+        gw.session_store._record_gateway_session_peer = MagicMock()
         gw._adapter_for_source = lambda source: fake_adapter
         gw._resolve_session_agent_runtime = MagicMock(return_value=("test/model", {"api_key": "fake", "base_url": ""}))
         gw._resolve_session_reasoning_config = MagicMock(return_value=None)
@@ -1239,9 +1381,7 @@ class TestProgressRedactionBoundary:
         assert raw_marker not in payload, f"raw marker leaked: {payload!r}"
         # Payload must be non-empty and not just dropped (fail-closed but still delivered for allowlisted)
         assert payload.strip() != ""
-        # Redacted form should differ via masking (either *** or …)
-        redacted = redact_sensitive_text(raw_marker, force=True)
-        # The payload should contain redacted hint or at least not equal raw and be redacted-like
+        # Payload must differ from raw marker (fail-closed ensures delivery, not dropping)
         assert payload != raw_marker
 
     def test_terminal_via_begin_tool_execution_is_redacted(self):
@@ -1253,7 +1393,6 @@ class TestProgressRedactionBoundary:
         # Enable code blocks on adapter so terminal renders as fenced block
         runner = _make_runner(ctx)
         # Replace runner's adapter to support code blocks
-        orig_adapter_for_source = runner._runner._adapter_for_source
         def _fake_adapter(source):
             m = MagicMock()
             m.supports_code_blocks = True
