@@ -1992,3 +1992,240 @@ async def test_same_key_after_cancelled_removal_exception_defers_new_start_and_r
     assert key not in ad._rxn_active
     assert key not in getattr(ad, "_rxn_retained", set())
     assert raw_new.ledger() == []
+
+# ---------------------------------------------------------------------------
+# RXN-REMOVE-003 completion authority binding — rejected new lifecycle must not
+# mutate retained old message, original lifecycle must reconcile correctly
+# Public adapter/effect-ledger regressions for SUCCESS/CANCELLED x false/exception
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_rejected_completion_authority_binding_success_false():
+    """SUCCESS False: retained old authority is bound to original raw; rejected new completion after recovery leaves old ledger byte-unchanged."""
+    cfg = PlatformConfig(enabled=True, token="***")
+    cfg.extra = {"persona_emoji": "🤖", "dynamic_reactions": True, "reaction_cooldown": 0}
+    ad = DiscordAdapter(cfg)
+    ad._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=99999, name="HermesBot"))
+    ad._rxn_cooldown = 0.0
+
+    src = SessionSource(platform=Platform.DISCORD, chat_id="bind-success-false", chat_type="dm", user_id="42")
+    raw_old = LedgerMessage(msg_id=94001)
+    evt_old = _make_event("94001", raw_old, source=src)
+    await ad.on_processing_start(evt_old)
+    assert raw_old.ledger() == [("add", "🤖")]
+    with patch("agent.display.get_tool_emoji", return_value="📄"):
+        await ad.on_tool_call_start(src, "read_file")
+    assert raw_old.ledger() == [("add", "🤖"), ("add", "📄"), ("remove", "🤖")]
+    assert raw_old.effective() == {"📄"}
+    key = ad._reaction_msg_key(src)
+
+    orig_remove = ad._reaction_remove
+    orig_add = ad._reaction_add
+    ad._reaction_remove = AsyncMock(return_value=False)
+    await ad.on_processing_complete(evt_old, ProcessingOutcome.SUCCESS)
+    # terminal remove unconfirmed => stacked persona + tool
+    assert raw_old.ledger() == [("add", "🤖"), ("add", "📄"), ("remove", "🤖"), ("add", "🤖")]
+    assert raw_old.effective() == {"🤖", "📄"}
+    assert key in ad._rxn_active
+    assert ad._rxn_msg_refs.get(key) is raw_old
+    assert key in getattr(ad, "_rxn_retained", set())
+
+    # New same-key start must be deferred before any remote mutation
+    raw_new = LedgerMessage(msg_id=94002)
+    evt_new = _make_event("94002", raw_new, source=src)
+    await ad.on_processing_start(evt_new)
+    assert raw_new.ledger() == [], "new start must perform no remote add/set"
+    assert raw_new.effective() == set()
+    assert raw_old.ledger() == [("add", "🤖"), ("add", "📄"), ("remove", "🤖"), ("add", "🤖")]
+    assert ad._rxn_msg_refs.get(key) is raw_old
+
+    # Control: provider still failing — rejected new completion must not duplicate old
+    snapshot_before_fail = list(raw_old.ledger())
+    await ad.on_processing_complete(evt_new, ProcessingOutcome.SUCCESS)
+    assert raw_old.ledger() == snapshot_before_fail, "rejected new completion with provider still failing must not mutate old"
+    assert raw_new.ledger() == []
+    assert key in ad._rxn_active
+    assert ad._rxn_msg_refs.get(key) is raw_old
+    assert key in getattr(ad, "_rxn_retained", set())
+    assert raw_old.effective() == {"🤖", "📄"}
+
+    # Recover provider, then rejected new completion must still leave old byte-unchanged
+    ad._reaction_remove = orig_remove
+    ad._reaction_add = orig_add
+    snapshot_before_recovery = list(raw_old.ledger())
+    await ad.on_processing_complete(evt_new, ProcessingOutcome.SUCCESS)
+    assert raw_old.ledger() == snapshot_before_recovery, "rejected new completion after recovery must not mutate old"
+    assert raw_new.ledger() == []
+    assert key in ad._rxn_active, "authority must not be cleared by rejected callback"
+    assert ad._rxn_msg_refs.get(key) is raw_old
+    assert key in getattr(ad, "_rxn_retained", set())
+    assert raw_old.effective() == {"🤖", "📄"}
+
+    # Original lifecycle public reconciliation with successful provider cleans correctly
+    await ad.on_processing_complete(evt_old, ProcessingOutcome.SUCCESS)
+    assert raw_old.effective() == {"🤖"}, "original retry must clean old tool, leaving single persona"
+    assert key not in ad._rxn_active
+    assert key not in ad._rxn_msg_refs
+    assert key not in getattr(ad, "_rxn_retained", set())
+    assert raw_new.ledger() == []
+
+
+@pytest.mark.asyncio
+async def test_rejected_completion_authority_binding_success_exception():
+    """SUCCESS exception: rejected new completion after recovery leaves old unchanged, original cleans."""
+    cfg = PlatformConfig(enabled=True, token="***")
+    cfg.extra = {"persona_emoji": "🤖", "dynamic_reactions": True, "reaction_cooldown": 0}
+    ad = DiscordAdapter(cfg)
+    ad._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=99999, name="HermesBot"))
+    ad._rxn_cooldown = 0.0
+
+    src = SessionSource(platform=Platform.DISCORD, chat_id="bind-success-exc", chat_type="dm", user_id="42")
+    raw_old = LedgerMessage(msg_id=94011)
+    evt_old = _make_event("94011", raw_old, source=src)
+    await ad.on_processing_start(evt_old)
+    with patch("agent.display.get_tool_emoji", return_value="📄"):
+        await ad.on_tool_call_start(src, "read_file")
+    assert raw_old.effective() == {"📄"}
+    key = ad._reaction_msg_key(src)
+
+    orig_remove = ad._reaction_remove
+    ad._reaction_remove = AsyncMock(side_effect=RuntimeError("boom"))
+    await ad.on_processing_complete(evt_old, ProcessingOutcome.SUCCESS)
+    assert raw_old.ledger() == [("add", "🤖"), ("add", "📄"), ("remove", "🤖"), ("add", "🤖")]
+    assert raw_old.effective() == {"🤖", "📄"}
+    assert key in getattr(ad, "_rxn_retained", set())
+
+    raw_new = LedgerMessage(msg_id=94012)
+    evt_new = _make_event("94012", raw_new, source=src)
+    await ad.on_processing_start(evt_new)
+    assert raw_new.ledger() == []
+    assert ad._rxn_msg_refs.get(key) is raw_old
+
+    snapshot = list(raw_old.ledger())
+    await ad.on_processing_complete(evt_new, ProcessingOutcome.SUCCESS)
+    assert raw_old.ledger() == snapshot, "rejected new completion while exception still active must not mutate old"
+    assert raw_new.ledger() == []
+    assert key in ad._rxn_active
+
+    ad._reaction_remove = orig_remove
+    snapshot2 = list(raw_old.ledger())
+    await ad.on_processing_complete(evt_new, ProcessingOutcome.SUCCESS)
+    assert raw_old.ledger() == snapshot2, "rejected new completion after recovery must not mutate old"
+    assert raw_new.ledger() == []
+    assert key in ad._rxn_active
+    assert ad._rxn_msg_refs.get(key) is raw_old
+    assert key in getattr(ad, "_rxn_retained", set())
+
+    await ad.on_processing_complete(evt_old, ProcessingOutcome.SUCCESS)
+    assert raw_old.effective() == {"🤖"}
+    assert key not in ad._rxn_active
+    assert key not in getattr(ad, "_rxn_retained", set())
+    assert raw_new.ledger() == []
+
+
+@pytest.mark.asyncio
+async def test_rejected_completion_authority_binding_cancelled_false():
+    """CANCELLED False: rejected new cancellation after recovery leaves old unchanged."""
+    cfg = PlatformConfig(enabled=True, token="***")
+    cfg.extra = {"persona_emoji": "🤖", "dynamic_reactions": True, "reaction_cooldown": 0}
+    ad = DiscordAdapter(cfg)
+    ad._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=99999, name="HermesBot"))
+    ad._rxn_cooldown = 0.0
+
+    src = SessionSource(platform=Platform.DISCORD, chat_id="bind-cancel-false", chat_type="dm", user_id="42")
+    raw_old = LedgerMessage(msg_id=94021)
+    evt_old = _make_event("94021", raw_old, source=src)
+    await ad.on_processing_start(evt_old)
+    with patch("agent.display.get_tool_emoji", return_value="📄"):
+        await ad.on_tool_call_start(src, "read_file")
+    assert raw_old.effective() == {"📄"}
+    key = ad._reaction_msg_key(src)
+
+    orig_remove = ad._reaction_remove
+    ad._reaction_remove = AsyncMock(return_value=False)
+    await ad.on_processing_complete(evt_old, ProcessingOutcome.CANCELLED)
+    assert raw_old.ledger() == [("add", "🤖"), ("add", "📄"), ("remove", "🤖")]
+    assert raw_old.effective() == {"📄"}
+    assert key in ad._rxn_active
+    assert ad._rxn_msg_refs.get(key) is raw_old
+    assert key in getattr(ad, "_rxn_retained", set())
+
+    raw_new = LedgerMessage(msg_id=94022)
+    evt_new = _make_event("94022", raw_new, source=src)
+    await ad.on_processing_start(evt_new)
+    assert raw_new.ledger() == []
+    assert ad._rxn_msg_refs.get(key) is raw_old
+
+    snapshot = list(raw_old.ledger())
+    await ad.on_processing_complete(evt_new, ProcessingOutcome.CANCELLED)
+    assert raw_old.ledger() == snapshot, "rejected new CANCELLED while still failing must not mutate old"
+    assert raw_new.ledger() == []
+    assert key in ad._rxn_active
+
+    ad._reaction_remove = orig_remove
+    snapshot2 = list(raw_old.ledger())
+    await ad.on_processing_complete(evt_new, ProcessingOutcome.CANCELLED)
+    assert raw_old.ledger() == snapshot2, "rejected new CANCELLED after recovery must not mutate old"
+    assert raw_new.ledger() == []
+    assert key in ad._rxn_active
+    assert key in getattr(ad, "_rxn_retained", set())
+    assert raw_old.effective() == {"📄"}
+
+    await ad.on_processing_complete(evt_old, ProcessingOutcome.CANCELLED)
+    assert raw_old.effective() == set()
+    assert key not in ad._rxn_active
+    assert key not in ad._rxn_msg_refs
+    assert key not in getattr(ad, "_rxn_retained", set())
+    assert raw_new.ledger() == []
+
+
+@pytest.mark.asyncio
+async def test_rejected_completion_authority_binding_cancelled_exception():
+    """CANCELLED exception: rejected new cancellation after recovery leaves old unchanged."""
+    cfg = PlatformConfig(enabled=True, token="***")
+    cfg.extra = {"persona_emoji": "🤖", "dynamic_reactions": True, "reaction_cooldown": 0}
+    ad = DiscordAdapter(cfg)
+    ad._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=99999, name="HermesBot"))
+    ad._rxn_cooldown = 0.0
+
+    src = SessionSource(platform=Platform.DISCORD, chat_id="bind-cancel-exc", chat_type="dm", user_id="42")
+    raw_old = LedgerMessage(msg_id=94031)
+    evt_old = _make_event("94031", raw_old, source=src)
+    await ad.on_processing_start(evt_old)
+    with patch("agent.display.get_tool_emoji", return_value="📄"):
+        await ad.on_tool_call_start(src, "read_file")
+    assert raw_old.effective() == {"📄"}
+    key = ad._reaction_msg_key(src)
+
+    orig_remove = ad._reaction_remove
+    ad._reaction_remove = AsyncMock(side_effect=RuntimeError("transport"))
+    await ad.on_processing_complete(evt_old, ProcessingOutcome.CANCELLED)
+    assert raw_old.ledger() == [("add", "🤖"), ("add", "📄"), ("remove", "🤖")]
+    assert raw_old.effective() == {"📄"}
+    assert key in getattr(ad, "_rxn_retained", set())
+
+    raw_new = LedgerMessage(msg_id=94032)
+    evt_new = _make_event("94032", raw_new, source=src)
+    await ad.on_processing_start(evt_new)
+    assert raw_new.ledger() == []
+    assert ad._rxn_msg_refs.get(key) is raw_old
+
+    snapshot = list(raw_old.ledger())
+    await ad.on_processing_complete(evt_new, ProcessingOutcome.CANCELLED)
+    assert raw_old.ledger() == snapshot
+    assert raw_new.ledger() == []
+    assert key in ad._rxn_active
+
+    ad._reaction_remove = orig_remove
+    snapshot2 = list(raw_old.ledger())
+    await ad.on_processing_complete(evt_new, ProcessingOutcome.CANCELLED)
+    assert raw_old.ledger() == snapshot2, "rejected new CANCELLED after recovery must not mutate old"
+    assert raw_new.ledger() == []
+    assert key in ad._rxn_active
+    assert key in getattr(ad, "_rxn_retained", set())
+
+    await ad.on_processing_complete(evt_old, ProcessingOutcome.CANCELLED)
+    assert raw_old.effective() == set()
+    assert key not in ad._rxn_active
+    assert key not in getattr(ad, "_rxn_retained", set())
+    assert raw_new.ledger() == []
