@@ -4011,6 +4011,7 @@ class TestNativePublicRawLongUserinfoRegression:
     """
 
     LONG_OPAQUE = "longOpaqueUserInfo1234567890ABCDEFExtraLongTail1234567890"
+    # Raw untrusted opaque userinfo URL – must be built from LONG_OPAQUE with no masked placeholder
     RAW_URL_BARE = f"https://{LONG_OPAQUE}@ex.com/p"
     RAW_URL_USERPASS = f"https://alice:{LONG_OPAQUE}@ex.com/p"
     DANGEROUS_PREFIX = LONG_OPAQUE[:8]
@@ -4280,6 +4281,7 @@ class TestNativeEnabledFinalDelivery:
         from tools.registry import registry
 
         LONG_OPAQUE = "longOpaqueUserInfo1234567890ABCDEFExtraLongTail1234567890"
+        # Raw untrusted opaque userinfo URL – must be built from LONG_OPAQUE with no masked placeholder
         RAW_URL = f"https://{LONG_OPAQUE}@ex.com/p"
         RAW_URL_USERPASS = f"https://alice:{LONG_OPAQUE}@ex.com/p"
         DANGEROUS_PREFIX = LONG_OPAQUE[:8]
