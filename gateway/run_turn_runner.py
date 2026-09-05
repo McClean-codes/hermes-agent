@@ -53,7 +53,7 @@ def _redact_progress_text(text: str | None) -> str:
     try:
         from agent.redact import redact_sensitive_text
 
-        return redact_sensitive_text(s, force=True)
+        return redact_sensitive_text(s, force=True, redact_url_credentials=True)
     except Exception:
         try:
             from gateway.run import _redact_gateway_user_facing_secrets
@@ -125,9 +125,11 @@ def _get_tool_categories(tool_name: str) -> list[str]:
             toolset_for_skill = None
         if toolset_for_skill == "skills":
             cats.append("skills")
-        elif name_lower in _SKILL_TOOL_NAMES:
+        elif entry_for_skill is None and name_lower in _SKILL_TOOL_NAMES:
             # Fallback allowlist when registry not yet populated or tool not registered
             # via registry (e.g., early turn before tool discovery). No prefix matching.
+            # When an authoritative registry entry exists, its provenance wins — do not
+            # add skills solely from the static allowlist (plugin/MCP authoritative).
             cats.append("skills")
     except Exception:
         # Registry unavailable: use allowlist only
