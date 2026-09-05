@@ -675,3 +675,105 @@ async def test_process_message_background_adds_and_swaps_reactions_legacy(adapte
     # So ledger should be just the initial add (no tool swaps)
     assert raw.effective() == {"👀"}
     assert "✅" not in raw.effective()
+
+# ---------------------------------------------------------------------------
+# Confirmed-start parity regression — provider outcome must gate state and ACK
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_on_processing_start_provider_false_leaves_no_state_and_ack_false(adapter):
+    """Provider False must not commit active/msg_refs and must record emoji_ack=False."""
+    adapter.config.extra["persona_emoji"] = "🤖"
+    adapter._rxn_persona_emoji = "🤖"
+    raw = LedgerMessage(msg_id=9001)
+    event = _make_event("9001", raw)
+    # deterministic fake at provider boundary only
+    adapter._reaction_add = AsyncMock(return_value=False)
+    ack_record = MagicMock()
+    adapter._record_discord_processing_start = ack_record
+
+    await adapter.on_processing_start(event)
+
+    key = adapter._reaction_msg_key(event)
+    assert raw.ledger() == []
+    assert key not in adapter._rxn_active
+    assert key not in adapter._rxn_msg_refs
+    assert ack_record.call_count == 1
+    assert ack_record.call_args.kwargs["emoji_ack"] is False
+
+
+@pytest.mark.asyncio
+async def test_on_processing_start_provider_exception_leaves_no_state_and_ack_false(adapter):
+    """Provider exception must not commit state and must record emoji_ack=False."""
+    adapter.config.extra["persona_emoji"] = "🤖"
+    adapter._rxn_persona_emoji = "🤖"
+    raw = LedgerMessage(msg_id=9002)
+    event = _make_event("9002", raw)
+    adapter._reaction_add = AsyncMock(side_effect=RuntimeError("boom"))
+    ack_record = MagicMock()
+    adapter._record_discord_processing_start = ack_record
+
+    await adapter.on_processing_start(event)
+
+    key = adapter._reaction_msg_key(event)
+    assert raw.ledger() == []
+    assert key not in adapter._rxn_active
+    assert key not in adapter._rxn_msg_refs
+    assert ack_record.call_count == 1
+    assert ack_record.call_args.kwargs["emoji_ack"] is False
+
+
+@pytest.mark.asyncio
+async def test_on_processing_start_missing_capability_leaves_no_state_and_ack_false(adapter, monkeypatch):
+    """Missing capability (no add_reaction) / disabled must not commit state and ack False."""
+    adapter.config.extra["persona_emoji"] = "🤖"
+    adapter._rxn_persona_emoji = "🤖"
+    # use a raw message without add_reaction to simulate missing capability
+    raw_no_cap = SimpleNamespace(id=9003)
+    event = _make_event("9003", raw_no_cap)
+    ack_record = MagicMock()
+    adapter._record_discord_processing_start = ack_record
+
+    await adapter.on_processing_start(event)
+
+    key = adapter._reaction_msg_key(event)
+    # no provider add should have been attempted via ledger, active/msg_refs empty
+    assert key not in adapter._rxn_active
+    assert key not in adapter._rxn_msg_refs
+    assert ack_record.call_count == 1
+    assert ack_record.call_args.kwargs["emoji_ack"] is False
+
+    # also verify disabled path produces same false ack via env
+    monkeypatch.setenv("DISCORD_REACTIONS", "false")
+    raw2 = LedgerMessage(msg_id=9004)
+    event2 = _make_event("9004", raw2)
+    ack2 = MagicMock()
+    adapter._record_discord_processing_start = ack2
+    await adapter.on_processing_start(event2)
+    key2 = adapter._reaction_msg_key(event2)
+    assert raw2.ledger() == []
+    assert key2 not in adapter._rxn_active
+    assert key2 not in adapter._rxn_msg_refs
+    assert ack2.call_count == 1
+    assert ack2.call_args.kwargs["emoji_ack"] is False
+
+
+@pytest.mark.asyncio
+async def test_on_processing_start_confirmed_add_records_ack_true(adapter):
+    """Confirmed provider success commits state, populates ledger, and records emoji_ack=True."""
+    adapter.config.extra["persona_emoji"] = "🤖"
+    adapter._rxn_persona_emoji = "🤖"
+    raw = LedgerMessage(msg_id=9005)
+    event = _make_event("9005", raw)
+    ack_record = MagicMock()
+    adapter._record_discord_processing_start = ack_record
+
+    await adapter.on_processing_start(event)
+
+    key = adapter._reaction_msg_key(event)
+    assert raw.ledger() == [("add", "🤖")]
+    assert raw.effective() == {"🤖"}
+    assert adapter._rxn_active.get(key) == "🤖"
+    assert adapter._rxn_msg_refs.get(key) is raw
+    assert ack_record.call_count == 1
+    assert ack_record.call_args.kwargs["emoji_ack"] is True

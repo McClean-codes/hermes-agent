@@ -181,19 +181,25 @@ class DynamicReactionMixin:
             self._rxn_locks[key] = asyncio.Lock()
         return self._rxn_locks[key]
 
-    async def _rxn_on_processing_start(self, event: Any) -> None:
-        """Add persona emoji when processing begins."""
+    async def _rxn_on_processing_start(self, event: Any) -> bool:
+        """Add persona emoji when processing begins.
+
+        Returns True only after the provider confirms success (``_reaction_add``
+        or ``_reaction_set`` returns truthy); False on disabled behavior,
+        missing capability, provider ``False``, or exception.  Commits
+        ``_rxn_active`` and ``_rxn_msg_refs`` only on confirmed success.
+        """
         if not getattr(self, "_rxn_initialized", False):
-            return
+            return False
         if not self._rxn_reactions_enabled():
-            return
+            return False
 
         msg_ref = self._reaction_resolve_message(event)
         if msg_ref is None:
-            return
+            return False
         key = self._reaction_msg_key(event)
         if key is None:
-            return
+            return False
 
         emoji = self._rxn_persona_emoji
         translated = self._reaction_translate_emoji(emoji)
@@ -202,14 +208,18 @@ class DynamicReactionMixin:
 
         try:
             if self._reaction_replace_mode:
-                await self._reaction_set(msg_ref, translated)
+                ok = await self._reaction_set(msg_ref, translated)
             else:
-                await self._reaction_add(msg_ref, translated)
+                ok = await self._reaction_add(msg_ref, translated)
+            if not ok:
+                return False
         except Exception as e:
             logger.debug("reaction start add failed (%s): %s", translated, e)
+            return False
 
         self._rxn_active[key] = translated
         self._rxn_msg_refs[key] = msg_ref
+        return True
 
     async def _rxn_on_tool_call_start(self, event: Any, tool_name: str) -> None:
         """Swap reaction to tool-specific emoji (with cooldown)."""

@@ -2786,11 +2786,11 @@ class DiscordAdapter(DynamicReactionMixin, BasePlatformAdapter):
         raw = getattr(event, "raw_message", None)
         if raw:
             self._session_raw_messages[key] = raw
-        await self._rxn_on_processing_start(event)
+        confirmed = await self._rxn_on_processing_start(event)
         await asyncio.to_thread(
             self._record_discord_processing_start,
             event,
-            emoji_ack=True,
+            emoji_ack=bool(confirmed),
         )
 
     async def on_tool_call_start(self, event, tool_name: str) -> None:
