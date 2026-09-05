@@ -143,12 +143,37 @@ class DynamicReactionMixin:
         """Resolve dynamic_reactions flag from platform → global → False."""
         if not self._rxn_reactions_enabled():
             return False
+
+        def _coerce_dynamic(value: Any, default: bool = False) -> bool:
+            """Established bool-token coercion (mirrors gateway.config._coerce_bool)."""
+            try:
+                from gateway.config import _coerce_bool
+
+                return _coerce_bool(value, default)
+            except Exception:
+                if isinstance(value, bool):
+                    return value
+                if isinstance(value, str):
+                    tok = value.strip().lower()
+                    if tok in ("1", "true", "yes", "on"):
+                        return True
+                    if tok in ("0", "false", "no", "off"):
+                        return False
+                    return default
+                if value is None:
+                    return default
+                try:
+                    return bool(value)
+                except Exception:
+                    return default
+
         extra = getattr(getattr(self, "config", None), "extra", {}) or {}
         if "dynamic_reactions" in extra:
-            return bool(extra["dynamic_reactions"])
+            return _coerce_dynamic(extra["dynamic_reactions"], False)
         try:
             from hermes_cli.config import load_config
-            return bool(load_config().get("dynamic_reactions", False))
+
+            return _coerce_dynamic(load_config().get("dynamic_reactions", False), False)
         except Exception:
             return False
 

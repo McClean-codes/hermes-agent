@@ -2755,7 +2755,70 @@ class DiscordAdapter(DynamicReactionMixin, BasePlatformAdapter):
         """Derive a stable session key from a SessionSource or MessageEvent."""
         if hasattr(source, "source") and source.source is not None:
             source = source.source
-        return f"{source.platform}:{source.chat_id}:{source.thread_id or ''}"
+        # Canonical participant/profile-scoped identity (parity with SessionStore/ build_session_key)
+        try:
+            from gateway.session import build_session_key
+
+            profile = getattr(source, "profile", None)
+            group_per_user = True
+            thread_per_user = False
+            gcfg = None
+            if getattr(self, "gateway_runner", None) is not None:
+                gcfg = getattr(self.gateway_runner, "config", None)
+            if gcfg is not None:
+                group_per_user = getattr(gcfg, "group_sessions_per_user", True)
+                thread_per_user = getattr(gcfg, "thread_sessions_per_user", False)
+                try:
+                    from gateway.config import _coerce_bool
+
+                    group_per_user = _coerce_bool(group_per_user, True)
+                    thread_per_user = _coerce_bool(thread_per_user, False)
+                    multiplex = _coerce_bool(getattr(gcfg, "multiplex_profiles", False), False)
+                except Exception:
+                    multiplex = bool(getattr(gcfg, "multiplex_profiles", False))
+                if not multiplex:
+                    profile = None
+            else:
+                # Best-effort file config; defaults already True/False and source profile
+                try:
+                    from hermes_cli.config import load_config
+
+                    raw = load_config()
+                    if isinstance(raw, dict):
+                        gw = raw.get("gateway") if isinstance(raw.get("gateway"), dict) else {}
+                        def _pick(key, default):
+                            if key in raw:
+                                return raw[key]
+                            if key in gw:
+                                return gw[key]
+                            return default
+                        try:
+                            from gateway.config import _coerce_bool
+
+                            group_per_user = _coerce_bool(_pick("group_sessions_per_user", group_per_user), True)
+                            thread_per_user = _coerce_bool(_pick("thread_sessions_per_user", thread_per_user), False)
+                            multiplex_raw = _pick("multiplex_profiles", None)
+                            if multiplex_raw is not None:
+                                multiplex = _coerce_bool(multiplex_raw, False)
+                                if not multiplex:
+                                    profile = None
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            if hasattr(source, "chat_id") and hasattr(source, "platform"):
+                return build_session_key(
+                    source,
+                    group_sessions_per_user=group_per_user,
+                    thread_sessions_per_user=thread_per_user,
+                    profile=profile,
+                )
+        except Exception:
+            pass
+        try:
+            return f"{source.platform}:{source.chat_id}:{source.thread_id or ''}"
+        except Exception:
+            return str(source)
 
     async def _reaction_add(self, msg_ref, emoji):
         """Add an emoji reaction to a Discord message."""
