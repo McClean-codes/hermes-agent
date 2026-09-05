@@ -485,14 +485,50 @@ class TurnRunner:
             )
 
             if status in SUBAGENT_FAILURE_STATUSES and ctx._run_still_current():
+                # SEC-PF-SUBAGENT-NOTICE-EGRESS: strict URL-aware fail-closed redaction before formatting
+                # and again immediately before the notifier/adapter boundary. Both layers must fail
+                # closed to fixed safe content; never enqueue raw input.
+                def _strict_notice_redact(value) -> str:
+                    if value is None:
+                        return ""
+                    s = str(value)
+                    if not s:
+                        return s
+                    try:
+                        return _redact_progress_text(s)
+                    except Exception:
+                        logger.debug("notice redaction primary failed", exc_info=True)
+                        return "[REDACTED]"
+
+                raw_goal = kwargs.get("goal")
+                raw_error = kwargs.get("summary") or preview
+                # Redact untrusted values before formatting so truncation (60/200 cap) sees redacted text
+                try:
+                    redacted_goal = _strict_notice_redact(raw_goal) if raw_goal is not None else raw_goal
+                except Exception:
+                    redacted_goal = "[REDACTED]"
+                try:
+                    redacted_error = _strict_notice_redact(raw_error) if raw_error is not None else ""
+                except Exception:
+                    redacted_error = "[REDACTED]"
+
                 line = format_subagent_failure_line(
-                    kwargs.get("goal"),
+                    redacted_goal,
                     status,
-                    error=kwargs.get("summary") or preview,
+                    error=redacted_error,
                     duration_seconds=kwargs.get("duration_seconds"),
                 )
+                # Second strict redaction immediately before notifier boundary
+                try:
+                    safe_line = _redact_progress_text(line)
+                except Exception:
+                    logger.debug("notice line final redaction failed", exc_info=True)
+                    safe_line = "[REDACTED]"
+                if not safe_line:
+                    safe_line = "[REDACTED]"
+
                 self._schedule(
-                    self._runner._deliver_platform_notice(ctx.source, line),
+                    self._runner._deliver_platform_notice(ctx.source, safe_line),
                     "subagent failure notice scheduling error",
                 )
         except Exception:

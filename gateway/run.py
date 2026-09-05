@@ -645,8 +645,8 @@ def _looks_like_gateway_provider_error(text: str) -> bool:
 
 
 def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
-    """Sanitize final gateway replies for chat surfaces: concise, secret-redacted provider failure
-    categories instead of raw HTTP bodies, request IDs, leaked credentials, or policy text."""
+    """Sanitize final gateway replies for chat surfaces: strict URL-aware fail-closed redaction plus
+    concise provider-failure categories instead of raw HTTP bodies, request IDs, leaked credentials, or policy text."""
     if not text or _gateway_surface_passes_raw_text(platform):
         return text
 
@@ -666,7 +666,30 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     if str(text).strip().startswith(INTERRUPT_WAITING_FOR_MODEL_PREFIX):
         return ""
 
-    redacted = _redact_gateway_user_facing_secrets(str(text))
+    # SEC-PF-FINAL-URL-EGRESS: strict URL-aware fail-closed redaction, same contract as progress/status
+    orig = str(text)
+    try:
+        from gateway.run_turn_runner import _redact_progress_text as _strict_redact  # type: ignore[import]
+
+        redacted = _strict_redact(text)
+    except Exception:
+        try:
+            redacted_tmp = _redact_gateway_user_facing_secrets(text)
+            try:
+                from agent.redact import _redact_strict_url_credentials
+
+                redacted = _redact_strict_url_credentials(redacted_tmp)
+            except Exception:
+                if "://" in orig:
+                    if redacted_tmp != orig and ("***" in redacted_tmp or "[REDACTED]" in redacted_tmp):
+                        redacted = redacted_tmp
+                    else:
+                        redacted = "[REDACTED]"
+                else:
+                    redacted = redacted_tmp
+        except Exception:
+            logger.debug("final response redaction unavailable", exc_info=True)
+            redacted = "[REDACTED]"
     if _looks_like_gateway_provider_error(redacted):
         return _gateway_provider_error_reply(redacted)
     return redacted

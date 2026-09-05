@@ -4890,3 +4890,706 @@ class TestProductionSeamFalsification:
             for tasks in ledger2
             for t in tasks
         )
+
+# ---------------------------------------------------------------------------
+# SEC-PF-FINAL-URL-EGRESS and SEC-PF-SUBAGENT-NOTICE-EGRESS — consolidated strict redaction
+# ---------------------------------------------------------------------------
+
+class TestFinalSlackHostileStrictEgress:
+    """SEC-PF-FINAL-URL-EGRESS: real GatewayRunner final Slack delivery must strictly redact opaque userinfo and query credentials."""
+
+    LONG_OPAQUE = "longOpaqueUserInfo1234567890ABCDEFExtraLongTail1234567890"
+    OPAQUE_TOKEN = "opaqueTok12345"
+    OPAQUE_API_KEY = "opaqueKey67890"
+    OPAQUE_SIG = "opaqueSigAbCd12"
+    DANGEROUS_PREFIX = LONG_OPAQUE[:8]
+
+    # Synthetic hostile URLs — raw, never pre-masked
+    RAW_URL_BARE = f"https://{LONG_OPAQUE}@ex.com/p"
+    RAW_URL_USERPASS = f"https://alice:{LONG_OPAQUE}@ex.com/p"
+    RAW_URL_QUERY = f"https://ex.com/cb?token={OPAQUE_TOKEN}&api_key={OPAQUE_API_KEY}&signature={OPAQUE_SIG}"
+    RAW_URL_COMBINED = f"https://{LONG_OPAQUE}@ex.com/p?token={OPAQUE_TOKEN}&api_key={OPAQUE_API_KEY}"
+
+    @pytest.mark.asyncio
+    async def test_final_hostile_via_production_gateway_slack_no_leakage(self):
+        from gateway.config import Platform, GatewayConfig, PlatformConfig
+        from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
+        from gateway.run import GatewayRunner
+        from gateway.session import SessionSource, SessionEntry, build_session_key
+        from unittest.mock import MagicMock, AsyncMock, patch
+        from datetime import datetime, timedelta
+        import asyncio, os, json
+        from types import SimpleNamespace
+
+        hostile_final = f"Result with userinfo {self.RAW_URL_BARE} and query {self.RAW_URL_QUERY} and combined {self.RAW_URL_COMBINED} also {self.RAW_URL_USERPASS}"
+
+        ledger: list[str] = []
+        native_ledger: list = []
+        fallback_ledger: list[str] = []
+
+        class _CaptureSlackAdapter(BasePlatformAdapter):
+            def __init__(self):
+                super().__init__(PlatformConfig(enabled=True, token="xoxb-fake"), Platform.SLACK)
+
+            async def connect(self, *, is_reconnect: bool = False) -> bool:
+                return True
+
+            async def disconnect(self) -> None:
+                return None
+
+            async def send(self, chat_id, content, reply_to=None, metadata=None):
+                ledger.append(content)
+                return SendResult(success=True, message_id="slack-final-1")
+
+            async def send_typing(self, chat_id, metadata=None):
+                return None
+
+            async def get_chat_info(self, chat_id):
+                return {"id": chat_id}
+
+            def native_task_cards_enabled(self) -> bool:
+                return True
+
+            async def send_native_task_card_progress(self, chat_id, tasks, title, reply_to=None, metadata=None, fallback_text=None):
+                native_ledger.append(list(tasks))
+                if fallback_text:
+                    fallback_ledger.append(fallback_text)
+                m = MagicMock()
+                m.success = True
+                m.message_id = "native-1"
+                return m
+
+            async def stop_native_task_card_progress(self, chat_id, reply_to=None, metadata=None):
+                return None
+
+        fake_adapter = _CaptureSlackAdapter()
+        fake_adapter.send = AsyncMock(side_effect=fake_adapter.send)
+        fake_adapter.send_native_task_card_progress = AsyncMock(side_effect=fake_adapter.send_native_task_card_progress)  # type: ignore[attr-defined]
+
+        config = GatewayConfig(platforms={Platform.SLACK: PlatformConfig(enabled=True, token="xoxb-fake")})
+        gw = GatewayRunner(config=config)
+        gw.adapters = {Platform.SLACK: fake_adapter}
+        gw._is_user_authorized = lambda _source: True
+        gw._is_user_authorized_for_source = lambda _s, **kw: True
+        gw._session_db = MagicMock()
+        gw._session_db.get_telegram_topic_binding = AsyncMock(return_value=None)
+        gw._session_db.get_compression_tip = AsyncMock(return_value=None)
+        gw.hooks = MagicMock()
+        gw.hooks.emit = AsyncMock()
+        now = datetime.now()
+        session_entry = SessionEntry(
+            session_key="agent:main:slack:channel:C123:U123",
+            session_id="sess-final-hostile-1",
+            created_at=now - timedelta(seconds=10),
+            updated_at=now,
+            platform=Platform.SLACK,
+            chat_type="channel",
+        )
+        gw.session_store = MagicMock()
+        gw.session_store.get_or_create_session.return_value = session_entry
+        gw.session_store.load_transcript.return_value = []
+        gw.session_store.has_any_sessions.return_value = True
+        gw.session_store.rewrite_transcript = MagicMock()
+        gw.session_store.append_to_transcript = MagicMock()
+        gw.session_store.update_session = MagicMock()
+        gw.session_store.has_platform_message_id = MagicMock(return_value=False)
+        gw.session_store._save = MagicMock()
+        gw.session_store._record_gateway_session_peer = MagicMock()
+        gw._async_session_store = gw.session_store  # type: ignore[attr-defined]
+        gw._adapter_for_source = lambda source: fake_adapter
+        gw._resolve_session_agent_runtime = MagicMock(return_value=("test/model", {"api_key": "fake", "base_url": "https://openrouter.ai/api/v1"}))
+        gw._resolve_session_reasoning_config = MagicMock(return_value=None)
+        gw._resolve_session_service_tier = MagicMock(return_value=None)
+        gw._provider_routing = {}
+        gw._reasoning_config = None
+        gw._service_tier = None
+        gw._is_session_run_current = lambda _k, _g: True
+
+        _orig_disp = gw._run_agent_display_settings
+
+        def _patched_disp(src):
+            d = _orig_disp(src)
+            d.progress_mode = "all"
+            d.tool_progress_enabled = True
+            try:
+                f = dict(d.tool_progress_filter) if isinstance(d.tool_progress_filter, dict) else {}
+            except Exception:
+                f = {}
+            f["_test_hostile_final_tool"] = "all"
+            d.tool_progress_filter = f
+            d.needs_progress_queue = True
+            return d
+
+        gw._run_agent_display_settings = _patched_disp
+
+        event = MessageEvent(
+            text="hi",
+            source=SessionSource(platform=Platform.SLACK, chat_id="C123", chat_type="channel", user_id="U123", thread_id="T123"),
+            message_id="msg-final-hostile-1",
+        )
+        fake_adapter.set_message_handler(gw._handle_message)
+        fake_adapter._keep_typing = lambda *a, **kw: asyncio.Event().wait()
+        _orig_home = os.environ.get("SLACK_HOME_CHANNEL")
+        os.environ["SLACK_HOME_CHANNEL"] = "C123"
+
+        def _direct_side_effect(agent, api_kwargs):
+            msg = SimpleNamespace(content=hostile_final, tool_calls=None)
+            choice = SimpleNamespace(message=msg, finish_reason="stop")
+            return SimpleNamespace(choices=[choice], model="test/model", usage=None)
+
+        try:
+            with (
+                patch("model_tools.get_tool_definitions", return_value=[]),
+                patch("model_tools.check_toolset_requirements", return_value={}),
+                patch("agent.chat_completion_helpers.direct_api_call", side_effect=_direct_side_effect),
+                patch("agent.chat_completion_helpers.interruptible_api_call", side_effect=_direct_side_effect),
+                patch("agent.chat_completion_helpers.interruptible_streaming_api_call", side_effect=lambda agent, api_kwargs, **kw: _direct_side_effect(agent, api_kwargs)),
+                patch("agent.chat_completion_helpers.should_use_direct_api_call", return_value=True),
+                patch("agent.process_bootstrap.OpenAI"),
+            ):
+                await fake_adapter._process_message_background(event, build_session_key(event.source))
+                # Every final adapter ledger entry must be free of raw hostile values
+                assert len(ledger) >= 1, f"expected at least one final send, got {ledger}"
+                for entry in ledger:
+                    assert self.RAW_URL_BARE not in entry, f"raw bare URL leaked in final: {entry!r}"
+                    assert self.RAW_URL_USERPASS not in entry, f"raw userpass URL leaked in final: {entry!r}"
+                    assert self.RAW_URL_QUERY not in entry, f"raw query URL leaked in final: {entry!r}"
+                    assert self.RAW_URL_COMBINED not in entry, f"raw combined URL leaked in final: {entry!r}"
+                    assert self.LONG_OPAQUE not in entry, f"opaque long userinfo leaked in final: {entry!r}"
+                    assert self.OPAQUE_TOKEN not in entry, f"opaque token leaked in final: {entry!r}"
+                    assert self.OPAQUE_API_KEY not in entry, f"opaque api_key leaked in final: {entry!r}"
+                    assert self.OPAQUE_SIG not in entry, f"opaque signature leaked in final: {entry!r}"
+                    assert self.DANGEROUS_PREFIX not in entry, f"dangerous prefix leaked in final: {entry!r}"
+                # Ensure at least one redaction marker is present (strict egress applied)
+                # For URL-bearing hostile, strict redactor masks credentials; check not empty and not equal to raw
+                for entry in ledger:
+                    assert entry != hostile_final, "final ledger equals raw hostile input — redaction did not apply"
+                # No duplicate final after tool.completed — sleep and check counts stable
+                prev = fake_adapter.send.call_count
+                await asyncio.sleep(0.35)
+                assert fake_adapter.send.call_count == prev, "unexpected duplicate final send after tool.completed"
+        finally:
+            if _orig_home is None:
+                os.environ.pop("SLACK_HOME_CHANNEL", None)
+            else:
+                os.environ["SLACK_HOME_CHANNEL"] = _orig_home
+
+    @pytest.mark.asyncio
+    async def test_final_both_layers_fail_closed_to_REDACTED(self):
+        from gateway.config import Platform, GatewayConfig, PlatformConfig
+        from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
+        from gateway.run import GatewayRunner
+        from gateway.session import SessionSource, SessionEntry, build_session_key
+        from unittest.mock import MagicMock, AsyncMock, patch
+        from datetime import datetime, timedelta
+        import asyncio, os
+        from types import SimpleNamespace
+
+        hostile_final = f"https://{self.LONG_OPAQUE}@ex.com/p?token={self.OPAQUE_TOKEN}"
+
+        ledger: list[str] = []
+
+        class _CaptureSlackAdapter(BasePlatformAdapter):
+            def __init__(self):
+                super().__init__(PlatformConfig(enabled=True, token="xoxb-fake"), Platform.SLACK)
+
+            async def connect(self, *, is_reconnect: bool = False) -> bool:
+                return True
+
+            async def disconnect(self) -> None:
+                return None
+
+            async def send(self, chat_id, content, reply_to=None, metadata=None):
+                ledger.append(content)
+                return SendResult(success=True, message_id="slack-fail-1")
+
+            async def send_typing(self, chat_id, metadata=None):
+                return None
+
+            async def get_chat_info(self, chat_id):
+                return {"id": chat_id}
+
+        fake_adapter = _CaptureSlackAdapter()
+        fake_adapter.send = AsyncMock(side_effect=fake_adapter.send)
+        config = GatewayConfig(platforms={Platform.SLACK: PlatformConfig(enabled=True, token="xoxb-fake")})
+        gw = GatewayRunner(config=config)
+        gw.adapters = {Platform.SLACK: fake_adapter}
+        gw._is_user_authorized = lambda _source: True
+        gw._is_user_authorized_for_source = lambda _s, **kw: True
+        gw._session_db = MagicMock()
+        gw._session_db.get_telegram_topic_binding = AsyncMock(return_value=None)
+        gw._session_db.get_compression_tip = AsyncMock(return_value=None)
+        gw.hooks = MagicMock()
+        gw.hooks.emit = AsyncMock()
+        now = datetime.now()
+        session_entry = SessionEntry(
+            session_key="agent:main:slack:channel:C123:U123",
+            session_id="sess-final-fail-1",
+            created_at=now - timedelta(seconds=10),
+            updated_at=now,
+            platform=Platform.SLACK,
+            chat_type="channel",
+        )
+        gw.session_store = MagicMock()
+        gw.session_store.get_or_create_session.return_value = session_entry
+        gw.session_store.load_transcript.return_value = []
+        gw.session_store.has_any_sessions.return_value = True
+        gw.session_store.rewrite_transcript = MagicMock()
+        gw.session_store.append_to_transcript = MagicMock()
+        gw.session_store.update_session = MagicMock()
+        gw.session_store.has_platform_message_id = MagicMock(return_value=False)
+        gw.session_store._save = MagicMock()
+        gw.session_store._record_gateway_session_peer = MagicMock()
+        gw._async_session_store = gw.session_store  # type: ignore[attr-defined]
+        gw._adapter_for_source = lambda source: fake_adapter
+        gw._resolve_session_agent_runtime = MagicMock(return_value=("test/model", {"api_key": "fake", "base_url": "https://openrouter.ai/api/v1"}))
+        gw._resolve_session_reasoning_config = MagicMock(return_value=None)
+        gw._resolve_session_service_tier = MagicMock(return_value=None)
+        gw._provider_routing = {}
+        gw._reasoning_config = None
+        gw._service_tier = None
+        gw._is_session_run_current = lambda _k, _g: True
+
+        event = MessageEvent(
+            text="hi",
+            source=SessionSource(platform=Platform.SLACK, chat_id="C123", chat_type="channel", user_id="U123", thread_id="T123"),
+            message_id="msg-final-fail-1",
+        )
+        fake_adapter.set_message_handler(gw._handle_message)
+        fake_adapter._keep_typing = lambda *a, **kw: asyncio.Event().wait()
+        _orig_home_fail = os.environ.get("SLACK_HOME_CHANNEL")
+        os.environ["SLACK_HOME_CHANNEL"] = "C123"
+        def _direct_side_effect(agent, api_kwargs):
+            msg = SimpleNamespace(content=hostile_final, tool_calls=None)
+            choice = SimpleNamespace(message=msg, finish_reason="stop")
+            return SimpleNamespace(choices=[choice], model="test/model", usage=None)
+
+        try:
+            with (
+                patch("agent.redact.redact_sensitive_text", side_effect=RuntimeError("primary boom")),
+                patch("gateway.run._redact_gateway_user_facing_secrets", side_effect=RuntimeError("gateway boom")),
+                patch("model_tools.get_tool_definitions", return_value=[]),
+                patch("model_tools.check_toolset_requirements", return_value={}),
+                patch("agent.chat_completion_helpers.direct_api_call", side_effect=_direct_side_effect),
+                patch("agent.chat_completion_helpers.interruptible_api_call", side_effect=_direct_side_effect),
+                patch("agent.chat_completion_helpers.interruptible_streaming_api_call", side_effect=lambda agent, api_kwargs, **kw: _direct_side_effect(agent, api_kwargs)),
+                patch("agent.chat_completion_helpers.should_use_direct_api_call", return_value=True),
+                patch("agent.process_bootstrap.OpenAI"),
+            ):
+                await fake_adapter._process_message_background(event, build_session_key(event.source))
+                assert len(ledger) >= 1
+                for entry in ledger:
+                    assert hostile_final not in entry, f"raw hostile leaked despite both-layer failure: {entry!r}"
+                    assert self.LONG_OPAQUE not in entry
+                    assert self.OPAQUE_TOKEN not in entry
+                    assert self.DANGEROUS_PREFIX not in entry
+                    assert entry == "[REDACTED]", f"expected exact [REDACTED] on both-layer failure, got {entry!r}"
+        finally:
+            if _orig_home_fail is None:
+                os.environ.pop("SLACK_HOME_CHANNEL", None)
+            else:
+                os.environ["SLACK_HOME_CHANNEL"] = _orig_home_fail
+
+    @pytest.mark.asyncio
+    async def test_final_non_secret_control_preserved(self):
+        from gateway.config import Platform, GatewayConfig, PlatformConfig
+        from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
+        from gateway.run import GatewayRunner
+        from gateway.session import SessionSource, SessionEntry, build_session_key
+        from unittest.mock import MagicMock, AsyncMock, patch
+        from datetime import datetime, timedelta
+        import asyncio, os
+        from types import SimpleNamespace
+
+        benign_final = "See https://example.com/page?foo=bar&baz=qux for docs — no secrets here."
+
+        ledger: list[str] = []
+
+        class _CaptureSlackAdapter(BasePlatformAdapter):
+            def __init__(self):
+                super().__init__(PlatformConfig(enabled=True, token="xoxb-fake"), Platform.SLACK)
+
+            async def connect(self, *, is_reconnect: bool = False) -> bool:
+                return True
+
+            async def disconnect(self) -> None:
+                return None
+
+            async def send(self, chat_id, content, reply_to=None, metadata=None):
+                ledger.append(content)
+                return SendResult(success=True, message_id="slack-ctrl-1")
+
+            async def send_typing(self, chat_id, metadata=None):
+                return None
+
+            async def get_chat_info(self, chat_id):
+                return {"id": chat_id}
+
+        fake_adapter = _CaptureSlackAdapter()
+        fake_adapter.send = AsyncMock(side_effect=fake_adapter.send)
+        config = GatewayConfig(platforms={Platform.SLACK: PlatformConfig(enabled=True, token="xoxb-fake")})
+        gw = GatewayRunner(config=config)
+        gw.adapters = {Platform.SLACK: fake_adapter}
+        gw._is_user_authorized = lambda _source: True
+        gw._is_user_authorized_for_source = lambda _s, **kw: True
+        gw._session_db = MagicMock()
+        gw._session_db.get_telegram_topic_binding = AsyncMock(return_value=None)
+        gw._session_db.get_compression_tip = AsyncMock(return_value=None)
+        gw.hooks = MagicMock()
+        gw.hooks.emit = AsyncMock()
+        now = datetime.now()
+        session_entry = SessionEntry(
+            session_key="agent:main:slack:channel:C123:U123",
+            session_id="sess-final-ctrl-1",
+            created_at=now - timedelta(seconds=10),
+            updated_at=now,
+            platform=Platform.SLACK,
+            chat_type="channel",
+        )
+        gw.session_store = MagicMock()
+        gw.session_store.get_or_create_session.return_value = session_entry
+        gw.session_store.load_transcript.return_value = []
+        gw.session_store.has_any_sessions.return_value = True
+        gw.session_store.rewrite_transcript = MagicMock()
+        gw.session_store.append_to_transcript = MagicMock()
+        gw.session_store.update_session = MagicMock()
+        gw.session_store.has_platform_message_id = MagicMock(return_value=False)
+        gw.session_store._save = MagicMock()
+        gw.session_store._record_gateway_session_peer = MagicMock()
+        gw._async_session_store = gw.session_store  # type: ignore[attr-defined]
+        gw._adapter_for_source = lambda source: fake_adapter
+        gw._resolve_session_agent_runtime = MagicMock(return_value=("test/model", {"api_key": "fake", "base_url": "https://openrouter.ai/api/v1"}))
+        gw._resolve_session_reasoning_config = MagicMock(return_value=None)
+        gw._resolve_session_service_tier = MagicMock(return_value=None)
+        gw._provider_routing = {}
+        gw._reasoning_config = None
+        gw._service_tier = None
+        gw._is_session_run_current = lambda _k, _g: True
+
+        event = MessageEvent(
+            text="hi",
+            source=SessionSource(platform=Platform.SLACK, chat_id="C123", chat_type="channel", user_id="U123", thread_id="T123"),
+            message_id="msg-final-ctrl-1",
+        )
+        fake_adapter.set_message_handler(gw._handle_message)
+        fake_adapter._keep_typing = lambda *a, **kw: asyncio.Event().wait()
+        _orig_home_ctrl = os.environ.get("SLACK_HOME_CHANNEL")
+        os.environ["SLACK_HOME_CHANNEL"] = "C123"
+        def _direct_side_effect(agent, api_kwargs):
+            msg = SimpleNamespace(content=benign_final, tool_calls=None)
+            choice = SimpleNamespace(message=msg, finish_reason="stop")
+            return SimpleNamespace(choices=[choice], model="test/model", usage=None)
+
+        try:
+            with (
+                patch("model_tools.get_tool_definitions", return_value=[]),
+                patch("model_tools.check_toolset_requirements", return_value={}),
+                patch("agent.chat_completion_helpers.direct_api_call", side_effect=_direct_side_effect),
+                patch("agent.chat_completion_helpers.interruptible_api_call", side_effect=_direct_side_effect),
+                patch("agent.chat_completion_helpers.interruptible_streaming_api_call", side_effect=lambda agent, api_kwargs, **kw: _direct_side_effect(agent, api_kwargs)),
+                patch("agent.chat_completion_helpers.should_use_direct_api_call", return_value=True),
+                patch("agent.process_bootstrap.OpenAI"),
+            ):
+                await fake_adapter._process_message_background(event, build_session_key(event.source))
+                assert len(ledger) >= 1
+                for entry in ledger:
+                    assert "example.com" in entry, f"non-secret URL should survive redaction: {entry!r}"
+                    assert benign_final in entry or "example.com/page?foo=bar" in entry
+        finally:
+            if _orig_home_ctrl is None:
+                os.environ.pop("SLACK_HOME_CHANNEL", None)
+            else:
+                os.environ["SLACK_HOME_CHANNEL"] = _orig_home_ctrl
+
+
+class TestSubagentNoticeHostileStrictEgress:
+    """SEC-PF-SUBAGENT-NOTICE-EGRESS: TurnRunner.progress_callback through GatewayRunner notice to Slack adapter."""
+
+    LONG_OPAQUE = "longOpaqueUserInfo1234567890ABCDEFExtraLongTail1234567890"
+    OPAQUE_TOKEN = "opaqueTok12345"
+    OPAQUE_API_KEY = "opaqueKey67890"
+    DANGEROUS_PREFIX = LONG_OPAQUE[:8]
+
+    RAW_URL_BARE = f"https://{LONG_OPAQUE}@ex.com/p"
+    RAW_URL_QUERY = f"https://ex.com/cb?token={OPAQUE_TOKEN}&api_key={OPAQUE_API_KEY}"
+
+    def _make_gateway_with_slack_ledger(self):
+        from gateway.config import Platform, GatewayConfig, PlatformConfig
+        from gateway.platforms.base import BasePlatformAdapter, SendResult
+        from gateway.run import GatewayRunner
+        from unittest.mock import MagicMock, AsyncMock
+
+        ledger: list[str] = []
+
+        class _LedgerSlackAdapter(BasePlatformAdapter):
+            def __init__(self):
+                super().__init__(PlatformConfig(enabled=True, token="xoxb-fake"), Platform.SLACK)
+
+            async def connect(self, *, is_reconnect: bool = False) -> bool:
+                return True
+
+            async def disconnect(self) -> None:
+                return None
+
+            async def send(self, chat_id, content, reply_to=None, metadata=None):
+                ledger.append(content)
+                return SendResult(success=True, message_id="slack-notice-1")
+
+            async def send_typing(self, chat_id, metadata=None):
+                return None
+
+            async def get_chat_info(self, chat_id):
+                return {"id": chat_id}
+
+            async def send_private_notice(self, chat_id, user_id, content, metadata=None):
+                ledger.append(content)
+                m = MagicMock()
+                m.success = True
+                m.message_id = "priv-1"
+                return m
+
+        adapter = _LedgerSlackAdapter()
+        # Keep original for later patching
+        orig_send = adapter.send
+        adapter.send = AsyncMock(side_effect=orig_send)
+        config = GatewayConfig(platforms={Platform.SLACK: PlatformConfig(enabled=True, token="xoxb-fake")})
+        gw = GatewayRunner(config=config)
+        gw.adapters = {Platform.SLACK: adapter}
+        return gw, adapter, ledger
+
+    def test_notice_hostile_via_progress_callback_to_slack_no_leakage(self):
+        import asyncio, queue
+        from unittest.mock import MagicMock, patch
+        from gateway.run import safe_schedule_threadsafe
+        from gateway.turn_context import TurnContext
+        from gateway.run_turn_runner import TurnRunner
+        from gateway.config import Platform
+        from gateway.session import SessionSource
+
+        gw, adapter, ledger = self._make_gateway_with_slack_ledger()
+        # Need a running loop for safe_schedule_threadsafe; patch to run synchronously like existing notice test
+        from gateway import run as run_mod
+
+        def _fake_schedule(coro, loop, logger=None, log_message=None):
+            try:
+                # If we are already in an event loop (pytest-asyncio may provide one), use it
+                loop_to_use = loop or asyncio.get_event_loop()
+                if loop_to_use.is_running():
+                    # Schedule and run via new loop in thread? Simpler: run in new loop
+                    new_loop = asyncio.new_event_loop()
+                    try:
+                        return new_loop.run_until_complete(coro)
+                    finally:
+                        new_loop.close()
+                else:
+                    return loop_to_use.run_until_complete(coro)
+            except RuntimeError:
+                new_loop = asyncio.new_event_loop()
+                try:
+                    new_loop.run_until_complete(coro)
+                finally:
+                    new_loop.close()
+            return MagicMock()
+
+        orig = run_mod.safe_schedule_threadsafe
+        run_mod.safe_schedule_threadsafe = _fake_schedule  # type: ignore[assignment]
+        try:
+            source = SessionSource(platform=Platform.SLACK, chat_id="C123", chat_type="channel", user_id="U123")
+            ctx = TurnContext(
+                source=source,
+                _run_still_current=lambda: True,
+                _live_status_adapter=None,
+                _live_status_mode="off",
+                _thinking_enabled=False,
+                progress_mode="all",
+                progress_grouping="accumulate",
+                tool_progress_enabled=True,
+                tool_progress_filter={},
+                progress_queue=queue.Queue(),
+                log_queue=None,
+                last_progress_msg=[None],
+                last_tool=[None],
+                last_was_terminal_block=[False],
+                repeat_count=[0],
+                long_tool_hint_fired=[False],
+                agent_holder=[None],
+                _native_slack_task_cards=False,
+                _loop_for_step=None,
+            )
+            runner = TurnRunner(gw, ctx)  # type: ignore[arg-type]
+            # Hostile summary and preview containing both userinfo and query credentials
+            hostile_summary = f"failed due to {self.RAW_URL_BARE} and {self.RAW_URL_QUERY}"
+            hostile_preview = f"preview {self.RAW_URL_BARE}"
+            # Also test goal containing hostile
+            hostile_goal = f"goal with {self.RAW_URL_BARE}"
+
+            runner.progress_callback(
+                "subagent.complete",
+                preview=hostile_preview,
+                status="failed",
+                goal=hostile_goal,
+                summary=hostile_summary,
+                duration_seconds=3,
+            )
+            # After fake schedule, ledger should have exactly one notice
+            assert len(ledger) == 1, f"expected one notice ledger entry, got {ledger}"
+            for entry in ledger:
+                assert self.RAW_URL_BARE not in entry, f"raw bare URL leaked in notice: {entry!r}"
+                assert self.RAW_URL_QUERY not in entry, f"raw query URL leaked in notice: {entry!r}"
+                assert self.LONG_OPAQUE not in entry, f"opaque leaked in notice: {entry!r}"
+                assert self.OPAQUE_TOKEN not in entry, f"opaque token leaked: {entry!r}"
+                assert self.OPAQUE_API_KEY not in entry, f"opaque api_key leaked: {entry!r}"
+                assert self.DANGEROUS_PREFIX not in entry, f"dangerous prefix leaked: {entry!r}"
+        finally:
+            run_mod.safe_schedule_threadsafe = orig  # type: ignore[assignment]
+
+    def test_notice_both_layers_fail_closed_to_REDACTED(self):
+        import asyncio, queue
+        from unittest.mock import MagicMock, patch
+        from gateway.turn_context import TurnContext
+        from gateway.run_turn_runner import TurnRunner
+        from gateway.config import Platform
+        from gateway.session import SessionSource
+        from gateway import run as run_mod
+
+        gw, adapter, ledger = self._make_gateway_with_slack_ledger()
+
+        def _fake_schedule(coro, loop, logger=None, log_message=None):
+            try:
+                loop_to_use = loop or asyncio.get_event_loop()
+                if loop_to_use.is_running():
+                    new_loop = asyncio.new_event_loop()
+                    try:
+                        return new_loop.run_until_complete(coro)
+                    finally:
+                        new_loop.close()
+                else:
+                    return loop_to_use.run_until_complete(coro)
+            except RuntimeError:
+                new_loop = asyncio.new_event_loop()
+                try:
+                    new_loop.run_until_complete(coro)
+                finally:
+                    new_loop.close()
+            return MagicMock()
+
+        orig = run_mod.safe_schedule_threadsafe
+        run_mod.safe_schedule_threadsafe = _fake_schedule  # type: ignore[assignment]
+        try:
+            source = SessionSource(platform=Platform.SLACK, chat_id="C123", chat_type="channel", user_id="U123")
+            ctx = TurnContext(
+                source=source,
+                _run_still_current=lambda: True,
+                _live_status_adapter=None,
+                _live_status_mode="off",
+                _thinking_enabled=False,
+                progress_mode="all",
+                progress_grouping="accumulate",
+                tool_progress_enabled=True,
+                tool_progress_filter={},
+                progress_queue=queue.Queue(),
+                log_queue=None,
+                last_progress_msg=[None],
+                last_tool=[None],
+                last_was_terminal_block=[False],
+                repeat_count=[0],
+                long_tool_hint_fired=[False],
+                agent_holder=[None],
+                _native_slack_task_cards=False,
+                _loop_for_step=None,
+            )
+            runner = TurnRunner(gw, ctx)  # type: ignore[arg-type]
+            hostile_summary = f"https://{self.LONG_OPAQUE}@ex.com/p?token={self.OPAQUE_TOKEN}"
+
+            with (
+                patch("agent.redact.redact_sensitive_text", side_effect=RuntimeError("primary boom")),
+                patch("gateway.run._redact_gateway_user_facing_secrets", side_effect=RuntimeError("gateway boom")),
+            ):
+                runner.progress_callback(
+                    "subagent.complete",
+                    preview=hostile_summary,
+                    status="failed",
+                    goal="goal",
+                    summary=hostile_summary,
+                    duration_seconds=1,
+                )
+            assert len(ledger) == 1, f"expected one notice even on both-layer failure, got {ledger}"
+            for entry in ledger:
+                assert hostile_summary not in entry
+                assert self.LONG_OPAQUE not in entry
+                assert self.OPAQUE_TOKEN not in entry
+                assert self.DANGEROUS_PREFIX not in entry
+                assert entry == "[REDACTED]", f"expected exact [REDACTED] on both-layer failure, got {entry!r}"
+        finally:
+            run_mod.safe_schedule_threadsafe = orig  # type: ignore[assignment]
+
+    def test_notice_non_secret_control_preserved(self):
+        import asyncio, queue
+        from unittest.mock import MagicMock
+        from gateway.turn_context import TurnContext
+        from gateway.run_turn_runner import TurnRunner
+        from gateway.config import Platform
+        from gateway.session import SessionSource
+        from gateway import run as run_mod
+
+        gw, adapter, ledger = self._make_gateway_with_slack_ledger()
+
+        def _fake_schedule(coro, loop, logger=None, log_message=None):
+            try:
+                loop_to_use = loop or asyncio.get_event_loop()
+                if loop_to_use.is_running():
+                    new_loop = asyncio.new_event_loop()
+                    try:
+                        return new_loop.run_until_complete(coro)
+                    finally:
+                        new_loop.close()
+                else:
+                    return loop_to_use.run_until_complete(coro)
+            except RuntimeError:
+                new_loop = asyncio.new_event_loop()
+                try:
+                    new_loop.run_until_complete(coro)
+                finally:
+                    new_loop.close()
+            return MagicMock()
+
+        orig = run_mod.safe_schedule_threadsafe
+        run_mod.safe_schedule_threadsafe = _fake_schedule  # type: ignore[assignment]
+        try:
+            source = SessionSource(platform=Platform.SLACK, chat_id="C123", chat_type="channel", user_id="U123")
+            ctx = TurnContext(
+                source=source,
+                _run_still_current=lambda: True,
+                _live_status_adapter=None,
+                _live_status_mode="off",
+                _thinking_enabled=False,
+                progress_mode="all",
+                progress_grouping="accumulate",
+                tool_progress_enabled=True,
+                tool_progress_filter={},
+                progress_queue=queue.Queue(),
+                log_queue=None,
+                last_progress_msg=[None],
+                last_tool=[None],
+                last_was_terminal_block=[False],
+                repeat_count=[0],
+                long_tool_hint_fired=[False],
+                agent_holder=[None],
+                _native_slack_task_cards=False,
+                _loop_for_step=None,
+            )
+            runner = TurnRunner(gw, ctx)  # type: ignore[arg-type]
+            benign = "https://example.com/page?foo=bar&baz=qux"
+            runner.progress_callback(
+                "subagent.complete",
+                preview=benign,
+                status="failed",
+                goal="do thing",
+                summary=benign,
+                duration_seconds=2,
+            )
+            assert len(ledger) == 1
+            for entry in ledger:
+                assert "example.com" in entry, f"benign URL should survive: {entry!r}"
+        finally:
+            run_mod.safe_schedule_threadsafe = orig  # type: ignore[assignment]
