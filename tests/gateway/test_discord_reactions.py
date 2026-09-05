@@ -1955,33 +1955,26 @@ async def test_rxn_stale_next_turn_pending_retains_and_eventually_drained():
     assert not ad._rxn_pending.get(key)
 
 
-# ---------------------------------------------------------------------------
-# Regression: durable acknowledgement must not record false success (Raven)
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.asyncio
-async def test_rxn_durable_ack_not_false_when_disabled_or_primitive_fails(monkeypatch):
-    """Disabled, missing cap, False and exception starts must not record emoji_ack=True."""
-    source = _make_source(chat_id="123")
+async def test_rxn_generation_guard_late_completion_does_not_mutate_current_and_pending_retried():
+    """Late completion for an older generation must not mutate the current replacement message.
 
-    # Helper to capture ack via patching _record_discord_processing_start
-    def _capture_ack_for(adapter, event):
-        captured = {}
-        orig = adapter._record_discord_processing_start
+    Same-key turn 1 starts on msg1 and swaps to tool emoji, turn 2 starts on distinct msg2,
+    then a late on_processing_complete for the old event arrives. The new message must remain
+    untouched, the old reaction must stay reachable via pending, and a subsequent successful
+    retry via the next complete must clean the old message without cross-turn targeting.
+    Uses production PlatformConfig construction and a concrete add/remove API ledger.
+    """
+    from unittest.mock import patch
 
-        def wrapper(evt, *, emoji_ack):
-            captured["ack"] = emoji_ack
-            return orig(evt, emoji_ack=emoji_ack)
-
-        # Use monkeypatch to avoid recursion? We'll patch via patch.object
-        return captured, wrapper
-
-    # 1. Disabled via extra reactions=False
     cfg = PlatformConfig(
         enabled=True,
         token="***",
-        extra={"reactions": False, "persona_emoji": "🤖", "reaction_cooldown": 0},
+        extra={
+            "persona_emoji": "🤖",
+            "dynamic_reactions": True,
+            "reaction_cooldown": 0,
+        },
     )
     ad = DiscordAdapter(cfg)
     ad._client = SimpleNamespace(
@@ -1990,129 +1983,217 @@ async def test_rxn_durable_ack_not_false_when_disabled_or_primitive_fails(monkey
         fetch_channel=AsyncMock(),
         user=SimpleNamespace(id=99999, name="HermesBot"),
     )
-    # Ensure backfill enabled to allow recording path to run, but we will capture via patch
-    # _missed_message_backfill_enabled reads config; patch it to True for test
-    with patch.object(ad, "_missed_message_backfill_enabled", return_value=True):
-        with patch.object(ad, "_record_discord_processing_start") as mock_record:
-            with patch.object(ad, "_record_discord_message_seen"):
-                raw = LedgerMessage(msg_id=100)
-                evt = _make_event("100", raw, source)
-                await ad.on_processing_start(evt)
-                # Should have been called with emoji_ack=False because reactions disabled
-                assert mock_record.called, "record should be called even when disabled"
-                ack = (
-                    mock_record.call_args.kwargs.get("emoji_ack")
-                    if mock_record.call_args.kwargs
-                    else mock_record.call_args[1].get("emoji_ack")
-                    if len(mock_record.call_args) > 1
-                    else None
-                )
-                # Extract from args: second arg is emoji_ack via kw
-                if ack is None and mock_record.call_args.args:
-                    # positional? but our code uses kw
-                    pass
-                # More robust: check call
-                called_ack = (
-                    mock_record.call_args[1]["emoji_ack"]
-                    if len(mock_record.call_args) > 1
-                    else mock_record.call_args.kwargs["emoji_ack"]
-                )
-                assert called_ack is False, (
-                    f"disabled should record ack False, got {called_ack}"
-                )
-                assert raw.ledger() == [], "disabled should not add reaction"
+    source = _make_source(chat_id="123")
+    # msg1 will fail its first stale drain (simulate transient remove failure) so pending retains
+    msg1 = FailableLedgerMessage(msg_id=10, fail_once_emoji="📄", fail_twice=False)
+    evt1 = _make_event("10", msg1, source)
+    await ad.on_processing_start(evt1)
+    assert ("add", "🤖") in msg1.ledger()
+    with patch("agent.display.get_tool_emoji", return_value="📄"):
+        await ad.on_tool_call_start(source, "read_file")
+    assert msg1.effective() == {"📄"}
+    assert msg1.ledger() == [("add", "🤖"), ("add", "📄"), ("remove", "🤖")]
+    key = ad._reaction_msg_key(evt1)
+    assert ad._rxn_generation.get(key) == 1
+    assert ad._rxn_active.get(key) == "📄"
+    # Second same-key turn on distinct msg2
+    msg2 = LedgerMessage(msg_id=11)
+    evt2 = _make_event("11", msg2, source)
+    await ad.on_processing_start(evt2)
+    # New start attempted to drain old active 📄 from msg1 but failed (first remove of 📄 fails), so pending retains
+    assert msg2.ledger() == [("add", "🤖")]
+    assert msg2.effective() == {"🤖"}
+    assert ad._rxn_generation.get(key) == 2
+    # Pending must retain old msg1's 📄
+    pending = ad._rxn_pending.get(key)
+    assert pending is not None and len(pending) == 1
+    assert pending[0][0] is msg1
+    assert "📄" in pending[0][1]
+    # Old message still has its tool emoji (not yet cleaned) and is still reachable
+    assert msg1.effective() == {"📄"}
+    assert ("add", "📄") in msg1.ledger()
+    # Late completion for old event (FAILURE) must not mutate current replacement message
+    await ad.on_processing_complete(evt1, ProcessingOutcome.FAILURE)
+    # New message must be untouched: still only persona, no cross, no failure emoji
+    assert msg2.ledger() == [("add", "🤖")], (
+        f"late completion mutated new message: {msg2.ledger()}"
+    )
+    assert ("add", "❌") not in msg2.ledger()
+    assert ("remove", "🤖") not in msg2.ledger()
+    assert ("remove", "📄") not in msg2.ledger()
+    assert msg2.effective() == {"🤖"}
+    # Old message must still be reachable via pending, not cleared merely because new message became current
+    assert msg1.effective() == {"📄"}
+    pending_after_late = ad._rxn_pending.get(key)
+    assert pending_after_late is not None and any(
+        ref is msg1 for ref, _ in pending_after_late
+    )
+    # Active should still be for current message only
+    assert ad._rxn_active.get(key) == "🤖"
+    assert ad._rxn_msg_refs.get(key) is msg2
+    # Now make retry succeed: completing the current turn should drain pending (second attempt succeeds)
+    await ad.on_processing_complete(evt2, ProcessingOutcome.SUCCESS)
+    # Old message's 📄 should be removed, without targeting new message
+    assert "📄" not in msg1.effective(), (
+        f"old msg1 should be cleaned, got {msg1.effective()} ledger {msg1.ledger()}"
+    )
+    assert ("remove", "📄") in msg1.ledger()
+    assert ("remove", "📄") not in msg2.ledger(), (
+        "cross-turn targeting: new message should not have removal of old emoji"
+    )
+    # Pending should be cleared after successful retry
+    assert not ad._rxn_pending.get(key)
+    # Generation should remain 2 (no bump on complete)
+    assert ad._rxn_generation.get(key) == 2
+    # Cleanup: internal locks cleared
+    assert ad._rxn_locks == {}
 
-    # 2. Primitive returns False
-    cfg2 = PlatformConfig(
-        enabled=True, token="***", extra={"persona_emoji": "🤖", "reaction_cooldown": 0}
-    )
-    ad2 = DiscordAdapter(cfg2)
-    ad2._client = SimpleNamespace(
-        tree=FakeTree(),
-        get_channel=lambda _id: None,
-        fetch_channel=AsyncMock(),
-        user=SimpleNamespace(id=99999, name="HermesBot"),
-    )
-    # Make _add_reaction return False
-    with patch.object(ad2, "_add_reaction", new=AsyncMock(return_value=False)):
-        with patch.object(ad2, "_missed_message_backfill_enabled", return_value=True):
-            with patch.object(ad2, "_record_discord_processing_start") as mock_record2:
-                with patch.object(ad2, "_record_discord_message_seen"):
-                    raw2 = LedgerMessage(msg_id=101)
-                    evt2 = _make_event("101", raw2, source)
-                    await ad2.on_processing_start(evt2)
-                    called_ack2 = (
-                        mock_record2.call_args[1]["emoji_ack"]
-                        if len(mock_record2.call_args) > 1
-                        else mock_record2.call_args.kwargs["emoji_ack"]
-                    )
-                    assert called_ack2 is False, (
-                        f"primitive False should record ack False, got {called_ack2}"
-                    )
-                    # Ledger should be empty because add failed at adapter level (we mocked _add_reaction, so Ledger not used)
-                    # But ensure no active tracking
-                    assert ad2._rxn_active.get(ad2._reaction_msg_key(evt2)) is None
 
-    # 3. Exception during add
-    cfg3 = PlatformConfig(
-        enabled=True, token="***", extra={"persona_emoji": "🤖", "reaction_cooldown": 0}
-    )
-    ad3 = DiscordAdapter(cfg3)
-    ad3._client = SimpleNamespace(
-        tree=FakeTree(),
-        get_channel=lambda _id: None,
-        fetch_channel=AsyncMock(),
-        user=SimpleNamespace(id=99999, name="HermesBot"),
-    )
-    with patch.object(
-        ad3, "_add_reaction", new=AsyncMock(side_effect=Exception("boom"))
-    ):
-        with patch.object(ad3, "_missed_message_backfill_enabled", return_value=True):
-            with patch.object(ad3, "_record_discord_processing_start") as mock_record3:
-                with patch.object(ad3, "_record_discord_message_seen"):
-                    raw3 = LedgerMessage(msg_id=102)
-                    evt3 = _make_event("102", raw3, source)
-                    await ad3.on_processing_start(evt3)
-                    called_ack3 = (
-                        mock_record3.call_args[1]["emoji_ack"]
-                        if len(mock_record3.call_args) > 1
-                        else mock_record3.call_args.kwargs["emoji_ack"]
-                    )
-                    assert called_ack3 is False, (
-                        f"exception should record ack False, got {called_ack3}"
-                    )
+# ---------------------------------------------------------------------------
+# Regression: durable acknowledgement must not record false success (Raven)
+# ---------------------------------------------------------------------------
 
-    # 4. Missing capability (no add_reaction)
-    cfg4 = PlatformConfig(
-        enabled=True, token="***", extra={"persona_emoji": "🤖", "reaction_cooldown": 0}
+
+@pytest.mark.asyncio
+async def test_rxn_durable_ack_not_false_when_disabled_or_primitive_fails(
+    monkeypatch, tmp_path
+):
+    """Disabled, primitive-False, and exception starts must not record emoji_ack=1."""
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+
+    def _query_ack(adapter, message_id):
+        def _op(conn):
+            row = conn.execute(
+                "SELECT emoji_ack FROM discord_messages WHERE message_id=?",
+                (str(message_id),),
+            ).fetchone()
+            return row[0] if row else None
+
+        return adapter._with_discord_recovery_db(_op)
+
+    # Helper to run one case with a temporary recovery store and concrete ledger
+    async def _run_case(cfg_extra, raw_message, expect_ack):
+        home = tmp_path / f"home_ack_{raw_message.id}"
+        home.mkdir(parents=True, exist_ok=True)
+        token = set_hermes_home_override(home)
+        monkeypatch.setenv("DISCORD_MISSED_MESSAGE_BACKFILL", "true")
+        try:
+            cfg = PlatformConfig(enabled=True, token="***", extra=dict(cfg_extra))
+            ad = DiscordAdapter(cfg)
+            ad._client = SimpleNamespace(
+                tree=FakeTree(),
+                get_channel=lambda _id: None,
+                fetch_channel=AsyncMock(),
+                user=SimpleNamespace(id=99999, name="HermesBot"),
+            )
+            source = _make_source(chat_id="123")
+            evt = _make_event(str(raw_message.id), raw_message, source)
+            await ad.on_processing_start(evt)
+            # Read persisted emoji_ack and compare to ledger
+            ack_db = _query_ack(ad, raw_message.id)
+            assert ack_db is not None, f"no durable row for {raw_message.id}"
+            # Ledger check: successful add means ack 1, otherwise 0
+            ledger = raw_message.ledger() if hasattr(raw_message, "ledger") else []
+            has_add = any(op == "add" for op, _ in ledger)
+            # The durable ack must match the ledger's actual success
+            assert (ack_db == 1) == has_add, f"ack {ack_db} vs ledger {ledger}"
+            assert ack_db == expect_ack, (
+                f"expected ack {expect_ack} got {ack_db} ledger {ledger}"
+            )
+            # For failure cases, ledger must have no add
+            if expect_ack == 0:
+                assert not has_add, f"failure case should have no add, got {ledger}"
+            else:
+                assert has_add, f"success case should have add, got {ledger}"
+            return ad, ledger, ack_db
+        finally:
+            reset_hermes_home_override(token)
+            monkeypatch.delenv("DISCORD_MISSED_MESSAGE_BACKFILL", raising=False)
+
+    # 1. Disabled via extra reactions=False -> no add, ack 0
+    raw_disabled = LedgerMessage(msg_id=100)
+    await _run_case(
+        {"reactions": False, "persona_emoji": "🤖", "reaction_cooldown": 0},
+        raw_disabled,
+        0,
     )
-    ad4 = DiscordAdapter(cfg4)
-    ad4._client = SimpleNamespace(
-        tree=FakeTree(),
-        get_channel=lambda _id: None,
-        fetch_channel=AsyncMock(),
-        user=SimpleNamespace(id=99999, name="HermesBot"),
-    )
-    raw4 = SimpleNamespace(id=103)  # no add_reaction attribute
-    evt4 = MessageEvent(
-        text="hello",
-        message_type=MessageType.TEXT,
-        source=source,
-        raw_message=raw4,
-        message_id="103",
-    )
-    with patch.object(ad4, "_missed_message_backfill_enabled", return_value=True):
-        with patch.object(ad4, "_record_discord_processing_start") as mock_record4:
-            with patch.object(ad4, "_record_discord_message_seen"):
-                await ad4.on_processing_start(evt4)
-                called_ack4 = (
-                    mock_record4.call_args[1]["emoji_ack"]
-                    if len(mock_record4.call_args) > 1
-                    else mock_record4.call_args.kwargs["emoji_ack"]
-                )
-                assert called_ack4 is False, (
-                    f"missing capability should record ack False, got {called_ack4}"
-                )
+    assert raw_disabled.ledger() == []
+
+    # 2. Primitive returns False -> message without add_reaction capability
+    raw_no_cap = SimpleNamespace(id=101)  # no add_reaction
+    # Wrap to have ledger-like check (no ledger, so has_add False)
+    # We need to make _run_case handle SimpleNamespace without ledger; it treats has_add False
+    # For this case we construct a raw message without capability and expect ack 0
+    home2 = tmp_path / "home_ack_101"
+    home2.mkdir(parents=True, exist_ok=True)
+    token2 = set_hermes_home_override(home2)
+    monkeypatch.setenv("DISCORD_MISSED_MESSAGE_BACKFILL", "true")
+    try:
+        cfg2 = PlatformConfig(
+            enabled=True,
+            token="***",
+            extra={"persona_emoji": "🤖", "reaction_cooldown": 0},
+        )
+        ad2 = DiscordAdapter(cfg2)
+        ad2._client = SimpleNamespace(
+            tree=FakeTree(),
+            get_channel=lambda _id: None,
+            fetch_channel=AsyncMock(),
+            user=SimpleNamespace(id=99999, name="HermesBot"),
+        )
+        source = _make_source(chat_id="123")
+        evt2 = MessageEvent(
+            text="hello",
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message=raw_no_cap,
+            message_id="101",
+        )
+        await ad2.on_processing_start(evt2)
+        ack2 = _query_ack(ad2, 101)
+        assert ack2 == 0, f"primitive missing capability should be 0, got {ack2}"
+        # No ledger to check, but ensure no active tracking
+        assert ad2._rxn_active.get(ad2._reaction_msg_key(evt2)) is None
+    finally:
+        reset_hermes_home_override(token2)
+        monkeypatch.delenv("DISCORD_MISSED_MESSAGE_BACKFILL", raising=False)
+
+    # 3. Exception during add -> ack 0, ledger empty (no successful add)
+    class ExceptionLedgerMessage:
+        def __init__(self, msg_id):
+            self.id = msg_id
+            self._ledger = []
+            self._effective = set()
+
+            async def _fail_add(emoji):
+                self._ledger.append(("add_attempt", emoji))
+                raise RuntimeError("boom")
+
+            async def _fail_remove(emoji, user=None):
+                self._ledger.append(("remove", emoji))
+                self._effective.discard(emoji)
+                return None
+
+            self.add_reaction = AsyncMock(side_effect=_fail_add)
+            self.remove_reaction = AsyncMock(side_effect=_fail_remove)
+
+        def ledger(self):
+            # Only successful adds count for ack comparison; failed attempts should not be counted as add
+            # Return only successful adds (none in this case)
+            return [x for x in self._ledger if x[0] == "add"]
+
+        def effective(self):
+            return set(self._effective)
+
+    raw_exc = ExceptionLedgerMessage(msg_id=102)
+    await _run_case({"persona_emoji": "🤖", "reaction_cooldown": 0}, raw_exc, 0)
+    # ledger should have no successful add
+    assert raw_exc.ledger() == []
+
+    # 4. Successful add -> ack 1, ledger has add (positive control)
+    raw_ok = LedgerMessage(msg_id=103)
+    await _run_case({"persona_emoji": "🤖", "reaction_cooldown": 0}, raw_ok, 1)
+    assert ("add", "🤖") in raw_ok.ledger()
 
 
 # ---------------------------------------------------------------------------

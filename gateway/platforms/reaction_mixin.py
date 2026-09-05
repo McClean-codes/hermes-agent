@@ -166,6 +166,10 @@ class DynamicReactionMixin:
         self._rxn_pending: Dict[Hashable, list[tuple[Any, set[str]]]] = {}
         # Per-key turn generation for late-callback rejection
         self._rxn_generation: Dict[Hashable, int] = {}
+        # Generation → msg_ref mapping for late-callback binding (key, generation) → msg_ref
+        self._rxn_gen_msg_ref: Dict[tuple, Any] = {}
+        # msg_ref → generation mapping for late-callback binding (key, id(msg_ref)) → generation
+        self._rxn_msg_generation: Dict[tuple, int] = {}
 
         # Resolve config once
         self._rxn_persona_emoji: str = self._rxn_resolve_persona_emoji()
@@ -208,7 +212,9 @@ class DynamicReactionMixin:
         try:
             from hermes_cli.config import load_config
 
-            return _rxn_normalize_bool(load_config().get("dynamic_reactions", False), default=False)
+            return _rxn_normalize_bool(
+                load_config().get("dynamic_reactions", False), default=False
+            )
         except Exception:
             return False
 
@@ -291,11 +297,24 @@ class DynamicReactionMixin:
         # --- Stale reachability: drain previous same-key message before overwriting cache ---
         # Retain failed cleanup per message/turn until remote remove succeeds.
         old_msg_ref = self._rxn_msg_refs.get(key)
+        old_active = self._rxn_active.get(key)
+        old_stale = (
+            set(self._rxn_stale.get(key, set())) if key in self._rxn_stale else set()
+        )
         if old_msg_ref is not None and old_msg_ref is not msg_ref:
-            old_stale = set(self._rxn_stale.get(key, set())) if key in self._rxn_stale else set()
-            # Only drain stale emojis from the old message; active is the final state and should remain.
-            # Tool-swap stales are tracked in _rxn_stale, so this covers the probe's orphaned reaction.
-            to_clean_old: set[str] = set(old_stale)
+            # Retain old active and stale per old message reference until remote removal succeeds.
+            # For an incomplete turn (no stale or active is a tool emoji), the active tool must be retained.
+            # For a completed turn where active is the final persona and stale is a failed tool removal,
+            # only the stale needs draining – the final persona stays on the old message.
+            to_clean_old: set[str] = set()
+            if old_stale:
+                to_clean_old.update(old_stale)
+                # Include active only if it is not the final persona (in-progress tool vs completed persona)
+                if old_active and old_active != self._rxn_persona_emoji:
+                    to_clean_old.add(old_active)
+            else:
+                if old_active:
+                    to_clean_old.add(old_active)
             if to_clean_old:
                 failed_old: set[str] = set()
                 for emoji in list(to_clean_old):
@@ -319,22 +338,29 @@ class DynamicReactionMixin:
                             break
                     if not merged:
                         pending.append((old_msg_ref, failed_old))
-            # Clear current stale tracking for old message (moved to pending or cleaned); keep active for now
-            # Active for old message is its final persona/tool state; new turn will overwrite it below.
+            # Clear current stale/active tracking for old message (failed retained in pending)
             self._rxn_stale.pop(key, None)
             self._rxn_active.pop(key, None)
-            # Bump generation for new turn
-            self._rxn_generation[key] = self._rxn_generation.get(key, 0) + 1
+            # Bump generation for new turn and bind token
+            new_gen = self._rxn_generation.get(key, 0) + 1
+            self._rxn_generation[key] = new_gen
+            self._rxn_msg_generation[(key, id(msg_ref))] = new_gen
+            self._rxn_gen_msg_ref[(key, new_gen)] = msg_ref
         elif old_msg_ref is None:
             # First turn for this key
-            if key not in self._rxn_generation:
-                self._rxn_generation[key] = 1
-            else:
-                self._rxn_generation[key] = self._rxn_generation.get(key, 0) + 1
+            new_gen = self._rxn_generation.get(key, 0) + 1
+            if key not in self._rxn_generation or self._rxn_generation[key] == 0:
+                new_gen = 1
+            self._rxn_generation[key] = new_gen
+            self._rxn_msg_generation[(key, id(msg_ref))] = new_gen
+            self._rxn_gen_msg_ref[(key, new_gen)] = msg_ref
         else:
             # Same msg_ref object reused (unlikely but safe) — still bump generation for idempotence
             # but do not drain; keep stale handling below
-            self._rxn_generation[key] = self._rxn_generation.get(key, 0) + 1
+            new_gen = self._rxn_generation.get(key, 0) + 1
+            self._rxn_generation[key] = new_gen
+            self._rxn_msg_generation[(key, id(msg_ref))] = new_gen
+            self._rxn_gen_msg_ref[(key, new_gen)] = msg_ref
 
         emoji = self._rxn_persona_emoji
         translated = self._reaction_translate_emoji(emoji)
@@ -377,15 +403,18 @@ class DynamicReactionMixin:
         if key is None:
             return
 
-        # Generation check: capture at entry, reject late callbacks after new start
+        # Generation + message-reference binding: capture at entry, reject late callbacks after new start
         gen_at_entry = self._rxn_generation.get(key)
         if gen_at_entry is None:
             # No processing start yet for this key; ignore
             return
+        msg_ref_at_entry = self._rxn_msg_refs.get(key)
 
         async with self._rxn_lock(key):
-            # Reject late callback if generation advanced while waiting for lock
+            # Reject late callback if generation advanced or message was replaced while waiting for lock
             if self._rxn_generation.get(key) != gen_at_entry:
+                return
+            if self._rxn_msg_refs.get(key) is not msg_ref_at_entry:
                 return
             msg_ref = self._rxn_msg_refs.get(key)
             if msg_ref is None:
@@ -433,7 +462,9 @@ class DynamicReactionMixin:
                             ok_rm = await self._reaction_remove(msg_ref, current)
                             ok_rm = bool(ok_rm)
                         except Exception as e:
-                            logger.debug("reaction swap remove failed (%s): %s", current, e)
+                            logger.debug(
+                                "reaction swap remove failed (%s): %s", current, e
+                            )
                             ok_rm = False
                         if not ok_rm:
                             # Preserve old as stale for final cleanup
@@ -446,7 +477,9 @@ class DynamicReactionMixin:
                                 if not self._rxn_stale[key]:
                                     self._rxn_stale.pop(key, None)
             except Exception as e:
-                logger.debug("reaction swap failed (%s -> %s): %s", current, tool_emoji, e)
+                logger.debug(
+                    "reaction swap failed (%s -> %s): %s", current, tool_emoji, e
+                )
                 # Do not corrupt active tracking on transient failure; keep previous
                 return
 
@@ -464,10 +497,45 @@ class DynamicReactionMixin:
         if key is None:
             return
 
+        # ---- Generation / message-reference binding ----
+        # Resolve the message reference carried by the event (if any) for authoritative per-turn token.
+        event_msg_ref = None
+        try:
+            event_msg_ref = self._reaction_resolve_message(event)
+        except Exception:
+            event_msg_ref = None
+        cached_msg_ref = self._rxn_msg_refs.get(key)
+        gen_current = self._rxn_generation.get(key)
+        event_gen = None
+        if event_msg_ref is not None:
+            event_gen = self._rxn_msg_generation.get((key, id(event_msg_ref)))
+        # Late callback from an older generation must not mutate the current replacement message.
+        if (
+            event_gen is not None
+            and gen_current is not None
+            and event_gen != gen_current
+        ):
+            return
+        # Capture for lock-race detection (new start may have bumped generation while we waited for lock)
+        gen_at_entry = gen_current
+        msg_ref_at_entry = cached_msg_ref
+
         # Use try/finally to guarantee lock cleanup even on early return due to API False
         lock = self._rxn_lock(key)
         try:
             async with lock:
+                # Re-check after acquiring lock: if generation or message changed while waiting, this is a late callback.
+                if self._rxn_generation.get(key) != gen_at_entry:
+                    return
+                if self._rxn_msg_refs.get(key) is not msg_ref_at_entry:
+                    return
+                gen_now = self._rxn_generation.get(key)
+                if (
+                    event_gen is not None
+                    and gen_now is not None
+                    and event_gen != gen_now
+                ):
+                    return
                 msg_ref = self._rxn_msg_refs.get(key)
                 if msg_ref is None:
                     try:
@@ -497,10 +565,14 @@ class DynamicReactionMixin:
                             if self._reaction_replace_mode:
                                 continue
                             try:
-                                ok_rm = await self._reaction_remove(pending_msg_ref, emoji)
+                                ok_rm = await self._reaction_remove(
+                                    pending_msg_ref, emoji
+                                )
                                 ok_rm = bool(ok_rm)
                             except Exception as e:
-                                logger.debug("pending cleanup remove failed (%s): %s", emoji, e)
+                                logger.debug(
+                                    "pending cleanup remove failed (%s): %s", emoji, e
+                                )
                                 ok_rm = False
                             if not ok_rm:
                                 failed_pending.add(emoji)
@@ -513,7 +585,11 @@ class DynamicReactionMixin:
 
                 # Peek current and stale without popping yet; only pop after success
                 current = self._rxn_active.get(key)
-                stale = set(self._rxn_stale.get(key, set())) if hasattr(self, "_rxn_stale") else set()
+                stale = (
+                    set(self._rxn_stale.get(key, set()))
+                    if hasattr(self, "_rxn_stale")
+                    else set()
+                )
 
                 # Import here to avoid circular imports at module level
                 from gateway.platforms.base import ProcessingOutcome
@@ -534,7 +610,9 @@ class DynamicReactionMixin:
                             ok_rm = await self._reaction_remove(msg_ref, emoji)
                             ok_rm = bool(ok_rm)
                         except Exception as e:
-                            logger.debug("cancel cleanup remove failed (%s): %s", emoji, e)
+                            logger.debug(
+                                "cancel cleanup remove failed (%s): %s", emoji, e
+                            )
                             ok_rm = False
                         if not ok_rm:
                             failed.add(emoji)
@@ -573,7 +651,12 @@ class DynamicReactionMixin:
                             ok = await self._reaction_set(msg_ref, translated)
                             ok = bool(ok)
                         except Exception as e:
-                            logger.debug("reaction complete set failed (%s -> %s): %s", current, translated, e)
+                            logger.debug(
+                                "reaction complete set failed (%s -> %s): %s",
+                                current,
+                                translated,
+                                e,
+                            )
                             ok = False
                         if not ok:
                             # Preserve current/stale for later retry; do not pop
@@ -585,14 +668,19 @@ class DynamicReactionMixin:
                         self._rxn_stale.pop(key, None)
                         return
                     else:
-                        need_add = (translated != current)
+                        need_add = translated != current
                         # If no active (start failed) we still need to add
                         if need_add:
                             try:
                                 ok = await self._reaction_add(msg_ref, translated)
                                 ok = bool(ok)
                             except Exception as e:
-                                logger.debug("reaction complete add failed (%s -> %s): %s", current, translated, e)
+                                logger.debug(
+                                    "reaction complete add failed (%s -> %s): %s",
+                                    current,
+                                    translated,
+                                    e,
+                                )
                                 ok = False
                             if not ok:
                                 # Preserve current/stale/msg_ref for later recovery
@@ -611,7 +699,9 @@ class DynamicReactionMixin:
                                 ok_rm = await self._reaction_remove(msg_ref, emoji)
                                 ok_rm = bool(ok_rm)
                             except Exception as e:
-                                logger.debug("reaction complete remove failed (%s): %s", emoji, e)
+                                logger.debug(
+                                    "reaction complete remove failed (%s): %s", emoji, e
+                                )
                                 ok_rm = False
                             if not ok_rm:
                                 failed2.add(emoji)
@@ -630,7 +720,12 @@ class DynamicReactionMixin:
                         self._rxn_stale.pop(key, None)
                         return
                 except Exception as e:
-                    logger.debug("reaction complete swap failed (%s -> %s): %s", current, translated, e)
+                    logger.debug(
+                        "reaction complete swap failed (%s -> %s): %s",
+                        current,
+                        translated,
+                        e,
+                    )
                     # Preserve state for retry
                     return
         finally:
