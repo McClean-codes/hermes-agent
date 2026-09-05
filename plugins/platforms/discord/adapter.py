@@ -3363,7 +3363,64 @@ class DiscordAdapter(DynamicReactionMixin, BasePlatformAdapter):
         """Derive a stable session key from a SessionSource or MessageEvent."""
         if hasattr(source, "source") and source.source is not None:
             source = source.source
-        return f"{source.platform}:{source.chat_id}:{source.thread_id or ''}"
+        # Canonical participant/profile-scoped identity (parity with SessionStore/ build_session_key)
+        # Use the same owner-aware profile resolver as the owning adapter/session path so
+        # secondary ingress before handler stamping does not collapse to agent:main.
+        try:
+            from gateway.session import build_session_key
+
+            profile = self._session_key_profile(source)
+            group_per_user = True
+            thread_per_user = False
+            gcfg = None
+            if getattr(self, "gateway_runner", None) is not None:
+                gcfg = getattr(self.gateway_runner, "config", None)
+            if gcfg is not None:
+                group_per_user = getattr(gcfg, "group_sessions_per_user", True)
+                thread_per_user = getattr(gcfg, "thread_sessions_per_user", False)
+                try:
+                    from gateway.config import _coerce_bool
+
+                    group_per_user = _coerce_bool(group_per_user, True)
+                    thread_per_user = _coerce_bool(thread_per_user, False)
+                except Exception:
+                    pass
+            else:
+                # Best-effort file config; defaults already True/False
+                try:
+                    from hermes_cli.config import load_config
+
+                    raw = load_config()
+                    if isinstance(raw, dict):
+                        gw = raw.get("gateway") if isinstance(raw.get("gateway"), dict) else {}
+                        def _pick(key, default):
+                            if key in raw:
+                                return raw[key]
+                            if key in gw:
+                                return gw[key]
+                            return default
+                        try:
+                            from gateway.config import _coerce_bool
+
+                            group_per_user = _coerce_bool(_pick("group_sessions_per_user", group_per_user), True)
+                            thread_per_user = _coerce_bool(_pick("thread_sessions_per_user", thread_per_user), False)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            if hasattr(source, "chat_id") and hasattr(source, "platform"):
+                return build_session_key(
+                    source,
+                    group_sessions_per_user=group_per_user,
+                    thread_sessions_per_user=thread_per_user,
+                    profile=profile,
+                )
+        except Exception:
+            pass
+        try:
+            return f"{source.platform}:{source.chat_id}:{source.thread_id or ''}"
+        except Exception:
+            return str(source)
 
     async def _reaction_add(self, msg_ref, emoji):
         """Add an emoji reaction to a Discord message."""
@@ -3376,17 +3433,19 @@ class DiscordAdapter(DynamicReactionMixin, BasePlatformAdapter):
     def _reaction_resolve_message(self, event):
         """Extract the raw Discord message from the event or session cache."""
         raw = getattr(event, "raw_message", None)
-        if raw and hasattr(raw, "add_reaction"):
-            return raw
+        if raw is not None:
+            # If raw is present but lacks capability, treat as missing — do not
+            # fall back to stale cached raw (prevents missing-capability replay
+            # from resolving an old message's raw and mutating it via stale authority).
+            if hasattr(raw, "add_reaction"):
+                return raw
+            return None
         source = getattr(event, "source", event)
         key = self._session_key_from_source(source)
         return self._session_raw_messages.get(key)
 
     def _reaction_msg_key(self, event):
-        """Return a hashable key for per-message locking."""
-        raw = getattr(event, "raw_message", None)
-        if raw and hasattr(raw, "id"):
-            return str(raw.id)
+        """Return a hashable key for per-message locking. Stable across raw vs source events."""
         source = getattr(event, "source", event)
         return self._session_key_from_source(source)
 
@@ -3395,32 +3454,21 @@ class DiscordAdapter(DynamicReactionMixin, BasePlatformAdapter):
         source = getattr(event, "source", event)
         key = self._session_key_from_source(source)
         raw = getattr(event, "raw_message", None)
-        if raw:
+        confirmed = await self._rxn_on_processing_start(event)
+        # Only cache raw after confirmed success; failed/disabled/exception
+        # must leave no raw-cache authority for later tool/complete fallbacks.
+        if confirmed and raw:
             self._session_raw_messages[key] = raw
-        await self._rxn_on_processing_start(event)
+        else:
+            self._session_raw_messages.pop(key, None)
         await asyncio.to_thread(
             self._record_discord_processing_start,
             event,
-            emoji_ack=True,
+            emoji_ack=bool(confirmed),
         )
 
     async def on_tool_call_start(self, event, tool_name: str) -> None:
-        """Swap the active reaction to the tool-specific emoji.
-
-        ``event`` is the ``SessionSource`` from ``ctx.source`` (set by
-        ``TurnRunner.progress_callback``).  The reaction mixin's
-        ``_reaction_msg_key`` would derive a session-level key from it,
-        but ``on_processing_start`` / ``on_processing_complete`` store
-        state under the Discord message ID.  Look up the cached raw
-        message so the same message-ID key is used across the entire
-        lifecycle — without this, the final tool-emoji removal would
-        never fire because it looks up a key that was never written.
-        """
-        source = getattr(event, "source", event)
-        key = self._session_key_from_source(source)
-        raw = self._session_raw_messages.get(key)
-        if raw is not None:
-            event = SimpleNamespace(raw_message=raw, source=source)
+        """Swap the active reaction to the tool-specific emoji."""
         await self._rxn_on_tool_call_start(event, tool_name)
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
