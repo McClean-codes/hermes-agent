@@ -3392,18 +3392,29 @@ class DiscordAdapter(DynamicReactionMixin, BasePlatformAdapter):
 
                     raw = load_config()
                     if isinstance(raw, dict):
-                        gw = raw.get("gateway") if isinstance(raw.get("gateway"), dict) else {}
+                        gw = (
+                            raw.get("gateway")
+                            if isinstance(raw.get("gateway"), dict)
+                            else {}
+                        )
+
                         def _pick(key, default):
                             if key in raw:
                                 return raw[key]
                             if key in gw:
                                 return gw[key]
                             return default
+
                         try:
                             from gateway.config import _coerce_bool
 
-                            group_per_user = _coerce_bool(_pick("group_sessions_per_user", group_per_user), True)
-                            thread_per_user = _coerce_bool(_pick("thread_sessions_per_user", thread_per_user), False)
+                            group_per_user = _coerce_bool(
+                                _pick("group_sessions_per_user", group_per_user), True
+                            )
+                            thread_per_user = _coerce_bool(
+                                _pick("thread_sessions_per_user", thread_per_user),
+                                False,
+                            )
                         except Exception:
                             pass
                 except Exception:

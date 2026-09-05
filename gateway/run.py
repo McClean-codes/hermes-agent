@@ -4764,7 +4764,12 @@ class TurnRunner:
         # Fire on_tool_call_start hook for dynamic reaction swapping.
         # Runs before the progress_queue guard so reactions work even when
         # tool progress messages are off.
-        if event_type == "tool.started" and tool_name and getattr(ctx, "_status_adapter", None) and ctx._run_still_current():
+        if (
+            event_type == "tool.started"
+            and tool_name
+            and getattr(ctx, "_status_adapter", None)
+            and ctx._run_still_current()
+        ):
             try:
                 safe_schedule_threadsafe(
                     ctx._status_adapter._run_processing_hook(

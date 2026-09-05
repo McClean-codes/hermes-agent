@@ -67,6 +67,7 @@ class FakeTree:
         def decorator(fn):
             self.commands[name] = fn
             return fn
+
         return decorator
 
 
@@ -146,6 +147,7 @@ def _make_source(chat_id="123", thread_id=None):
 # 1. Persona placement at processing start
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_persona_emoji_added_on_processing_start(adapter):
     """Persona emoji (configured) is added when processing begins."""
@@ -179,6 +181,7 @@ async def test_persona_fallback_to_eyes_when_not_configured(adapter):
 # ---------------------------------------------------------------------------
 # 2. Two distinct tool transitions, each add(new) before remove(previous)
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.asyncio
 async def test_two_tool_transitions_add_before_remove(adapter):
@@ -226,6 +229,7 @@ async def test_two_tool_transitions_add_before_remove(adapter):
 # 3. Successful completion: add(persona) before remove(last_tool), exactly one final persona
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_successful_completion_adds_persona_before_removing_last_tool(adapter):
     adapter.config.extra["persona_emoji"] = "🦊"
@@ -269,6 +273,7 @@ async def test_successful_completion_adds_persona_before_removing_last_tool(adap
 # 4. No-tool completion without duplicate/untracked cleanup
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_no_tool_completion_no_duplicate_cleanup(adapter):
     adapter.config.extra["persona_emoji"] = "🤖"
@@ -295,12 +300,14 @@ async def test_no_tool_completion_no_duplicate_cleanup(adapter):
 # 5. Callback/reaction updates remain active when tool-progress messages disabled
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_reaction_via_progress_callback_even_when_progress_queue_disabled():
     """TurnRunner.progress_callback must fire on_tool_call_start even with progress_queue=None."""
     # This tests the real current callback path: TurnRunner.progress_callback
     # fires the adapter hook before the progress_queue guard.
     from gateway.turn_context import TurnContext
+
     try:
         from gateway.run_turn_runner import TurnRunner
     except ImportError:
@@ -308,7 +315,11 @@ async def test_reaction_via_progress_callback_even_when_progress_queue_disabled(
 
     # Create a fake adapter that records hook invocations
     config = PlatformConfig(enabled=True, token="***")
-    config.extra = {"persona_emoji": "🤖", "dynamic_reactions": True, "reaction_cooldown": 0}
+    config.extra = {
+        "persona_emoji": "🤖",
+        "dynamic_reactions": True,
+        "reaction_cooldown": 0,
+    }
     hook_calls = []
 
     class HookAdapter(DiscordAdapter):
@@ -360,11 +371,22 @@ async def test_reaction_via_progress_callback_even_when_progress_queue_disabled(
     # TurnRunner at target main uses gateway.run.safe_schedule_threadsafe; reviewed used TurnRunner._schedule.
     # Patch whichever exists to execute immediately for determinism.
     if hasattr(TurnRunner, "_schedule"):
-        sched_patch = patch.object(TurnRunner, "_schedule", side_effect=lambda coro, msg, loop=None: asyncio.create_task(coro))
+        sched_patch = patch.object(
+            TurnRunner,
+            "_schedule",
+            side_effect=lambda coro, msg, loop=None: asyncio.create_task(coro),
+        )
     else:
-        sched_patch = patch("gateway.run.safe_schedule_threadsafe", side_effect=lambda coro, loop, logger=None, log_message=None: asyncio.create_task(coro))
+        sched_patch = patch(
+            "gateway.run.safe_schedule_threadsafe",
+            side_effect=lambda coro, loop, logger=None, log_message=None: (
+                asyncio.create_task(coro)
+            ),
+        )
     with sched_patch:
-        tr.progress_callback("tool.started", tool_name="read_file", preview="x", args={})
+        tr.progress_callback(
+            "tool.started", tool_name="read_file", preview="x", args={}
+        )
         await asyncio.sleep(0.05)
 
     # Even though progress_queue was None, the hook should have been scheduled and executed
@@ -406,11 +428,22 @@ async def test_reaction_via_progress_callback_even_when_progress_queue_disabled(
 
     with patch("agent.display.get_tool_emoji", side_effect=fake_emoji):
         if hasattr(TurnRunner, "_schedule"):
-            sched_patch2 = patch.object(TurnRunner, "_schedule", side_effect=lambda coro, msg, loop=None: asyncio.create_task(coro))
+            sched_patch2 = patch.object(
+                TurnRunner,
+                "_schedule",
+                side_effect=lambda coro, msg, loop=None: asyncio.create_task(coro),
+            )
         else:
-            sched_patch2 = patch("gateway.run.safe_schedule_threadsafe", side_effect=lambda coro, loop, logger=None, log_message=None: asyncio.create_task(coro))
+            sched_patch2 = patch(
+                "gateway.run.safe_schedule_threadsafe",
+                side_effect=lambda coro, loop, logger=None, log_message=None: (
+                    asyncio.create_task(coro)
+                ),
+            )
         with sched_patch2:
-            tr2.progress_callback("tool.started", tool_name="read_file", preview="x", args={})
+            tr2.progress_callback(
+                "tool.started", tool_name="read_file", preview="x", args={}
+            )
             await asyncio.sleep(0.05)
     # After the call, raw2 should have swapped to 📄 even though progress was off
     assert ("add", "📄") in raw2.ledger()
@@ -422,6 +455,7 @@ async def test_reaction_via_progress_callback_even_when_progress_queue_disabled(
 # ---------------------------------------------------------------------------
 # 6. Repeated identical/rapid updates are coalesced (cooldown/hysteresis)
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.asyncio
 async def test_repeated_identical_tool_coalesced(adapter):
@@ -488,6 +522,7 @@ async def test_rapid_different_tool_coalesced_by_cooldown(adapter):
 # ---------------------------------------------------------------------------
 # 7. Disabled / failure / cancel behavior remains intact
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.asyncio
 async def test_reactions_disabled_via_env_no_ops(adapter, monkeypatch):
@@ -578,6 +613,7 @@ async def test_cancelled_outcome_removes_without_adding(adapter):
 # 8. Rate-limit / API failures leave tracked state recoverable and do not raise
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_rate_limit_failure_recoverable_and_no_exception(adapter):
     adapter.config.extra["persona_emoji"] = "🤖"
@@ -621,7 +657,9 @@ async def test_rate_limit_failure_recoverable_and_no_exception(adapter):
         assert raw.effective() == {"🤖"}
         # Next tool swap should succeed
         await adapter.on_tool_call_start(source, "web_search")
-        assert ("add", "🔍") in [("add", e) for e in [x[1] for x in raw.ledger() if x[0]=="add"]]
+        assert ("add", "🔍") in [
+            ("add", e) for e in [x[1] for x in raw.ledger() if x[0] == "add"]
+        ]
         assert raw.effective() == {"🔍"}
         # Completion should still work
         await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
@@ -630,10 +668,13 @@ async def test_rate_limit_failure_recoverable_and_no_exception(adapter):
 
 
 @pytest.mark.asyncio
-async def test_process_message_background_still_delivers_when_reactions_disabled(adapter, monkeypatch):
+async def test_process_message_background_still_delivers_when_reactions_disabled(
+    adapter, monkeypatch
+):
     """Preserve established message-delivery semantics when reactions disabled."""
     monkeypatch.setenv("DISCORD_REACTIONS", "false")
     raw = LedgerMessage()
+
     # raw needs to mimic discord message for background path? _process_message_background uses raw_message.add_reaction etc.
     # With reactions disabled, it should still deliver via send()
     async def handler(_event):
@@ -657,6 +698,7 @@ async def test_process_message_background_still_delivers_when_reactions_disabled
 # ---------------------------------------------------------------------------
 # Legacy compatibility: original test expectations updated for persona
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.asyncio
 async def test_process_message_background_adds_and_swaps_reactions_legacy(adapter):
@@ -689,20 +731,24 @@ async def test_process_message_background_adds_and_swaps_reactions_legacy(adapte
     assert raw.effective() == {"👀"}
     assert "✅" not in raw.effective()
 
+
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 # Confirmed-start parity regression — provider outcome must gate state and ACK
 # (real durable SQLite recovery store, no writer mocks)
 # ---------------------------------------------------------------------------
 
+
 def _query_durable_row(adapter, message_id: str):
     """Read back the durable discord_messages row via the real recovery store."""
+
     def _op(conn):
         row = conn.execute(
             "SELECT status, emoji_ack, replied FROM discord_messages WHERE message_id=?",
             (str(message_id),),
         ).fetchone()
         return row
+
     return adapter._with_discord_recovery_db(_op)
 
 
@@ -727,7 +773,9 @@ def _make_recovery_adapter(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_on_processing_start_provider_false_leaves_no_state_and_ack_false(tmp_path, monkeypatch):
+async def test_on_processing_start_provider_false_leaves_no_state_and_ack_false(
+    tmp_path, monkeypatch
+):
     """Provider False must not commit active/msg_refs and must record emoji_ack=False via real DB."""
     adapter = _make_recovery_adapter(tmp_path, monkeypatch)
     adapter.config.extra["persona_emoji"] = "🤖"
@@ -751,7 +799,9 @@ async def test_on_processing_start_provider_false_leaves_no_state_and_ack_false(
 
 
 @pytest.mark.asyncio
-async def test_on_processing_start_provider_exception_leaves_no_state_and_ack_false(tmp_path, monkeypatch):
+async def test_on_processing_start_provider_exception_leaves_no_state_and_ack_false(
+    tmp_path, monkeypatch
+):
     """Provider exception must not commit state and must record emoji_ack=False via real DB."""
     adapter = _make_recovery_adapter(tmp_path, monkeypatch)
     adapter.config.extra["persona_emoji"] = "🤖"
@@ -774,7 +824,9 @@ async def test_on_processing_start_provider_exception_leaves_no_state_and_ack_fa
 
 
 @pytest.mark.asyncio
-async def test_on_processing_start_missing_capability_leaves_no_state_and_ack_false(tmp_path, monkeypatch):
+async def test_on_processing_start_missing_capability_leaves_no_state_and_ack_false(
+    tmp_path, monkeypatch
+):
     """Missing capability / disabled must not commit state and ack False via real DB."""
     adapter = _make_recovery_adapter(tmp_path, monkeypatch)
     adapter.config.extra["persona_emoji"] = "🤖"
@@ -811,7 +863,9 @@ async def test_on_processing_start_missing_capability_leaves_no_state_and_ack_fa
 
 
 @pytest.mark.asyncio
-async def test_on_processing_start_confirmed_add_records_ack_true(tmp_path, monkeypatch):
+async def test_on_processing_start_confirmed_add_records_ack_true(
+    tmp_path, monkeypatch
+):
     """Confirmed provider success commits state, populates ledger, and records emoji_ack=True via real DB."""
     adapter = _make_recovery_adapter(tmp_path, monkeypatch)
     adapter.config.extra["persona_emoji"] = "🤖"
@@ -834,7 +888,9 @@ async def test_on_processing_start_confirmed_add_records_ack_true(tmp_path, monk
 
 
 @pytest.mark.asyncio
-async def test_failed_start_false_blocks_tool_and_complete_with_recovered_provider(tmp_path, monkeypatch):
+async def test_failed_start_false_blocks_tool_and_complete_with_recovered_provider(
+    tmp_path, monkeypatch
+):
     """Provider False on start must block later tool and completion even after provider recovers — real durable."""
     adapter = _make_recovery_adapter(tmp_path, monkeypatch)
     adapter.config.extra["persona_emoji"] = "🤖"
@@ -917,7 +973,9 @@ async def test_failed_start_false_blocks_tool_and_complete_with_recovered_provid
 
 
 @pytest.mark.asyncio
-async def test_failed_start_exception_blocks_tool_and_complete_with_recovered_provider(tmp_path, monkeypatch):
+async def test_failed_start_exception_blocks_tool_and_complete_with_recovered_provider(
+    tmp_path, monkeypatch
+):
     """Provider exception on start must block later tool and completion even after provider recovers — real durable."""
     adapter = _make_recovery_adapter(tmp_path, monkeypatch)
     adapter.config.extra["persona_emoji"] = "🤖"
@@ -985,8 +1043,11 @@ async def test_failed_start_exception_blocks_tool_and_complete_with_recovered_pr
 # Stale same-key authority — confirmed message1 then failed/disabled/missing start for message2
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
-async def test_stale_same_key_failed_start_clears_prior_authority(tmp_path, monkeypatch):
+async def test_stale_same_key_failed_start_clears_prior_authority(
+    tmp_path, monkeypatch
+):
     """Confirmed start message1 → same-key provider-False start message2 → tool/completion must not affect message1 — real DB."""
     adapter = _make_recovery_adapter(tmp_path, monkeypatch)
     adapter.config.extra["persona_emoji"] = "🤖"
@@ -1046,7 +1107,9 @@ async def test_stale_same_key_failed_start_clears_prior_authority(tmp_path, monk
 
 
 @pytest.mark.asyncio
-async def test_stale_same_key_disabled_start_clears_prior_authority(tmp_path, monkeypatch):
+async def test_stale_same_key_disabled_start_clears_prior_authority(
+    tmp_path, monkeypatch
+):
     """Confirmed start message1 → same-key disabled start message2 → recovery tool must not mutate message1."""
     adapter = _make_recovery_adapter(tmp_path, monkeypatch)
     adapter.config.extra["persona_emoji"] = "🤖"
@@ -1091,7 +1154,9 @@ async def test_stale_same_key_disabled_start_clears_prior_authority(tmp_path, mo
 
 
 @pytest.mark.asyncio
-async def test_stale_same_key_missing_capability_start_clears_prior_authority(tmp_path, monkeypatch):
+async def test_stale_same_key_missing_capability_start_clears_prior_authority(
+    tmp_path, monkeypatch
+):
     """Confirmed start message1 → same-key missing-capability start message2 → tool must not affect message1."""
     adapter = _make_recovery_adapter(tmp_path, monkeypatch)
     adapter.config.extra["persona_emoji"] = "🤖"
@@ -1172,8 +1237,11 @@ async def test_stale_disabled_completion_clears_authority(tmp_path, monkeypatch)
 # Removal ACK — provider False during add-before-remove swap must not advance tracked state
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
-async def test_tool_swap_removal_false_does_not_advance_tracked_state(tmp_path, monkeypatch):
+async def test_tool_swap_removal_false_does_not_advance_tracked_state(
+    tmp_path, monkeypatch
+):
     """When _reaction_remove returns False during tool swap, tracked state must not advance and cleanup remains reachable."""
     adapter = _make_recovery_adapter(tmp_path, monkeypatch)
     adapter.config.extra["persona_emoji"] = "🤖"
@@ -1204,7 +1272,9 @@ async def test_tool_swap_removal_false_does_not_advance_tracked_state(tmp_path, 
     # Removal was attempted but returned False, so no remove in ledger (mocked boundary)
     # Effective remote has both (add succeeded, remove not confirmed)
     # Tracked state must still be persona, not tool
-    assert adapter._rxn_active.get(key) == "🤖", "tracked state must not advance when removal unconfirmed"
+    assert adapter._rxn_active.get(key) == "🤖", (
+        "tracked state must not advance when removal unconfirmed"
+    )
     assert raw.effective() == {"🤖", "📄"}
 
     # Cleanup must remain reachable: restore provider and retry swap must succeed
@@ -1232,8 +1302,11 @@ async def test_tool_swap_removal_false_does_not_advance_tracked_state(tmp_path, 
 # Participant/profile authority isolation — real construction/lifecycle seams
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
-async def test_group_two_participants_distinct_keys_no_cross_mutation(tmp_path, monkeypatch):
+async def test_group_two_participants_distinct_keys_no_cross_mutation(
+    tmp_path, monkeypatch
+):
     """Two group SessionSource with same chat/thread but distinct participants must isolate reactions."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("DISCORD_MISSED_MESSAGE_BACKFILL", "true")
@@ -1275,7 +1348,9 @@ async def test_group_two_participants_distinct_keys_no_cross_mutation(tmp_path, 
     # Independent canonical identity oracle: build_session_key must differ for distinct participants
     oracle_a = build_session_key(src_a)
     oracle_b = build_session_key(src_b)
-    assert oracle_a != oracle_b, f"group participant keys must differ: {oracle_a} vs {oracle_b}"
+    assert oracle_a != oracle_b, (
+        f"group participant keys must differ: {oracle_a} vs {oracle_b}"
+    )
     assert "alice123" in oracle_a
     assert "bob456" in oracle_b
 
@@ -1311,18 +1386,37 @@ async def test_group_two_participants_distinct_keys_no_cross_mutation(tmp_path, 
 
     # Source-only completion from A must affect only raw_a (add persona before remove tool)
     await adapter.on_processing_complete(src_a, ProcessingOutcome.SUCCESS)
-    assert raw_a.ledger() == [("add", "🤖"), ("add", "📄"), ("remove", "🤖"), ("add", "🤖"), ("remove", "📄")]
+    assert raw_a.ledger() == [
+        ("add", "🤖"),
+        ("add", "📄"),
+        ("remove", "🤖"),
+        ("add", "🤖"),
+        ("remove", "📄"),
+    ]
     assert raw_a.effective() == {"🤖"}
     assert raw_b.ledger() == [("add", "🤖"), ("add", "🔍"), ("remove", "🤖")]
     assert raw_b.effective() == {"🔍"}
 
     # Completion from B must affect only raw_b
     await adapter.on_processing_complete(src_b, ProcessingOutcome.SUCCESS)
-    assert raw_b.ledger() == [("add", "🤖"), ("add", "🔍"), ("remove", "🤖"), ("add", "🤖"), ("remove", "🔍")]
+    assert raw_b.ledger() == [
+        ("add", "🤖"),
+        ("add", "🔍"),
+        ("remove", "🤖"),
+        ("add", "🤖"),
+        ("remove", "🔍"),
+    ]
     assert raw_b.effective() == {"🤖"}
     # raw_a remains persona, no cross mutation after B's completion
-    assert raw_a.ledger() == [("add", "🤖"), ("add", "📄"), ("remove", "🤖"), ("add", "🤖"), ("remove", "📄")]
+    assert raw_a.ledger() == [
+        ("add", "🤖"),
+        ("add", "📄"),
+        ("remove", "🤖"),
+        ("add", "🤖"),
+        ("remove", "📄"),
+    ]
     assert raw_a.effective() == {"🤖"}
+
 
 @pytest.mark.asyncio
 async def test_dm_two_profiles_distinct_keys_no_cross_mutation(tmp_path, monkeypatch):
@@ -1338,11 +1432,21 @@ async def test_dm_two_profiles_distinct_keys_no_cross_mutation(tmp_path, monkeyp
     # The adapter's _session_key_from_source reads multiplex_profiles via hermes_cli.config.load_config,
     # so we must provide a real config file rather than private assignment.
     cfg_path = _Path(tmp_path) / "config.yaml"
-    cfg_path.write_text(yaml.safe_dump({"gateway": {"multiplex_profiles": True}, "multiplex_profiles": True}), encoding="utf-8")
+    cfg_path.write_text(
+        yaml.safe_dump({
+            "gateway": {"multiplex_profiles": True},
+            "multiplex_profiles": True,
+        }),
+        encoding="utf-8",
+    )
     # Ensure canonical loader sees the new file before adapter construction
     from hermes_cli.config import load_config as _load
+
     _loaded = _load()
-    assert _loaded.get("multiplex_profiles") is True or _loaded.get("gateway", {}).get("multiplex_profiles") is True
+    assert (
+        _loaded.get("multiplex_profiles") is True
+        or _loaded.get("gateway", {}).get("multiplex_profiles") is True
+    )
 
     config = PlatformConfig(enabled=True, token="***")
     config.extra = {
@@ -1379,7 +1483,9 @@ async def test_dm_two_profiles_distinct_keys_no_cross_mutation(tmp_path, monkeyp
     )
     oracle_alpha = build_session_key(src_alpha, profile="alpha")
     oracle_beta = build_session_key(src_beta, profile="beta")
-    assert oracle_alpha != oracle_beta, f"profile keys must differ: {oracle_alpha} vs {oracle_beta}"
+    assert oracle_alpha != oracle_beta, (
+        f"profile keys must differ: {oracle_alpha} vs {oracle_beta}"
+    )
     assert "alpha" in oracle_alpha
     assert "beta" in oracle_beta
 
@@ -1410,18 +1516,33 @@ async def test_dm_two_profiles_distinct_keys_no_cross_mutation(tmp_path, monkeyp
     assert raw_alpha.effective() == {"📄"}
 
     await adapter.on_processing_complete(src_alpha, ProcessingOutcome.SUCCESS)
-    assert raw_alpha.ledger() == [("add", "🤖"), ("add", "📄"), ("remove", "🤖"), ("add", "🤖"), ("remove", "📄")]
+    assert raw_alpha.ledger() == [
+        ("add", "🤖"),
+        ("add", "📄"),
+        ("remove", "🤖"),
+        ("add", "🤖"),
+        ("remove", "📄"),
+    ]
     assert raw_alpha.effective() == {"🤖"}
     assert raw_beta.ledger() == [("add", "🤖"), ("add", "🔍"), ("remove", "🤖")]
     assert raw_beta.effective() == {"🔍"}
 
     await adapter.on_processing_complete(src_beta, ProcessingOutcome.SUCCESS)
-    assert raw_beta.ledger() == [("add", "🤖"), ("add", "🔍"), ("remove", "🤖"), ("add", "🤖"), ("remove", "🔍")]
+    assert raw_beta.ledger() == [
+        ("add", "🤖"),
+        ("add", "🔍"),
+        ("remove", "🤖"),
+        ("add", "🤖"),
+        ("remove", "🔍"),
+    ]
     assert raw_beta.effective() == {"🤖"}
     assert raw_alpha.effective() == {"🤖"}
 
+
 @pytest.mark.asyncio
-async def test_quoted_string_dynamic_reactions_false_and_zero_disable_via_production_config(tmp_path, monkeypatch):
+async def test_quoted_string_dynamic_reactions_false_and_zero_disable_via_production_config(
+    tmp_path, monkeypatch
+):
     """Quoted 'false' and '0' must disable swapping via PlatformConfig; true token enables."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.delenv("DISCORD_REACTIONS", raising=False)
@@ -1431,34 +1552,58 @@ async def test_quoted_string_dynamic_reactions_false_and_zero_disable_via_produc
     from hermes_cli.config import load_config
 
     # Platform-quoted 'false' disables
-    cfg_false = PlatformConfig.from_dict(
-        {"enabled": True, "token": "***", "extra": {"dynamic_reactions": "false", "persona_emoji": "🤖", "reaction_cooldown": 0}}
-    )
+    cfg_false = PlatformConfig.from_dict({
+        "enabled": True,
+        "token": "***",
+        "extra": {
+            "dynamic_reactions": "false",
+            "persona_emoji": "🤖",
+            "reaction_cooldown": 0,
+        },
+    })
     ad_false = DiscordAdapter(cfg_false)
     ad_false._client = SimpleNamespace(
-        tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=99999, name="HermesBot")
+        tree=FakeTree(),
+        get_channel=lambda _id: None,
+        fetch_channel=AsyncMock(),
+        user=SimpleNamespace(id=99999, name="HermesBot"),
     )
     raw = LedgerMessage(msg_id=6001)
-    src = SessionSource(platform=Platform.DISCORD, chat_id="123", chat_type="dm", user_id="42")
+    src = SessionSource(
+        platform=Platform.DISCORD, chat_id="123", chat_type="dm", user_id="42"
+    )
     evt = _make_event("6001", raw, source=src)
     await ad_false.on_processing_start(evt)
     assert raw.ledger() == [("add", "🤖")]
     # source-only tool must not swap when disabled — public ledger only, no private map inspection
     with patch("agent.display.get_tool_emoji", return_value="📄"):
         await ad_false.on_tool_call_start(src, "read_file")
-    assert raw.ledger() == [("add", "🤖")], "quoted 'false' must disable dynamic swapping"
+    assert raw.ledger() == [("add", "🤖")], (
+        "quoted 'false' must disable dynamic swapping"
+    )
     assert raw.effective() == {"🤖"}
 
     # Platform-quoted '0' disables
-    cfg_zero = PlatformConfig.from_dict(
-        {"enabled": True, "token": "***", "extra": {"dynamic_reactions": "0", "persona_emoji": "🤖", "reaction_cooldown": 0}}
-    )
+    cfg_zero = PlatformConfig.from_dict({
+        "enabled": True,
+        "token": "***",
+        "extra": {
+            "dynamic_reactions": "0",
+            "persona_emoji": "🤖",
+            "reaction_cooldown": 0,
+        },
+    })
     ad_zero = DiscordAdapter(cfg_zero)
     ad_zero._client = SimpleNamespace(
-        tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=99999, name="HermesBot")
+        tree=FakeTree(),
+        get_channel=lambda _id: None,
+        fetch_channel=AsyncMock(),
+        user=SimpleNamespace(id=99999, name="HermesBot"),
     )
     raw2 = LedgerMessage(msg_id=6002)
-    src2 = SessionSource(platform=Platform.DISCORD, chat_id="124", chat_type="dm", user_id="42")
+    src2 = SessionSource(
+        platform=Platform.DISCORD, chat_id="124", chat_type="dm", user_id="42"
+    )
     evt2 = _make_event("6002", raw2, source=src2)
     await ad_zero.on_processing_start(evt2)
     assert raw2.ledger() == [("add", "🤖")]
@@ -1471,35 +1616,51 @@ async def test_quoted_string_dynamic_reactions_false_and_zero_disable_via_produc
     config_path = _Path(tmp_path) / "config.yaml"
     config_path.write_text('dynamic_reactions: "false"\n', encoding="utf-8")
     loaded = load_config()
-    assert str(loaded.get("dynamic_reactions")).lower() == "false", f"loader must see quoted false, got {loaded.get('dynamic_reactions')!r}"
+    assert str(loaded.get("dynamic_reactions")).lower() == "false", (
+        f"loader must see quoted false, got {loaded.get('dynamic_reactions')!r}"
+    )
     cfg_global_false = PlatformConfig(enabled=True, token="***")
     cfg_global_false.extra = {"persona_emoji": "🤖", "reaction_cooldown": 0}
     ad_global_false = DiscordAdapter(cfg_global_false)
     ad_global_false._client = SimpleNamespace(
-        tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=99999, name="HermesBot")
+        tree=FakeTree(),
+        get_channel=lambda _id: None,
+        fetch_channel=AsyncMock(),
+        user=SimpleNamespace(id=99999, name="HermesBot"),
     )
     raw3 = LedgerMessage(msg_id=6003)
-    src3 = SessionSource(platform=Platform.DISCORD, chat_id="125", chat_type="dm", user_id="42")
+    src3 = SessionSource(
+        platform=Platform.DISCORD, chat_id="125", chat_type="dm", user_id="42"
+    )
     evt3 = _make_event("6003", raw3, source=src3)
     await ad_global_false.on_processing_start(evt3)
     assert raw3.ledger() == [("add", "🤖")]
     assert raw3.effective() == {"🤖"}
     with patch("agent.display.get_tool_emoji", return_value="📄"):
         await ad_global_false.on_tool_call_start(src3, "read_file")
-    assert raw3.ledger() == [("add", "🤖")], "global quoted 'false' must disable swapping"
+    assert raw3.ledger() == [("add", "🤖")], (
+        "global quoted 'false' must disable swapping"
+    )
     assert raw3.effective() == {"🤖"}
 
     config_path.write_text('dynamic_reactions: "0"\n', encoding="utf-8")
     loaded = load_config()
-    assert str(loaded.get("dynamic_reactions")) == "0", f"loader must see quoted 0, got {loaded.get('dynamic_reactions')!r}"
+    assert str(loaded.get("dynamic_reactions")) == "0", (
+        f"loader must see quoted 0, got {loaded.get('dynamic_reactions')!r}"
+    )
     cfg_global_zero = PlatformConfig(enabled=True, token="***")
     cfg_global_zero.extra = {"persona_emoji": "🤖", "reaction_cooldown": 0}
     ad_global_zero = DiscordAdapter(cfg_global_zero)
     ad_global_zero._client = SimpleNamespace(
-        tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=99999, name="HermesBot")
+        tree=FakeTree(),
+        get_channel=lambda _id: None,
+        fetch_channel=AsyncMock(),
+        user=SimpleNamespace(id=99999, name="HermesBot"),
     )
     raw4 = LedgerMessage(msg_id=6004)
-    src4 = SessionSource(platform=Platform.DISCORD, chat_id="126", chat_type="dm", user_id="42")
+    src4 = SessionSource(
+        platform=Platform.DISCORD, chat_id="126", chat_type="dm", user_id="42"
+    )
     evt4 = _make_event("6004", raw4, source=src4)
     await ad_global_zero.on_processing_start(evt4)
     assert raw4.ledger() == [("add", "🤖")]
@@ -1510,15 +1671,26 @@ async def test_quoted_string_dynamic_reactions_false_and_zero_disable_via_produc
     assert raw4.effective() == {"🤖"}
 
     # True-token control enables swapping (platform and global) — public ledger proof
-    cfg_true = PlatformConfig.from_dict(
-        {"enabled": True, "token": "***", "extra": {"dynamic_reactions": "true", "persona_emoji": "🤖", "reaction_cooldown": 0}}
-    )
+    cfg_true = PlatformConfig.from_dict({
+        "enabled": True,
+        "token": "***",
+        "extra": {
+            "dynamic_reactions": "true",
+            "persona_emoji": "🤖",
+            "reaction_cooldown": 0,
+        },
+    })
     ad_true = DiscordAdapter(cfg_true)
     ad_true._client = SimpleNamespace(
-        tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=99999, name="HermesBot")
+        tree=FakeTree(),
+        get_channel=lambda _id: None,
+        fetch_channel=AsyncMock(),
+        user=SimpleNamespace(id=99999, name="HermesBot"),
     )
     raw_true = LedgerMessage(msg_id=6005)
-    src_true = SessionSource(platform=Platform.DISCORD, chat_id="127", chat_type="dm", user_id="42")
+    src_true = SessionSource(
+        platform=Platform.DISCORD, chat_id="127", chat_type="dm", user_id="42"
+    )
     evt_true = _make_event("6005", raw_true, source=src_true)
     await ad_true.on_processing_start(evt_true)
     assert raw_true.ledger() == [("add", "🤖")]
@@ -1529,15 +1701,22 @@ async def test_quoted_string_dynamic_reactions_false_and_zero_disable_via_produc
 
     config_path.write_text('dynamic_reactions: "true"\n', encoding="utf-8")
     loaded = load_config()
-    assert str(loaded.get("dynamic_reactions")).lower() == "true", f"loader must see quoted true, got {loaded.get('dynamic_reactions')!r}"
+    assert str(loaded.get("dynamic_reactions")).lower() == "true", (
+        f"loader must see quoted true, got {loaded.get('dynamic_reactions')!r}"
+    )
     cfg_global_true = PlatformConfig(enabled=True, token="***")
     cfg_global_true.extra = {"persona_emoji": "🤖", "reaction_cooldown": 0}
     ad_global_true = DiscordAdapter(cfg_global_true)
     ad_global_true._client = SimpleNamespace(
-        tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=99999, name="HermesBot")
+        tree=FakeTree(),
+        get_channel=lambda _id: None,
+        fetch_channel=AsyncMock(),
+        user=SimpleNamespace(id=99999, name="HermesBot"),
     )
     raw_gtrue = LedgerMessage(msg_id=6006)
-    src_gtrue = SessionSource(platform=Platform.DISCORD, chat_id="128", chat_type="dm", user_id="42")
+    src_gtrue = SessionSource(
+        platform=Platform.DISCORD, chat_id="128", chat_type="dm", user_id="42"
+    )
     evt_gtrue = _make_event("6006", raw_gtrue, source=src_gtrue)
     await ad_global_true.on_processing_start(evt_gtrue)
     assert raw_gtrue.ledger() == [("add", "🤖")]
@@ -1547,9 +1726,11 @@ async def test_quoted_string_dynamic_reactions_false_and_zero_disable_via_produc
     assert raw_gtrue.ledger() == [("add", "🤖"), ("add", "📄"), ("remove", "🤖")]
     assert raw_gtrue.effective() == {"📄"}
 
+
 # ---------------------------------------------------------------------------
 # Owner-profile ingress before handler stamping — public lifecycle with two secondary owners
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.asyncio
 async def test_secondary_owner_profile_ingress_before_stamp_public_lifecycle_two_owners():
@@ -1567,10 +1748,16 @@ async def test_secondary_owner_profile_ingress_before_stamp_public_lifecycle_two
     # Two independent adapters, each with its own owner profile, same chat identity
     def _make_reaction_adapter():
         cfg = PlatformConfig(enabled=True, token="***")
-        cfg.extra = {"persona_emoji": "🤖", "dynamic_reactions": True, "reaction_cooldown": 0}
+        cfg.extra = {
+            "persona_emoji": "🤖",
+            "dynamic_reactions": True,
+            "reaction_cooldown": 0,
+        }
         ad = DiscordAdapter(cfg)
         ad._client = SimpleNamespace(
-            tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(),
+            tree=FakeTree(),
+            get_channel=lambda _id: None,
+            fetch_channel=AsyncMock(),
             user=SimpleNamespace(id=99999, name="HermesBot"),
         )
         ad._rxn_cooldown = 0.0
@@ -1585,8 +1772,20 @@ async def test_secondary_owner_profile_ingress_before_stamp_public_lifecycle_two
     ad_beta.set_owner_profile("beta")
 
     # Unstamped DM sources: same chat/user, no profile yet (pre-handler)
-    src_alpha_unstamped = SessionSource(platform=Platform.DISCORD, chat_id="same", chat_type="dm", user_id="42", user_name="Jezza")
-    src_beta_unstamped = SessionSource(platform=Platform.DISCORD, chat_id="same", chat_type="dm", user_id="42", user_name="Jezza")
+    src_alpha_unstamped = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="same",
+        chat_type="dm",
+        user_id="42",
+        user_name="Jezza",
+    )
+    src_beta_unstamped = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="same",
+        chat_type="dm",
+        user_id="42",
+        user_name="Jezza",
+    )
     # Ensure unstamped
     assert not getattr(src_alpha_unstamped, "profile", None)
     assert not getattr(src_beta_unstamped, "profile", None)
@@ -1595,13 +1794,17 @@ async def test_secondary_owner_profile_ingress_before_stamp_public_lifecycle_two
     key_alpha_unstamped = ad_alpha._session_key_from_source(src_alpha_unstamped)
     key_beta_unstamped = ad_beta._session_key_from_source(src_beta_unstamped)
     key_main = build_session_key(src_alpha_unstamped)
-    assert key_alpha_unstamped != key_beta_unstamped, f"two secondary owners must not collide pre-stamp: {key_alpha_unstamped} vs {key_beta_unstamped}"
+    assert key_alpha_unstamped != key_beta_unstamped, (
+        f"two secondary owners must not collide pre-stamp: {key_alpha_unstamped} vs {key_beta_unstamped}"
+    )
     assert key_alpha_unstamped != key_main
     assert key_beta_unstamped != key_main
     assert "alpha" in key_alpha_unstamped
     assert "beta" in key_beta_unstamped
     # Also oracle via direct build_session_key with explicit profile
-    assert key_alpha_unstamped == build_session_key(src_alpha_unstamped, profile="alpha")
+    assert key_alpha_unstamped == build_session_key(
+        src_alpha_unstamped, profile="alpha"
+    )
     assert key_beta_unstamped == build_session_key(src_beta_unstamped, profile="beta")
 
     raw_alpha = LedgerMessage(msg_id=91001)
@@ -1622,8 +1825,22 @@ async def test_secondary_owner_profile_ingress_before_stamp_public_lifecycle_two
     src_alpha_unstamped.profile = "alpha"
     src_beta_unstamped.profile = "beta"
     # Also create explicit stamped sources for source-only callbacks
-    src_alpha_stamped = SessionSource(platform=Platform.DISCORD, chat_id="same", chat_type="dm", user_id="42", user_name="Jezza", profile="alpha")
-    src_beta_stamped = SessionSource(platform=Platform.DISCORD, chat_id="same", chat_type="dm", user_id="42", user_name="Jezza", profile="beta")
+    src_alpha_stamped = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="same",
+        chat_type="dm",
+        user_id="42",
+        user_name="Jezza",
+        profile="alpha",
+    )
+    src_beta_stamped = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="same",
+        chat_type="dm",
+        user_id="42",
+        user_name="Jezza",
+        profile="beta",
+    )
 
     # Source-only public tool callbacks after stamping must swap via add-before-remove
     with patch("agent.display.get_tool_emoji", return_value="📄"):
@@ -1639,24 +1856,52 @@ async def test_secondary_owner_profile_ingress_before_stamp_public_lifecycle_two
     # Public completion callbacks after stamping must restore persona with add-before-remove and cleanup
     await ad_alpha.on_processing_complete(src_alpha_stamped, ProcessingOutcome.SUCCESS)
     await ad_beta.on_processing_complete(src_beta_stamped, ProcessingOutcome.SUCCESS)
-    assert raw_alpha.ledger() == [("add", "🤖"), ("add", "📄"), ("remove", "🤖"), ("add", "🤖"), ("remove", "📄")]
-    assert raw_beta.ledger() == [("add", "🤖"), ("add", "📄"), ("remove", "🤖"), ("add", "🤖"), ("remove", "📄")]
+    assert raw_alpha.ledger() == [
+        ("add", "🤖"),
+        ("add", "📄"),
+        ("remove", "🤖"),
+        ("add", "🤖"),
+        ("remove", "📄"),
+    ]
+    assert raw_beta.ledger() == [
+        ("add", "🤖"),
+        ("add", "📄"),
+        ("remove", "🤖"),
+        ("add", "🤖"),
+        ("remove", "📄"),
+    ]
     assert raw_alpha.effective() == {"🤖"}
     assert raw_beta.effective() == {"🤖"}
     # Terminal cleanup: supplemental oracle that no authority remains stranded (but ledger is primary)
     # If we used private maps as primary, this would be vacuous; ledger above already proves cleanup via effective set.
 
+
 @pytest.mark.asyncio
 async def test_secondary_owner_profile_ingress_same_adapter_stamped_source_precedence():
     """Stamped source after owner-configured ingress must still resolve to stamped profile precedence."""
     cfg = PlatformConfig(enabled=True, token="***")
-    cfg.extra = {"persona_emoji": "🤖", "dynamic_reactions": True, "reaction_cooldown": 0}
+    cfg.extra = {
+        "persona_emoji": "🤖",
+        "dynamic_reactions": True,
+        "reaction_cooldown": 0,
+    }
     ad = DiscordAdapter(cfg)
-    ad._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=99999, name="HermesBot"))
+    ad._client = SimpleNamespace(
+        tree=FakeTree(),
+        get_channel=lambda _id: None,
+        fetch_channel=AsyncMock(),
+        user=SimpleNamespace(id=99999, name="HermesBot"),
+    )
     ad._rxn_cooldown = 0.0
     ad.set_owner_profile("alpha")
     # Start with stamped source already present (handler already stamped) — should use stamped, not owner
-    src_stamped = SessionSource(platform=Platform.DISCORD, chat_id="same2", chat_type="dm", user_id="42", profile="beta")
+    src_stamped = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="same2",
+        chat_type="dm",
+        user_id="42",
+        profile="beta",
+    )
     # Even though adapter owner is alpha, stamped beta must win (precedence)
     key = ad._session_key_from_source(src_stamped)
     assert key == build_session_key(src_stamped, profile="beta")
@@ -1677,16 +1922,28 @@ async def test_secondary_owner_profile_ingress_same_adapter_stamped_source_prece
 # Terminal removal-ACK integrity — public ledger regressions for false/exception
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_terminal_completion_removal_false_retains_authority_and_stacks():
     """Completion SUCCESS with provider removal False must not discard authority; remote stacks."""
     cfg = PlatformConfig(enabled=True, token="***")
-    cfg.extra = {"persona_emoji": "🤖", "dynamic_reactions": True, "reaction_cooldown": 0}
+    cfg.extra = {
+        "persona_emoji": "🤖",
+        "dynamic_reactions": True,
+        "reaction_cooldown": 0,
+    }
     ad = DiscordAdapter(cfg)
-    ad._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=99999, name="HermesBot"))
+    ad._client = SimpleNamespace(
+        tree=FakeTree(),
+        get_channel=lambda _id: None,
+        fetch_channel=AsyncMock(),
+        user=SimpleNamespace(id=99999, name="HermesBot"),
+    )
     ad._rxn_cooldown = 0.0
     raw = LedgerMessage(msg_id=92001)
-    src = SessionSource(platform=Platform.DISCORD, chat_id="c1", chat_type="dm", user_id="42")
+    src = SessionSource(
+        platform=Platform.DISCORD, chat_id="c1", chat_type="dm", user_id="42"
+    )
     evt = _make_event("92001", raw, source=src)
     await ad.on_processing_start(evt)
     assert raw.ledger() == [("add", "🤖")]
@@ -1700,10 +1957,17 @@ async def test_terminal_completion_removal_false_retains_authority_and_stacks():
     ad._reaction_remove = AsyncMock(return_value=False)
     await ad.on_processing_complete(src, ProcessingOutcome.SUCCESS)
     # Exact remote effects: persona added, but old tool not removed => stacked
-    assert raw.ledger() == [("add", "🤖"), ("add", "📄"), ("remove", "🤖"), ("add", "🤖")]
+    assert raw.ledger() == [
+        ("add", "🤖"),
+        ("add", "📄"),
+        ("remove", "🤖"),
+        ("add", "🤖"),
+    ]
     assert raw.effective() == {"🤖", "📄"}
     # Safe state: authority retained (supplemental), not silently cleared
-    assert key in ad._rxn_active, "active must be retained when terminal removal unconfirmed"
+    assert key in ad._rxn_active, (
+        "active must be retained when terminal removal unconfirmed"
+    )
     assert key in ad._rxn_msg_refs
     # Restore and verify retry can clean up (reachability)
     ad._reaction_remove = orig_remove
@@ -1718,16 +1982,28 @@ async def test_terminal_completion_removal_false_retains_authority_and_stacks():
     assert raw.effective() == {"🤖"}
     assert key not in ad._rxn_active
 
+
 @pytest.mark.asyncio
 async def test_terminal_completion_removal_exception_retains_authority_and_stacks():
     """Completion FAILURE with provider removal exception must retain authority and leave remote stacked."""
     cfg = PlatformConfig(enabled=True, token="***")
-    cfg.extra = {"persona_emoji": "🤖", "dynamic_reactions": True, "reaction_cooldown": 0}
+    cfg.extra = {
+        "persona_emoji": "🤖",
+        "dynamic_reactions": True,
+        "reaction_cooldown": 0,
+    }
     ad = DiscordAdapter(cfg)
-    ad._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=99999, name="HermesBot"))
+    ad._client = SimpleNamespace(
+        tree=FakeTree(),
+        get_channel=lambda _id: None,
+        fetch_channel=AsyncMock(),
+        user=SimpleNamespace(id=99999, name="HermesBot"),
+    )
     ad._rxn_cooldown = 0.0
     raw = LedgerMessage(msg_id=92002)
-    src = SessionSource(platform=Platform.DISCORD, chat_id="c2", chat_type="dm", user_id="42")
+    src = SessionSource(
+        platform=Platform.DISCORD, chat_id="c2", chat_type="dm", user_id="42"
+    )
     evt = _make_event("92002", raw, source=src)
     await ad.on_processing_start(evt)
     with patch("agent.display.get_tool_emoji", return_value="📄"):
@@ -1751,16 +2027,28 @@ async def test_terminal_completion_removal_exception_retains_authority_and_stack
     assert raw.effective() == {"❌"}
     assert key not in ad._rxn_active
 
+
 @pytest.mark.asyncio
 async def test_terminal_cancellation_removal_false_retains_authority():
     """Cancellation with provider removal False must retain authority; no new add, remote still has tool emoji."""
     cfg = PlatformConfig(enabled=True, token="***")
-    cfg.extra = {"persona_emoji": "🤖", "dynamic_reactions": True, "reaction_cooldown": 0}
+    cfg.extra = {
+        "persona_emoji": "🤖",
+        "dynamic_reactions": True,
+        "reaction_cooldown": 0,
+    }
     ad = DiscordAdapter(cfg)
-    ad._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=99999, name="HermesBot"))
+    ad._client = SimpleNamespace(
+        tree=FakeTree(),
+        get_channel=lambda _id: None,
+        fetch_channel=AsyncMock(),
+        user=SimpleNamespace(id=99999, name="HermesBot"),
+    )
     ad._rxn_cooldown = 0.0
     raw = LedgerMessage(msg_id=92003)
-    src = SessionSource(platform=Platform.DISCORD, chat_id="c3", chat_type="dm", user_id="42")
+    src = SessionSource(
+        platform=Platform.DISCORD, chat_id="c3", chat_type="dm", user_id="42"
+    )
     evt = _make_event("92003", raw, source=src)
     await ad.on_processing_start(evt)
     with patch("agent.display.get_tool_emoji", return_value="📄"):
@@ -1781,16 +2069,28 @@ async def test_terminal_cancellation_removal_false_retains_authority():
     assert raw.effective() == set()
     assert key not in ad._rxn_active
 
+
 @pytest.mark.asyncio
 async def test_terminal_cancellation_removal_exception_retains_authority():
     """Cancellation with provider removal exception must retain authority."""
     cfg = PlatformConfig(enabled=True, token="***")
-    cfg.extra = {"persona_emoji": "🤖", "dynamic_reactions": True, "reaction_cooldown": 0}
+    cfg.extra = {
+        "persona_emoji": "🤖",
+        "dynamic_reactions": True,
+        "reaction_cooldown": 0,
+    }
     ad = DiscordAdapter(cfg)
-    ad._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=99999, name="HermesBot"))
+    ad._client = SimpleNamespace(
+        tree=FakeTree(),
+        get_channel=lambda _id: None,
+        fetch_channel=AsyncMock(),
+        user=SimpleNamespace(id=99999, name="HermesBot"),
+    )
     ad._rxn_cooldown = 0.0
     raw = LedgerMessage(msg_id=92004)
-    src = SessionSource(platform=Platform.DISCORD, chat_id="c4", chat_type="dm", user_id="42")
+    src = SessionSource(
+        platform=Platform.DISCORD, chat_id="c4", chat_type="dm", user_id="42"
+    )
     evt = _make_event("92004", raw, source=src)
     await ad.on_processing_start(evt)
     with patch("agent.display.get_tool_emoji", return_value="📄"):
@@ -1815,16 +2115,31 @@ async def test_terminal_cancellation_removal_exception_retains_authority():
 # RXN-REMOVE-003: retained authority must not be overwritten by new start
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_same_key_after_success_removal_false_defers_new_start_and_retains_old():
     """SUCCESS with removal False retains old; same-key new start must not add and old remains reachable for retry."""
     cfg = PlatformConfig(enabled=True, token="***")
-    cfg.extra = {"persona_emoji": "🤖", "dynamic_reactions": True, "reaction_cooldown": 0}
+    cfg.extra = {
+        "persona_emoji": "🤖",
+        "dynamic_reactions": True,
+        "reaction_cooldown": 0,
+    }
     ad = DiscordAdapter(cfg)
-    ad._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=99999, name="HermesBot"))
+    ad._client = SimpleNamespace(
+        tree=FakeTree(),
+        get_channel=lambda _id: None,
+        fetch_channel=AsyncMock(),
+        user=SimpleNamespace(id=99999, name="HermesBot"),
+    )
     ad._rxn_cooldown = 0.0
 
-    src = SessionSource(platform=Platform.DISCORD, chat_id="same-success-false", chat_type="dm", user_id="42")
+    src = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="same-success-false",
+        chat_type="dm",
+        user_id="42",
+    )
     raw_old = LedgerMessage(msg_id=93001)
     evt_old = _make_event("93001", raw_old, source=src)
     await ad.on_processing_start(evt_old)
@@ -1841,7 +2156,12 @@ async def test_same_key_after_success_removal_false_defers_new_start_and_retains
     ad._reaction_remove = AsyncMock(return_value=False)
     await ad.on_processing_complete(src, ProcessingOutcome.SUCCESS)
     # Public ledger: persona added but tool not removed => stacked
-    assert raw_old.ledger() == [("add", "🤖"), ("add", "📄"), ("remove", "🤖"), ("add", "🤖")]
+    assert raw_old.ledger() == [
+        ("add", "🤖"),
+        ("add", "📄"),
+        ("remove", "🤖"),
+        ("add", "🤖"),
+    ]
     assert raw_old.effective() == {"🤖", "📄"}
     # Supplemental: authority retained for later reconciliation, not silently replaced
     assert key in ad._rxn_active
@@ -1858,7 +2178,12 @@ async def test_same_key_after_success_removal_false_defers_new_start_and_retains
     assert raw_new.ledger() == []
     assert raw_new.effective() == set()
     # Old remote must remain stacked/effective and reachable
-    assert raw_old.ledger() == [("add", "🤖"), ("add", "📄"), ("remove", "🤖"), ("add", "🤖")]
+    assert raw_old.ledger() == [
+        ("add", "🤖"),
+        ("add", "📄"),
+        ("remove", "🤖"),
+        ("add", "🤖"),
+    ]
     assert raw_old.effective() == {"🤖", "📄"}
     assert key in ad._rxn_active
     assert ad._rxn_msg_refs.get(key) is raw_old
@@ -1887,12 +2212,26 @@ async def test_same_key_after_success_removal_false_defers_new_start_and_retains
 async def test_same_key_after_success_removal_exception_defers_new_start_and_retains_old():
     """SUCCESS with removal exception retains old; same-key new start must not overwrite."""
     cfg = PlatformConfig(enabled=True, token="***")
-    cfg.extra = {"persona_emoji": "🤖", "dynamic_reactions": True, "reaction_cooldown": 0}
+    cfg.extra = {
+        "persona_emoji": "🤖",
+        "dynamic_reactions": True,
+        "reaction_cooldown": 0,
+    }
     ad = DiscordAdapter(cfg)
-    ad._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=99999, name="HermesBot"))
+    ad._client = SimpleNamespace(
+        tree=FakeTree(),
+        get_channel=lambda _id: None,
+        fetch_channel=AsyncMock(),
+        user=SimpleNamespace(id=99999, name="HermesBot"),
+    )
     ad._rxn_cooldown = 0.0
 
-    src = SessionSource(platform=Platform.DISCORD, chat_id="same-success-exc", chat_type="dm", user_id="42")
+    src = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="same-success-exc",
+        chat_type="dm",
+        user_id="42",
+    )
     raw_old = LedgerMessage(msg_id=93011)
     evt_old = _make_event("93011", raw_old, source=src)
     await ad.on_processing_start(evt_old)
@@ -1904,7 +2243,12 @@ async def test_same_key_after_success_removal_exception_defers_new_start_and_ret
     orig_remove = ad._reaction_remove
     ad._reaction_remove = AsyncMock(side_effect=RuntimeError("boom"))
     await ad.on_processing_complete(src, ProcessingOutcome.SUCCESS)
-    assert raw_old.ledger() == [("add", "🤖"), ("add", "📄"), ("remove", "🤖"), ("add", "🤖")]
+    assert raw_old.ledger() == [
+        ("add", "🤖"),
+        ("add", "📄"),
+        ("remove", "🤖"),
+        ("add", "🤖"),
+    ]
     assert raw_old.effective() == {"🤖", "📄"}
     assert key in ad._rxn_active
     assert key in getattr(ad, "_rxn_retained", set())
@@ -1928,12 +2272,26 @@ async def test_same_key_after_success_removal_exception_defers_new_start_and_ret
 async def test_same_key_after_cancelled_removal_false_defers_new_start_and_retains_old():
     """CANCELLED with removal False retains old; same-key new start must not add and old remains reachable."""
     cfg = PlatformConfig(enabled=True, token="***")
-    cfg.extra = {"persona_emoji": "🤖", "dynamic_reactions": True, "reaction_cooldown": 0}
+    cfg.extra = {
+        "persona_emoji": "🤖",
+        "dynamic_reactions": True,
+        "reaction_cooldown": 0,
+    }
     ad = DiscordAdapter(cfg)
-    ad._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=99999, name="HermesBot"))
+    ad._client = SimpleNamespace(
+        tree=FakeTree(),
+        get_channel=lambda _id: None,
+        fetch_channel=AsyncMock(),
+        user=SimpleNamespace(id=99999, name="HermesBot"),
+    )
     ad._rxn_cooldown = 0.0
 
-    src = SessionSource(platform=Platform.DISCORD, chat_id="same-cancel-false", chat_type="dm", user_id="42")
+    src = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="same-cancel-false",
+        chat_type="dm",
+        user_id="42",
+    )
     raw_old = LedgerMessage(msg_id=93021)
     evt_old = _make_event("93021", raw_old, source=src)
     await ad.on_processing_start(evt_old)
@@ -1970,12 +2328,26 @@ async def test_same_key_after_cancelled_removal_false_defers_new_start_and_retai
 async def test_same_key_after_cancelled_removal_exception_defers_new_start_and_retains_old():
     """CANCELLED with removal exception retains old; same-key new start must not overwrite."""
     cfg = PlatformConfig(enabled=True, token="***")
-    cfg.extra = {"persona_emoji": "🤖", "dynamic_reactions": True, "reaction_cooldown": 0}
+    cfg.extra = {
+        "persona_emoji": "🤖",
+        "dynamic_reactions": True,
+        "reaction_cooldown": 0,
+    }
     ad = DiscordAdapter(cfg)
-    ad._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=99999, name="HermesBot"))
+    ad._client = SimpleNamespace(
+        tree=FakeTree(),
+        get_channel=lambda _id: None,
+        fetch_channel=AsyncMock(),
+        user=SimpleNamespace(id=99999, name="HermesBot"),
+    )
     ad._rxn_cooldown = 0.0
 
-    src = SessionSource(platform=Platform.DISCORD, chat_id="same-cancel-exc", chat_type="dm", user_id="42")
+    src = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="same-cancel-exc",
+        chat_type="dm",
+        user_id="42",
+    )
     raw_old = LedgerMessage(msg_id=93031)
     evt_old = _make_event("93031", raw_old, source=src)
     await ad.on_processing_start(evt_old)
@@ -2006,22 +2378,38 @@ async def test_same_key_after_cancelled_removal_exception_defers_new_start_and_r
     assert key not in getattr(ad, "_rxn_retained", set())
     assert raw_new.ledger() == []
 
+
 # ---------------------------------------------------------------------------
 # RXN-REMOVE-003 completion authority binding — rejected new lifecycle must not
 # mutate retained old message, original lifecycle must reconcile correctly
 # Public adapter/effect-ledger regressions for SUCCESS/CANCELLED x false/exception
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_rejected_completion_authority_binding_success_false():
     """SUCCESS False: retained old authority is bound to original raw; rejected new completion after recovery leaves old ledger byte-unchanged."""
     cfg = PlatformConfig(enabled=True, token="***")
-    cfg.extra = {"persona_emoji": "🤖", "dynamic_reactions": True, "reaction_cooldown": 0}
+    cfg.extra = {
+        "persona_emoji": "🤖",
+        "dynamic_reactions": True,
+        "reaction_cooldown": 0,
+    }
     ad = DiscordAdapter(cfg)
-    ad._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=99999, name="HermesBot"))
+    ad._client = SimpleNamespace(
+        tree=FakeTree(),
+        get_channel=lambda _id: None,
+        fetch_channel=AsyncMock(),
+        user=SimpleNamespace(id=99999, name="HermesBot"),
+    )
     ad._rxn_cooldown = 0.0
 
-    src = SessionSource(platform=Platform.DISCORD, chat_id="bind-success-false", chat_type="dm", user_id="42")
+    src = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="bind-success-false",
+        chat_type="dm",
+        user_id="42",
+    )
     raw_old = LedgerMessage(msg_id=94001)
     evt_old = _make_event("94001", raw_old, source=src)
     await ad.on_processing_start(evt_old)
@@ -2037,7 +2425,12 @@ async def test_rejected_completion_authority_binding_success_false():
     ad._reaction_remove = AsyncMock(return_value=False)
     await ad.on_processing_complete(evt_old, ProcessingOutcome.SUCCESS)
     # terminal remove unconfirmed => stacked persona + tool
-    assert raw_old.ledger() == [("add", "🤖"), ("add", "📄"), ("remove", "🤖"), ("add", "🤖")]
+    assert raw_old.ledger() == [
+        ("add", "🤖"),
+        ("add", "📄"),
+        ("remove", "🤖"),
+        ("add", "🤖"),
+    ]
     assert raw_old.effective() == {"🤖", "📄"}
     assert key in ad._rxn_active
     assert ad._rxn_msg_refs.get(key) is raw_old
@@ -2049,13 +2442,20 @@ async def test_rejected_completion_authority_binding_success_false():
     await ad.on_processing_start(evt_new)
     assert raw_new.ledger() == [], "new start must perform no remote add/set"
     assert raw_new.effective() == set()
-    assert raw_old.ledger() == [("add", "🤖"), ("add", "📄"), ("remove", "🤖"), ("add", "🤖")]
+    assert raw_old.ledger() == [
+        ("add", "🤖"),
+        ("add", "📄"),
+        ("remove", "🤖"),
+        ("add", "🤖"),
+    ]
     assert ad._rxn_msg_refs.get(key) is raw_old
 
     # Control: provider still failing — rejected new completion must not duplicate old
     snapshot_before_fail = list(raw_old.ledger())
     await ad.on_processing_complete(evt_new, ProcessingOutcome.SUCCESS)
-    assert raw_old.ledger() == snapshot_before_fail, "rejected new completion with provider still failing must not mutate old"
+    assert raw_old.ledger() == snapshot_before_fail, (
+        "rejected new completion with provider still failing must not mutate old"
+    )
     assert raw_new.ledger() == []
     assert key in ad._rxn_active
     assert ad._rxn_msg_refs.get(key) is raw_old
@@ -2067,7 +2467,9 @@ async def test_rejected_completion_authority_binding_success_false():
     ad._reaction_add = orig_add
     snapshot_before_recovery = list(raw_old.ledger())
     await ad.on_processing_complete(evt_new, ProcessingOutcome.SUCCESS)
-    assert raw_old.ledger() == snapshot_before_recovery, "rejected new completion after recovery must not mutate old"
+    assert raw_old.ledger() == snapshot_before_recovery, (
+        "rejected new completion after recovery must not mutate old"
+    )
     assert raw_new.ledger() == []
     assert key in ad._rxn_active, "authority must not be cleared by rejected callback"
     assert ad._rxn_msg_refs.get(key) is raw_old
@@ -2076,7 +2478,9 @@ async def test_rejected_completion_authority_binding_success_false():
 
     # Original lifecycle public reconciliation with successful provider cleans correctly
     await ad.on_processing_complete(evt_old, ProcessingOutcome.SUCCESS)
-    assert raw_old.effective() == {"🤖"}, "original retry must clean old tool, leaving single persona"
+    assert raw_old.effective() == {"🤖"}, (
+        "original retry must clean old tool, leaving single persona"
+    )
     assert key not in ad._rxn_active
     assert key not in ad._rxn_msg_refs
     assert key not in getattr(ad, "_rxn_retained", set())
@@ -2087,12 +2491,26 @@ async def test_rejected_completion_authority_binding_success_false():
 async def test_rejected_completion_authority_binding_success_exception():
     """SUCCESS exception: rejected new completion after recovery leaves old unchanged, original cleans."""
     cfg = PlatformConfig(enabled=True, token="***")
-    cfg.extra = {"persona_emoji": "🤖", "dynamic_reactions": True, "reaction_cooldown": 0}
+    cfg.extra = {
+        "persona_emoji": "🤖",
+        "dynamic_reactions": True,
+        "reaction_cooldown": 0,
+    }
     ad = DiscordAdapter(cfg)
-    ad._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=99999, name="HermesBot"))
+    ad._client = SimpleNamespace(
+        tree=FakeTree(),
+        get_channel=lambda _id: None,
+        fetch_channel=AsyncMock(),
+        user=SimpleNamespace(id=99999, name="HermesBot"),
+    )
     ad._rxn_cooldown = 0.0
 
-    src = SessionSource(platform=Platform.DISCORD, chat_id="bind-success-exc", chat_type="dm", user_id="42")
+    src = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="bind-success-exc",
+        chat_type="dm",
+        user_id="42",
+    )
     raw_old = LedgerMessage(msg_id=94011)
     evt_old = _make_event("94011", raw_old, source=src)
     await ad.on_processing_start(evt_old)
@@ -2104,7 +2522,12 @@ async def test_rejected_completion_authority_binding_success_exception():
     orig_remove = ad._reaction_remove
     ad._reaction_remove = AsyncMock(side_effect=RuntimeError("boom"))
     await ad.on_processing_complete(evt_old, ProcessingOutcome.SUCCESS)
-    assert raw_old.ledger() == [("add", "🤖"), ("add", "📄"), ("remove", "🤖"), ("add", "🤖")]
+    assert raw_old.ledger() == [
+        ("add", "🤖"),
+        ("add", "📄"),
+        ("remove", "🤖"),
+        ("add", "🤖"),
+    ]
     assert raw_old.effective() == {"🤖", "📄"}
     assert key in getattr(ad, "_rxn_retained", set())
 
@@ -2116,14 +2539,18 @@ async def test_rejected_completion_authority_binding_success_exception():
 
     snapshot = list(raw_old.ledger())
     await ad.on_processing_complete(evt_new, ProcessingOutcome.SUCCESS)
-    assert raw_old.ledger() == snapshot, "rejected new completion while exception still active must not mutate old"
+    assert raw_old.ledger() == snapshot, (
+        "rejected new completion while exception still active must not mutate old"
+    )
     assert raw_new.ledger() == []
     assert key in ad._rxn_active
 
     ad._reaction_remove = orig_remove
     snapshot2 = list(raw_old.ledger())
     await ad.on_processing_complete(evt_new, ProcessingOutcome.SUCCESS)
-    assert raw_old.ledger() == snapshot2, "rejected new completion after recovery must not mutate old"
+    assert raw_old.ledger() == snapshot2, (
+        "rejected new completion after recovery must not mutate old"
+    )
     assert raw_new.ledger() == []
     assert key in ad._rxn_active
     assert ad._rxn_msg_refs.get(key) is raw_old
@@ -2140,12 +2567,26 @@ async def test_rejected_completion_authority_binding_success_exception():
 async def test_rejected_completion_authority_binding_cancelled_false():
     """CANCELLED False: rejected new cancellation after recovery leaves old unchanged."""
     cfg = PlatformConfig(enabled=True, token="***")
-    cfg.extra = {"persona_emoji": "🤖", "dynamic_reactions": True, "reaction_cooldown": 0}
+    cfg.extra = {
+        "persona_emoji": "🤖",
+        "dynamic_reactions": True,
+        "reaction_cooldown": 0,
+    }
     ad = DiscordAdapter(cfg)
-    ad._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=99999, name="HermesBot"))
+    ad._client = SimpleNamespace(
+        tree=FakeTree(),
+        get_channel=lambda _id: None,
+        fetch_channel=AsyncMock(),
+        user=SimpleNamespace(id=99999, name="HermesBot"),
+    )
     ad._rxn_cooldown = 0.0
 
-    src = SessionSource(platform=Platform.DISCORD, chat_id="bind-cancel-false", chat_type="dm", user_id="42")
+    src = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="bind-cancel-false",
+        chat_type="dm",
+        user_id="42",
+    )
     raw_old = LedgerMessage(msg_id=94021)
     evt_old = _make_event("94021", raw_old, source=src)
     await ad.on_processing_start(evt_old)
@@ -2171,14 +2612,18 @@ async def test_rejected_completion_authority_binding_cancelled_false():
 
     snapshot = list(raw_old.ledger())
     await ad.on_processing_complete(evt_new, ProcessingOutcome.CANCELLED)
-    assert raw_old.ledger() == snapshot, "rejected new CANCELLED while still failing must not mutate old"
+    assert raw_old.ledger() == snapshot, (
+        "rejected new CANCELLED while still failing must not mutate old"
+    )
     assert raw_new.ledger() == []
     assert key in ad._rxn_active
 
     ad._reaction_remove = orig_remove
     snapshot2 = list(raw_old.ledger())
     await ad.on_processing_complete(evt_new, ProcessingOutcome.CANCELLED)
-    assert raw_old.ledger() == snapshot2, "rejected new CANCELLED after recovery must not mutate old"
+    assert raw_old.ledger() == snapshot2, (
+        "rejected new CANCELLED after recovery must not mutate old"
+    )
     assert raw_new.ledger() == []
     assert key in ad._rxn_active
     assert key in getattr(ad, "_rxn_retained", set())
@@ -2196,12 +2641,26 @@ async def test_rejected_completion_authority_binding_cancelled_false():
 async def test_rejected_completion_authority_binding_cancelled_exception():
     """CANCELLED exception: rejected new cancellation after recovery leaves old unchanged."""
     cfg = PlatformConfig(enabled=True, token="***")
-    cfg.extra = {"persona_emoji": "🤖", "dynamic_reactions": True, "reaction_cooldown": 0}
+    cfg.extra = {
+        "persona_emoji": "🤖",
+        "dynamic_reactions": True,
+        "reaction_cooldown": 0,
+    }
     ad = DiscordAdapter(cfg)
-    ad._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=99999, name="HermesBot"))
+    ad._client = SimpleNamespace(
+        tree=FakeTree(),
+        get_channel=lambda _id: None,
+        fetch_channel=AsyncMock(),
+        user=SimpleNamespace(id=99999, name="HermesBot"),
+    )
     ad._rxn_cooldown = 0.0
 
-    src = SessionSource(platform=Platform.DISCORD, chat_id="bind-cancel-exc", chat_type="dm", user_id="42")
+    src = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="bind-cancel-exc",
+        chat_type="dm",
+        user_id="42",
+    )
     raw_old = LedgerMessage(msg_id=94031)
     evt_old = _make_event("94031", raw_old, source=src)
     await ad.on_processing_start(evt_old)
@@ -2232,7 +2691,9 @@ async def test_rejected_completion_authority_binding_cancelled_exception():
     ad._reaction_remove = orig_remove
     snapshot2 = list(raw_old.ledger())
     await ad.on_processing_complete(evt_new, ProcessingOutcome.CANCELLED)
-    assert raw_old.ledger() == snapshot2, "rejected new CANCELLED after recovery must not mutate old"
+    assert raw_old.ledger() == snapshot2, (
+        "rejected new CANCELLED after recovery must not mutate old"
+    )
     assert raw_new.ledger() == []
     assert key in ad._rxn_active
     assert key in getattr(ad, "_rxn_retained", set())
@@ -2248,14 +2709,18 @@ async def test_rejected_completion_authority_binding_cancelled_exception():
 # Strict raw lifecycle authority — same-ID and missing-capability regressions
 # ---------------------------------------------------------------------------
 
+
 class _MissingCapMessage:
     """Distinct raw object lacking add_reaction capability for Raven bypass repro."""
+
     def __init__(self, msg_id):
         self.id = msg_id
         self._ledger = []
         self._effective = set()
+
     def ledger(self):
         return list(self._ledger)
+
     def effective(self):
         return set(self._effective)
 
@@ -2264,11 +2729,25 @@ class _MissingCapMessage:
 async def test_strict_same_id_success_false():
     """SUCCESS false: same-ID distinct raw must not mutate old while failing and after recovery; original retry reconciles."""
     cfg = PlatformConfig(enabled=True, token="***")
-    cfg.extra = {"persona_emoji": "🤖", "dynamic_reactions": True, "reaction_cooldown": 0}
+    cfg.extra = {
+        "persona_emoji": "🤖",
+        "dynamic_reactions": True,
+        "reaction_cooldown": 0,
+    }
     ad = DiscordAdapter(cfg)
-    ad._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=99999, name="HermesBot"))
+    ad._client = SimpleNamespace(
+        tree=FakeTree(),
+        get_channel=lambda _id: None,
+        fetch_channel=AsyncMock(),
+        user=SimpleNamespace(id=99999, name="HermesBot"),
+    )
     ad._rxn_cooldown = 0.0
-    src = SessionSource(platform=Platform.DISCORD, chat_id="strict-same-success-false", chat_type="dm", user_id="42")
+    src = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="strict-same-success-false",
+        chat_type="dm",
+        user_id="42",
+    )
     raw_old = LedgerMessage(msg_id=96101)
     evt_old = _make_event("96101", raw_old, source=src)
     await ad.on_processing_start(evt_old)
@@ -2282,7 +2761,12 @@ async def test_strict_same_id_success_false():
     orig_add = ad._reaction_add
     ad._reaction_remove = AsyncMock(return_value=False)
     await ad.on_processing_complete(evt_old, ProcessingOutcome.SUCCESS)
-    assert raw_old.ledger() == [("add", "🤖"), ("add", "📄"), ("remove", "🤖"), ("add", "🤖")]
+    assert raw_old.ledger() == [
+        ("add", "🤖"),
+        ("add", "📄"),
+        ("remove", "🤖"),
+        ("add", "🤖"),
+    ]
     assert raw_old.effective() == {"🤖", "📄"}
     assert key in ad._rxn_active
     assert ad._rxn_msg_refs.get(key) is raw_old
@@ -2297,7 +2781,9 @@ async def test_strict_same_id_success_false():
     assert ad._rxn_msg_refs.get(key) is raw_old
     snapshot = list(raw_old.ledger())
     await ad.on_processing_complete(evt_new, ProcessingOutcome.SUCCESS)
-    assert raw_old.ledger() == snapshot, "same-ID rejected SUCCESS while still failing must not mutate old"
+    assert raw_old.ledger() == snapshot, (
+        "same-ID rejected SUCCESS while still failing must not mutate old"
+    )
     assert raw_new.ledger() == []
     assert raw_new.effective() == set()
     assert key in ad._rxn_active
@@ -2307,7 +2793,9 @@ async def test_strict_same_id_success_false():
     ad._reaction_add = orig_add
     snapshot2 = list(raw_old.ledger())
     await ad.on_processing_complete(evt_new, ProcessingOutcome.SUCCESS)
-    assert raw_old.ledger() == snapshot2, "same-ID rejected SUCCESS after recovery must not mutate old"
+    assert raw_old.ledger() == snapshot2, (
+        "same-ID rejected SUCCESS after recovery must not mutate old"
+    )
     assert raw_new.ledger() == []
     assert raw_new.effective() == set()
     assert key in ad._rxn_active
@@ -2325,11 +2813,25 @@ async def test_strict_same_id_success_false():
 @pytest.mark.asyncio
 async def test_strict_same_id_success_exception():
     cfg = PlatformConfig(enabled=True, token="***")
-    cfg.extra = {"persona_emoji": "🤖", "dynamic_reactions": True, "reaction_cooldown": 0}
+    cfg.extra = {
+        "persona_emoji": "🤖",
+        "dynamic_reactions": True,
+        "reaction_cooldown": 0,
+    }
     ad = DiscordAdapter(cfg)
-    ad._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=99999, name="HermesBot"))
+    ad._client = SimpleNamespace(
+        tree=FakeTree(),
+        get_channel=lambda _id: None,
+        fetch_channel=AsyncMock(),
+        user=SimpleNamespace(id=99999, name="HermesBot"),
+    )
     ad._rxn_cooldown = 0.0
-    src = SessionSource(platform=Platform.DISCORD, chat_id="strict-same-success-exc", chat_type="dm", user_id="42")
+    src = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="strict-same-success-exc",
+        chat_type="dm",
+        user_id="42",
+    )
     raw_old = LedgerMessage(msg_id=96111)
     evt_old = _make_event("96111", raw_old, source=src)
     await ad.on_processing_start(evt_old)
@@ -2339,7 +2841,12 @@ async def test_strict_same_id_success_exception():
     orig_remove = ad._reaction_remove
     ad._reaction_remove = AsyncMock(side_effect=RuntimeError("boom"))
     await ad.on_processing_complete(evt_old, ProcessingOutcome.SUCCESS)
-    assert raw_old.ledger() == [("add", "🤖"), ("add", "📄"), ("remove", "🤖"), ("add", "🤖")]
+    assert raw_old.ledger() == [
+        ("add", "🤖"),
+        ("add", "📄"),
+        ("remove", "🤖"),
+        ("add", "🤖"),
+    ]
     assert raw_old.effective() == {"🤖", "📄"}
     assert key in getattr(ad, "_rxn_retained", set())
     raw_new = LedgerMessage(msg_id=96111)
@@ -2369,11 +2876,25 @@ async def test_strict_same_id_success_exception():
 @pytest.mark.asyncio
 async def test_strict_same_id_cancelled_false():
     cfg = PlatformConfig(enabled=True, token="***")
-    cfg.extra = {"persona_emoji": "🤖", "dynamic_reactions": True, "reaction_cooldown": 0}
+    cfg.extra = {
+        "persona_emoji": "🤖",
+        "dynamic_reactions": True,
+        "reaction_cooldown": 0,
+    }
     ad = DiscordAdapter(cfg)
-    ad._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=99999, name="HermesBot"))
+    ad._client = SimpleNamespace(
+        tree=FakeTree(),
+        get_channel=lambda _id: None,
+        fetch_channel=AsyncMock(),
+        user=SimpleNamespace(id=99999, name="HermesBot"),
+    )
     ad._rxn_cooldown = 0.0
-    src = SessionSource(platform=Platform.DISCORD, chat_id="strict-same-cancel-false", chat_type="dm", user_id="42")
+    src = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="strict-same-cancel-false",
+        chat_type="dm",
+        user_id="42",
+    )
     raw_old = LedgerMessage(msg_id=96121)
     evt_old = _make_event("96121", raw_old, source=src)
     await ad.on_processing_start(evt_old)
@@ -2414,11 +2935,25 @@ async def test_strict_same_id_cancelled_false():
 @pytest.mark.asyncio
 async def test_strict_same_id_cancelled_exception():
     cfg = PlatformConfig(enabled=True, token="***")
-    cfg.extra = {"persona_emoji": "🤖", "dynamic_reactions": True, "reaction_cooldown": 0}
+    cfg.extra = {
+        "persona_emoji": "🤖",
+        "dynamic_reactions": True,
+        "reaction_cooldown": 0,
+    }
     ad = DiscordAdapter(cfg)
-    ad._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=99999, name="HermesBot"))
+    ad._client = SimpleNamespace(
+        tree=FakeTree(),
+        get_channel=lambda _id: None,
+        fetch_channel=AsyncMock(),
+        user=SimpleNamespace(id=99999, name="HermesBot"),
+    )
     ad._rxn_cooldown = 0.0
-    src = SessionSource(platform=Platform.DISCORD, chat_id="strict-same-cancel-exc", chat_type="dm", user_id="42")
+    src = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="strict-same-cancel-exc",
+        chat_type="dm",
+        user_id="42",
+    )
     raw_old = LedgerMessage(msg_id=96131)
     evt_old = _make_event("96131", raw_old, source=src)
     await ad.on_processing_start(evt_old)
@@ -2454,11 +2989,25 @@ async def test_strict_same_id_cancelled_exception():
 async def test_strict_missing_cap_success_false():
     """SUCCESS false: missing add_reaction distinct raw must not mutate old while failing and after recovery."""
     cfg = PlatformConfig(enabled=True, token="***")
-    cfg.extra = {"persona_emoji": "🤖", "dynamic_reactions": True, "reaction_cooldown": 0}
+    cfg.extra = {
+        "persona_emoji": "🤖",
+        "dynamic_reactions": True,
+        "reaction_cooldown": 0,
+    }
     ad = DiscordAdapter(cfg)
-    ad._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=99999, name="HermesBot"))
+    ad._client = SimpleNamespace(
+        tree=FakeTree(),
+        get_channel=lambda _id: None,
+        fetch_channel=AsyncMock(),
+        user=SimpleNamespace(id=99999, name="HermesBot"),
+    )
     ad._rxn_cooldown = 0.0
-    src = SessionSource(platform=Platform.DISCORD, chat_id="strict-miss-success-false", chat_type="dm", user_id="42")
+    src = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="strict-miss-success-false",
+        chat_type="dm",
+        user_id="42",
+    )
     raw_old = LedgerMessage(msg_id=96201)
     evt_old = _make_event("96201", raw_old, source=src)
     await ad.on_processing_start(evt_old)
@@ -2470,7 +3019,12 @@ async def test_strict_missing_cap_success_false():
     orig_add = ad._reaction_add
     ad._reaction_remove = AsyncMock(return_value=False)
     await ad.on_processing_complete(evt_old, ProcessingOutcome.SUCCESS)
-    assert raw_old.ledger() == [("add", "🤖"), ("add", "📄"), ("remove", "🤖"), ("add", "🤖")]
+    assert raw_old.ledger() == [
+        ("add", "🤖"),
+        ("add", "📄"),
+        ("remove", "🤖"),
+        ("add", "🤖"),
+    ]
     assert raw_old.effective() == {"🤖", "📄"}
     assert key in getattr(ad, "_rxn_retained", set())
     raw_new = _MissingCapMessage(msg_id=96201)
@@ -2482,7 +3036,9 @@ async def test_strict_missing_cap_success_false():
     assert ad._rxn_msg_refs.get(key) is raw_old
     snapshot = list(raw_old.ledger())
     await ad.on_processing_complete(evt_new, ProcessingOutcome.SUCCESS)
-    assert raw_old.ledger() == snapshot, "missing-cap rejected SUCCESS while still failing must not mutate old"
+    assert raw_old.ledger() == snapshot, (
+        "missing-cap rejected SUCCESS while still failing must not mutate old"
+    )
     assert raw_new.ledger() == []
     assert key in ad._rxn_active
     assert ad._rxn_msg_refs.get(key) is raw_old
@@ -2490,7 +3046,9 @@ async def test_strict_missing_cap_success_false():
     ad._reaction_add = orig_add
     snapshot2 = list(raw_old.ledger())
     await ad.on_processing_complete(evt_new, ProcessingOutcome.SUCCESS)
-    assert raw_old.ledger() == snapshot2, "missing-cap rejected SUCCESS after recovery must not mutate old"
+    assert raw_old.ledger() == snapshot2, (
+        "missing-cap rejected SUCCESS after recovery must not mutate old"
+    )
     assert raw_new.ledger() == []
     assert key in ad._rxn_active
     assert ad._rxn_msg_refs.get(key) is raw_old
@@ -2505,11 +3063,25 @@ async def test_strict_missing_cap_success_false():
 @pytest.mark.asyncio
 async def test_strict_missing_cap_success_exception():
     cfg = PlatformConfig(enabled=True, token="***")
-    cfg.extra = {"persona_emoji": "🤖", "dynamic_reactions": True, "reaction_cooldown": 0}
+    cfg.extra = {
+        "persona_emoji": "🤖",
+        "dynamic_reactions": True,
+        "reaction_cooldown": 0,
+    }
     ad = DiscordAdapter(cfg)
-    ad._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=99999, name="HermesBot"))
+    ad._client = SimpleNamespace(
+        tree=FakeTree(),
+        get_channel=lambda _id: None,
+        fetch_channel=AsyncMock(),
+        user=SimpleNamespace(id=99999, name="HermesBot"),
+    )
     ad._rxn_cooldown = 0.0
-    src = SessionSource(platform=Platform.DISCORD, chat_id="strict-miss-success-exc", chat_type="dm", user_id="42")
+    src = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="strict-miss-success-exc",
+        chat_type="dm",
+        user_id="42",
+    )
     raw_old = LedgerMessage(msg_id=96211)
     evt_old = _make_event("96211", raw_old, source=src)
     await ad.on_processing_start(evt_old)
@@ -2542,11 +3114,25 @@ async def test_strict_missing_cap_success_exception():
 @pytest.mark.asyncio
 async def test_strict_missing_cap_cancelled_false():
     cfg = PlatformConfig(enabled=True, token="***")
-    cfg.extra = {"persona_emoji": "🤖", "dynamic_reactions": True, "reaction_cooldown": 0}
+    cfg.extra = {
+        "persona_emoji": "🤖",
+        "dynamic_reactions": True,
+        "reaction_cooldown": 0,
+    }
     ad = DiscordAdapter(cfg)
-    ad._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=99999, name="HermesBot"))
+    ad._client = SimpleNamespace(
+        tree=FakeTree(),
+        get_channel=lambda _id: None,
+        fetch_channel=AsyncMock(),
+        user=SimpleNamespace(id=99999, name="HermesBot"),
+    )
     ad._rxn_cooldown = 0.0
-    src = SessionSource(platform=Platform.DISCORD, chat_id="strict-miss-cancel-false", chat_type="dm", user_id="42")
+    src = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="strict-miss-cancel-false",
+        chat_type="dm",
+        user_id="42",
+    )
     raw_old = LedgerMessage(msg_id=96221)
     evt_old = _make_event("96221", raw_old, source=src)
     await ad.on_processing_start(evt_old)
@@ -2579,11 +3165,25 @@ async def test_strict_missing_cap_cancelled_false():
 @pytest.mark.asyncio
 async def test_strict_missing_cap_cancelled_exception():
     cfg = PlatformConfig(enabled=True, token="***")
-    cfg.extra = {"persona_emoji": "🤖", "dynamic_reactions": True, "reaction_cooldown": 0}
+    cfg.extra = {
+        "persona_emoji": "🤖",
+        "dynamic_reactions": True,
+        "reaction_cooldown": 0,
+    }
     ad = DiscordAdapter(cfg)
-    ad._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=99999, name="HermesBot"))
+    ad._client = SimpleNamespace(
+        tree=FakeTree(),
+        get_channel=lambda _id: None,
+        fetch_channel=AsyncMock(),
+        user=SimpleNamespace(id=99999, name="HermesBot"),
+    )
     ad._rxn_cooldown = 0.0
-    src = SessionSource(platform=Platform.DISCORD, chat_id="strict-miss-cancel-exc", chat_type="dm", user_id="42")
+    src = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="strict-miss-cancel-exc",
+        chat_type="dm",
+        user_id="42",
+    )
     raw_old = LedgerMessage(msg_id=96231)
     evt_old = _make_event("96231", raw_old, source=src)
     await ad.on_processing_start(evt_old)
@@ -2614,11 +3214,25 @@ async def test_strict_missing_cap_cancelled_exception():
 async def test_strict_source_only_retry_success_false():
     """Source-only (raw None) original retry must still reconcile old and clear only after confirmed success."""
     cfg = PlatformConfig(enabled=True, token="***")
-    cfg.extra = {"persona_emoji": "🤖", "dynamic_reactions": True, "reaction_cooldown": 0}
+    cfg.extra = {
+        "persona_emoji": "🤖",
+        "dynamic_reactions": True,
+        "reaction_cooldown": 0,
+    }
     ad = DiscordAdapter(cfg)
-    ad._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=99999, name="HermesBot"))
+    ad._client = SimpleNamespace(
+        tree=FakeTree(),
+        get_channel=lambda _id: None,
+        fetch_channel=AsyncMock(),
+        user=SimpleNamespace(id=99999, name="HermesBot"),
+    )
     ad._rxn_cooldown = 0.0
-    src = SessionSource(platform=Platform.DISCORD, chat_id="strict-source-success", chat_type="dm", user_id="42")
+    src = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="strict-source-success",
+        chat_type="dm",
+        user_id="42",
+    )
     raw_old = LedgerMessage(msg_id=96301)
     evt_old = _make_event("96301", raw_old, source=src)
     await ad.on_processing_start(evt_old)
@@ -2633,12 +3247,20 @@ async def test_strict_source_only_retry_success_false():
     assert raw_old.effective() == {"🤖", "📄"}
     assert key in getattr(ad, "_rxn_retained", set())
     assert ad._rxn_msg_refs.get(key) is raw_old
-    evt_source = MessageEvent(text="hello", message_type=MessageType.TEXT, source=src, raw_message=None, message_id="96301")
+    evt_source = MessageEvent(
+        text="hello",
+        message_type=MessageType.TEXT,
+        source=src,
+        raw_message=None,
+        message_id="96301",
+    )
     # while still failing, make both add and remove fail so no ledger mutation
     ad._reaction_add = AsyncMock(return_value=False)
     snapshot = list(raw_old.ledger())
     await ad.on_processing_complete(evt_source, ProcessingOutcome.SUCCESS)
-    assert raw_old.ledger() == snapshot, "source-only retry while still failing must not mutate old"
+    assert raw_old.ledger() == snapshot, (
+        "source-only retry while still failing must not mutate old"
+    )
     assert raw_old.effective() == {"🤖", "📄"}
     assert key in ad._rxn_active
     assert ad._rxn_msg_refs.get(key) is raw_old
@@ -2655,11 +3277,25 @@ async def test_strict_source_only_retry_success_false():
 @pytest.mark.asyncio
 async def test_strict_source_only_retry_cancelled_false():
     cfg = PlatformConfig(enabled=True, token="***")
-    cfg.extra = {"persona_emoji": "🤖", "dynamic_reactions": True, "reaction_cooldown": 0}
+    cfg.extra = {
+        "persona_emoji": "🤖",
+        "dynamic_reactions": True,
+        "reaction_cooldown": 0,
+    }
     ad = DiscordAdapter(cfg)
-    ad._client = SimpleNamespace(tree=FakeTree(), get_channel=lambda _id: None, fetch_channel=AsyncMock(), user=SimpleNamespace(id=99999, name="HermesBot"))
+    ad._client = SimpleNamespace(
+        tree=FakeTree(),
+        get_channel=lambda _id: None,
+        fetch_channel=AsyncMock(),
+        user=SimpleNamespace(id=99999, name="HermesBot"),
+    )
     ad._rxn_cooldown = 0.0
-    src = SessionSource(platform=Platform.DISCORD, chat_id="strict-source-cancel", chat_type="dm", user_id="42")
+    src = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="strict-source-cancel",
+        chat_type="dm",
+        user_id="42",
+    )
     raw_old = LedgerMessage(msg_id=96311)
     evt_old = _make_event("96311", raw_old, source=src)
     await ad.on_processing_start(evt_old)
@@ -2671,7 +3307,13 @@ async def test_strict_source_only_retry_cancelled_false():
     await ad.on_processing_complete(evt_old, ProcessingOutcome.CANCELLED)
     assert raw_old.effective() == {"📄"}
     assert key in getattr(ad, "_rxn_retained", set())
-    evt_source = MessageEvent(text="hello", message_type=MessageType.TEXT, source=src, raw_message=None, message_id="96311")
+    evt_source = MessageEvent(
+        text="hello",
+        message_type=MessageType.TEXT,
+        source=src,
+        raw_message=None,
+        message_id="96311",
+    )
     snapshot = list(raw_old.ledger())
     await ad.on_processing_complete(evt_source, ProcessingOutcome.CANCELLED)
     assert raw_old.ledger() == snapshot
