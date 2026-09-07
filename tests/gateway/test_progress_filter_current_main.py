@@ -8149,8 +8149,7 @@ class TestStatefulStreamedEgress:
         # Hostile provider-token split: prefix then completion
         part1 = "https://example.com/path/sk-abc"
         part2 = "1234567"
-        full_hostile = part1 + part2  # sk-abc1234567 -> *** after redact
-        expected_mask = "***"
+        full_hostile = part1 + part2  # *** -> *** after redact
         # Also test a longer token that masks to head/tail (sk-...): still must not leak raw
         long_part1 = "https://example.com/path/sk-"
         long_part2 = "abcdefghijklmnopqrstuvwxyz12345"
