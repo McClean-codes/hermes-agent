@@ -495,3 +495,294 @@ class TestSeedFromEnvRespectsExistingPoolEntries:
         assert pool.peek() is None
         assert _SECRET_SCOPE.get() is None
         assert not is_multiplex_active()
+
+    def test_openrouter_stale_token_cleared_and_explicit_lease_rejected(self, tmp_path, monkeypatch):
+        """Regression: openrouter early-return path must clear stale token and reject leases.
+
+        Covers provider-specific seeding bypass — disk sanitization removes raw
+        persisted value but prior early-return left in-memory token live; explicit
+        acquire_lease(credential_id) and current() must not expose it.
+        """
+        home = tmp_path / "hermes"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        from hermes_cli.config import invalidate_env_cache
+
+        invalidate_env_cache()
+        for key in ["OPENROUTER_API_KEY"]:
+            monkeypatch.delenv(key, raising=False)
+            import os
+            os.environ.pop(key, None)
+        from agent.secret_scope import _SECRET_SCOPE, is_multiplex_active, set_multiplex_active
+
+        _SECRET_SCOPE.set(None)
+        set_multiplex_active(False)
+        invalidate_env_cache()
+        assert _SECRET_SCOPE.get() is None
+        assert not is_multiplex_active()
+
+        legacy_token = SYN_PRIMARY
+
+        # Direct _seed_from_env path for openrouter must clear stale token
+        from agent.credential_pool import PooledCredential, _seed_from_env
+
+        stale = PooledCredential(
+            provider="openrouter",
+            id="leg123",
+            label="legacy-openrouter",
+            auth_type="api_key",
+            priority=0,
+            source="env:OPENROUTER_API_KEY",
+            access_token=legacy_token,
+        )
+        entries = [stale]
+        changed, active = _seed_from_env("openrouter", entries)
+        assert "env:OPENROUTER_API_KEY" not in active
+        assert entries[0].access_token == "", "openrouter stale token not cleared by _seed_from_env"
+        assert entries[0].extra.get("secret_fingerprint", "").startswith("sha256:")
+
+        # Full load_pool integration — disk sanitized, in-memory unavailable
+        _write_auth(home, {
+            "openrouter": [
+                {"id": "leg123", "label": "legacy-openrouter", "auth_type": "api_key", "priority": 0, "source": "env:OPENROUTER_API_KEY", "access_token": legacy_token},
+            ]
+        })
+        (home / ".env").write_text("", encoding="utf-8")
+        invalidate_env_cache()
+
+        from agent.credential_pool import load_pool
+
+        pool = load_pool("openrouter")
+        raw = (home / "auth.json").read_text(encoding="utf-8")
+        assert legacy_token not in raw, "raw openrouter legacy token leaked to disk"
+        data = _read_auth(home)
+        disk_entries = data.get("credential_pool", {}).get("openrouter", [])
+        assert len(disk_entries) == 1
+        assert disk_entries[0].get("source") == "env:OPENROUTER_API_KEY"
+        assert disk_entries[0].get("access_token") in (None, "")
+
+        avail, _ = pool._available_entries()
+        assert len(avail) == 0, f"openrouter stale entry incorrectly available: {avail!r}"
+        assert pool.select() is None
+        assert pool.peek() is None
+        assert pool.acquire_lease() is None
+        # Explicit lease must be rejected fail-closed
+        assert pool.acquire_lease("leg123") is None
+        cur = pool.current()
+        assert cur is None or cur.access_token == "" or cur.runtime_api_key == ""
+        # Runtime token must not be exposed via current
+        if cur is not None:
+            assert not cur.runtime_api_key
+        # Pool entries in memory should have cleared token
+        for ent in pool.entries():
+            if ent.source == "env:OPENROUTER_API_KEY":
+                assert ent.access_token == "", "in-memory openrouter stale token not cleared"
+                assert not ent.runtime_api_key
+        assert _SECRET_SCOPE.get() is None
+        assert not is_multiplex_active()
+
+    def test_explicit_lease_rejected_when_env_source_inactive(self, tmp_path, monkeypatch):
+        """Regression: explicit acquire_lease(credential_id) must respect fail-closed checks.
+
+        An env:VAR row whose VAR is unset must reject explicit-ID lease and leave
+        current() without the stale token — same as normal selection.
+        """
+        home = tmp_path / "hermes"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        from hermes_cli.config import invalidate_env_cache
+
+        invalidate_env_cache()
+        for key in ["PROVIDER_API_KEY", "PROVIDER_API_KEY_2"]:
+            monkeypatch.delenv(key, raising=False)
+            import os
+            os.environ.pop(key, None)
+        from agent.secret_scope import _SECRET_SCOPE, is_multiplex_active, set_multiplex_active
+
+        _SECRET_SCOPE.set(None)
+        set_multiplex_active(False)
+        invalidate_env_cache()
+        assert _SECRET_SCOPE.get() is None
+        assert not is_multiplex_active()
+
+        from agent.credential_pool import CredentialPool, PooledCredential
+
+        # Construct pool with stale token in memory but env unset (no seeding)
+        stale_token = SYN_SECONDARY
+        stale = PooledCredential(
+            provider="opencode-go",
+            id="stale123",
+            label="stale-secondary",
+            auth_type="api_key",
+            priority=1,
+            source="env:PROVIDER_API_KEY_2",
+            access_token=stale_token,
+        )
+        # Also add a manual healthy entry for comparison
+        healthy = PooledCredential(
+            provider="opencode-go",
+            id="healthy1",
+            label="manual",
+            auth_type="api_key",
+            priority=0,
+            source="manual",
+            access_token=SYN_MANUAL,
+        )
+        pool = CredentialPool(provider="opencode-go", entries=[healthy, stale])
+
+        # Normal selection must not return stale — should return healthy or None if healthy exhausted
+        # With healthy present, select should return healthy
+        sel = pool.select()
+        assert sel is not None
+        assert sel.id == "healthy1", f"expected healthy, got {sel.id!r}"
+        # Available should not contain stale
+        avail, _ = pool._available_entries()
+        assert all(e.id != "stale123" for e in avail), f"stale incorrectly available: {[e.id for e in avail]!r}"
+        assert any(e.id == "healthy1" for e in avail)
+
+        # Explicit lease for stale must be rejected
+        assert pool.acquire_lease("stale123") is None, "explicit lease of stale env entry should be rejected"
+        # current() must not expose stale token
+        cur = pool.current()
+        # current should be healthy (from select) not stale
+        assert cur is None or cur.id != "stale123"
+        if cur is not None:
+            assert cur.runtime_api_key != stale_token
+
+        # Verify explicit lease does not record in active leases
+        assert "stale123" not in pool._active_leases
+
+        # Explicit lease for healthy should succeed
+        leased = pool.acquire_lease("healthy1")
+        assert leased == "healthy1"
+        assert pool._active_leases.get("healthy1", 0) >= 1
+        cur2 = pool.current()
+        assert cur2 is not None and cur2.id == "healthy1"
+
+        # Now test stale-only pool where no healthy entry exists — explicit lease must still fail
+        pool2 = CredentialPool(provider="opencode-go", entries=[stale])
+        assert pool2.select() is None
+        assert pool2.acquire_lease() is None
+        assert pool2.acquire_lease("stale123") is None
+        assert pool2.current() is None or pool2.current().access_token == ""
+        assert "stale123" not in pool2._active_leases
+        # After attempted explicit lease, _available_entries should have cleared token
+        # (fail-closed clearing in _available_entries)
+        for ent in pool2.entries():
+            if ent.id == "stale123":
+                # token should be cleared after availability check
+                assert ent.access_token == "" or not ent.runtime_api_key
+
+        assert _SECRET_SCOPE.get() is None
+        assert not is_multiplex_active()
+
+    def test_malformed_env_source_with_legacy_token_not_selected_and_cleared(self, tmp_path, monkeypatch):
+        """Regression: malformed env: (empty var name) with non-empty legacy token must be unavailable.
+
+        Treat env: with no non-empty variable name as unavailable; clear/mark any
+        runtime token before selection or lease. Both "env:" and "env:   " forms.
+        """
+        home = tmp_path / "hermes"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        from hermes_cli.config import invalidate_env_cache
+
+        invalidate_env_cache()
+        from agent.secret_scope import _SECRET_SCOPE, is_multiplex_active, set_multiplex_active
+
+        _SECRET_SCOPE.set(None)
+        set_multiplex_active(False)
+        invalidate_env_cache()
+        assert _SECRET_SCOPE.get() is None
+        assert not is_multiplex_active()
+
+        from agent.credential_pool import PooledCredential, _seed_from_env, CredentialPool, load_pool
+
+        legacy_token = SYN_EXTRA
+
+        # Direct _seed_from_env must clear malformed entry
+        malformed = PooledCredential(
+            provider="opencode-go",
+            id="bad123",
+            label="malformed",
+            auth_type="api_key",
+            priority=0,
+            source="env:",
+            access_token=legacy_token,
+        )
+        malformed_ws = PooledCredential(
+            provider="opencode-go",
+            id="badws1",
+            label="malformed-ws",
+            auth_type="api_key",
+            priority=1,
+            source="env:   ",
+            access_token=legacy_token,
+        )
+        entries = [malformed, malformed_ws]
+        pconfig = _make_pconfig("opencode-go", ["PROVIDER_API_KEY"])
+        from unittest.mock import patch
+        _write_env_file(home, PROVIDER_API_KEY=SYN_PRIMARY)
+        with patch("agent.credential_pool.PROVIDER_REGISTRY", {"opencode-go": pconfig}):
+            changed, active = _seed_from_env("opencode-go", entries)
+        # Malformed sources must not be in active_sources
+        assert "env:" not in active
+        assert "env:   " not in active
+        assert "" not in active
+        # Tokens must be cleared with fingerprint preserved (only malformed)
+        for ent in entries:
+            if ent.source.strip() in ("env:", "env:   "):
+                assert ent.access_token == "", f"malformed {ent.source!r} token not cleared"
+                assert ent.extra.get("secret_fingerprint", "").startswith("sha256:")
+
+        # Full load_pool integration with malformed row on disk
+        _write_auth(home, {
+            "opencode-go": [
+                {"id": "bad123", "label": "malformed", "auth_type": "api_key", "priority": 0, "source": "env:", "access_token": legacy_token},
+                {"id": "good1", "label": "primary", "auth_type": "api_key", "priority": 1, "source": "env:PROVIDER_API_KEY", "access_token": ""},
+            ]
+        })
+        # PROVIDER_API_KEY is set in .env, so good entry should hydrate, malformed stays cleared
+        pool = load_pool("opencode-go")
+        raw = (home / "auth.json").read_text(encoding="utf-8")
+        assert legacy_token not in raw
+        data = _read_auth(home)
+        disk_entries = data.get("credential_pool", {}).get("opencode-go", [])
+        for de in disk_entries:
+            if de.get("source") == "env:":
+                assert de.get("access_token") in (None, "")
+                assert de.get("secret_fingerprint", "").startswith("sha256:")
+
+        avail, _ = pool._available_entries()
+        assert all(e.source != "env:" for e in avail), f"malformed incorrectly available: {avail!r}"
+        assert any(e.source == "env:PROVIDER_API_KEY" for e in avail)
+        assert pool.select() is not None
+        assert pool.select().source != "env:"
+        assert pool.peek() is None or pool.peek().source != "env:"
+        # Explicit lease for malformed must be rejected
+        assert pool.acquire_lease("bad123") is None
+        cur = pool.current()
+        assert cur is None or cur.source != "env:"
+
+        # Direct CredentialPool construction with malformed stale token — same fail-closed
+        stale_malformed = PooledCredential(
+            provider="opencode-go",
+            id="mal123",
+            label="mal",
+            auth_type="api_key",
+            priority=0,
+            source="env:",
+            access_token=legacy_token,
+        )
+        pool2 = CredentialPool(provider="opencode-go", entries=[stale_malformed])
+        assert pool2.select() is None
+        assert pool2.acquire_lease() is None
+        assert pool2.acquire_lease("mal123") is None
+        assert pool2.current() is None or pool2.current().access_token == ""
+        # After check, token should be cleared
+        for ent in pool2.entries():
+            if ent.id == "mal123":
+                assert ent.access_token == ""
+
+        assert _SECRET_SCOPE.get() is None
+        assert not is_multiplex_active()

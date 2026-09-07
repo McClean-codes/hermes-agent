@@ -2210,8 +2210,19 @@ class CredentialPool:
             # process must treat it as unavailable until the env source is
             # active again.
             if entry.source.startswith("env:"):
-                _env_name = entry.source.split(":", 1)[1]
-                if _env_name and not get_env_prefer_dotenv(_env_name):
+                _env_name = entry.source.split(":", 1)[1].strip()
+                if not _env_name or not get_env_prefer_dotenv(_env_name):
+                    if entry.access_token:
+                        try:
+                            _fp = fingerprint_secret_value(entry.access_token)
+                        except Exception:
+                            _fp = None
+                        _new_extra = dict(entry.extra) if entry.extra else {}
+                        if _fp:
+                            _new_extra["secret_fingerprint"] = _fp
+                        _cleared = replace(entry, access_token="", extra=_new_extra)
+                        self._replace_entry(entry, _cleared)
+                        cleared_any = True
                     continue
             # For anthropic claude_code entries, sync from the credentials file
             # before any status/refresh checks. This picks up tokens refreshed
@@ -2609,9 +2620,14 @@ class CredentialPool:
         """Run lease acquisition under the lock, returning id + pending refreshes."""
         with self._lock:
             if credential_id:
+                available, pending_refresh = self._available_entries(clear_expired=True, refresh=True)
+                if not any(entry.id == credential_id for entry in available):
+                    if self._current_id == credential_id:
+                        self._current_id = None
+                    return None, pending_refresh
                 self._active_leases[credential_id] = self._active_leases.get(credential_id, 0) + 1
                 self._current_id = credential_id
-                return credential_id, []
+                return credential_id, pending_refresh
 
             available, pending_refresh = self._available_entries(clear_expired=True, refresh=True)
             if not available:
@@ -3357,6 +3373,30 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
                     base_url=OPENROUTER_BASE_URL,
                 ),
             )
+        # Fail-closed: clear stale in-memory token for env sources that are not
+        # active (including malformed env:). Mirrors generic provider path so the
+        # provider-specific early return does not leave a sanitized-on-disk legacy
+        # token live in memory.
+        for _stale in list(entries):
+            if not _stale.source.startswith("env:"):
+                continue
+            _stale_env = _stale.source.split(":", 1)[1].strip()
+            if _stale.source in active_sources:
+                continue
+            if _stale.access_token:
+                try:
+                    _fp = fingerprint_secret_value(_stale.access_token)
+                except Exception:
+                    _fp = None
+                _new_extra = dict(_stale.extra) if _stale.extra else {}
+                if _fp:
+                    _new_extra["secret_fingerprint"] = _fp
+                _cleared = replace(_stale, access_token="", extra=_new_extra)
+                for _idx, _ent in enumerate(entries):
+                    if _ent.id == _stale.id:
+                        entries[_idx] = _cleared
+                        break
+                changed = True
         return changed, active_sources
 
     pconfig = PROVIDER_REGISTRY.get(provider)
@@ -3382,7 +3422,7 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
     # gap and keeps multi-key rotation working without per-provider code.
     for entry in entries:
         if entry.source.startswith("env:"):
-            env_name = entry.source.split(":", 1)[1]
+            env_name = entry.source.split(":", 1)[1].strip()
             if env_name and env_name not in env_vars:
                 env_vars.append(env_name)
 
@@ -3416,11 +3456,14 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
     # for cross-process safety, but this process must not select a legacy
     # persisted token when its env var is unset/empty. Preserve a fingerprint
     # for audit before clearing so disk sanitization still leaves a trace.
+    # Malformed env: (no non-empty variable name) is treated as unavailable and
+    # its token is cleared — otherwise a non-empty legacy token in source env:
+    # would remain selectable.
     for _stale in list(entries):
         if not _stale.source.startswith("env:"):
             continue
-        _stale_env = _stale.source.split(":", 1)[1]
-        if not _stale_env or _stale.source in active_sources:
+        _stale_env = _stale.source.split(":", 1)[1].strip()
+        if _stale.source in active_sources:
             continue
         if _stale.access_token:
             try:
