@@ -429,12 +429,10 @@ def _find_stream_safe_prefix_len(text: str, normalized_set) -> int:
     if normalized_set is not None:
         try:
             last_delim = -1
-            last_char = ""
             for delim in ("?", "&", ";", "#"):
                 pos = text.rfind(delim)
                 if pos > last_delim:
                     last_delim = pos
-                    last_char = delim
             if last_delim != -1 and n - last_delim <= 80:
                 raw_after = text[last_delim + 1 :].lstrip(" \t\n\r")
                 if "=" not in raw_after:
