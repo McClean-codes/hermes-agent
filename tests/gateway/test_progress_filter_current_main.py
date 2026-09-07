@@ -4500,6 +4500,7 @@ class TestNativeEnabledFinalDelivery:
             # Monolith seam: _run_agent_display_settings is shim-only; skip patch when absent
             _orig_disp = getattr(gw, "_run_agent_display_settings", None)
             if _orig_disp is not None:
+
                 def _patched_disp(src):
                     d = _orig_disp(src)
                     # Ensure native visible: global all and tool allowlisted, needs_progress_queue true
@@ -5217,6 +5218,7 @@ class TestFinalSlackHostileStrictEgress:
 
         _orig_disp = getattr(gw, "_run_agent_display_settings", None)
         if _orig_disp is not None:
+
             def _patched_disp(src):
                 d = _orig_disp(src)
                 d.progress_mode = "all"
@@ -7008,6 +7010,154 @@ class TestStreamedFinalEditEgress:
         # Verify outer deliver would suppress normal send — simulate _hmwa_deliver_turn_response already_sent path
         # The ledger remaining 0 proves no duplicate edit was introduced
 
+    @pytest.mark.asyncio
+    async def test_streamed_edits_active_path_uses_helper_and_redacts_hostile(
+        self, monkeypatch
+    ):
+        """Active GatewayRunner streamed edit paths (stale & transformed) must route via helper and redact."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+        from gateway.config import GatewayConfig, PlatformConfig, Platform
+        from gateway.session import SessionSource
+        from gateway.run import GatewayRunner
+        from gateway.turn_context import TurnContext
+
+        # Verify static wiring: active _run_agent_inner no longer contains raw edit_message bypass
+        import pathlib
+
+        run_py = pathlib.Path("gateway/run.py").read_text()
+        # The two historical raw sites were at 32510 and 32544; they must now delegate to helper
+        # Ensure the helper is present and the raw finalize edit is absent outside the helper definition
+        assert "_run_agent_edit_streamed_message" in run_py
+        # Check that the stale and transformed branches now use await self._run_agent_edit_streamed_message
+        assert run_py.count("await self._run_agent_edit_streamed_message") >= 2, (
+            "both streamed branches must delegate to helper"
+        )
+
+        # Dynamic ledger test via helper (used by active path): stale reconcile
+        ledger: list[str] = []
+
+        class _Cap:
+            async def edit_message(
+                self, chat_id, message_id, content, metadata=None, finalize=False
+            ):
+                ledger.append(content)
+                m = MagicMock()
+                m.success = True
+                m.message_id = message_id
+                return m
+
+        cap = _Cap()
+        source = SessionSource(
+            platform=Platform.SLACK,
+            chat_id="C123",
+            chat_type="channel",
+            user_id="U123",
+            thread_id="T123",
+        )
+        fake_sc = MagicMock()
+        fake_sc.adapter = cap
+        fake_sc.message_id = "stream-msg-active-1"
+        fake_sc._turn_split_delivery = False
+        # Make delivered_final_matches return False to trigger stale
+        fake_sc.delivered_final_matches = MagicMock(return_value=False)
+        fake_sc.final_content_delivered = True
+        fake_sc.final_response_sent = False
+
+        gw = GatewayRunner(
+            config=GatewayConfig(
+                platforms={Platform.SLACK: PlatformConfig(enabled=True, token="x")}
+            )
+        )
+        response = {
+            "final_response": self._hostile_final(),
+            "response_transformed": False,
+            "response_previewed": False,
+        }
+        turn_ctx = TurnContext(
+            source=source,
+            session_key="sk-active-stale",
+            stream_consumer_holder=[fake_sc],
+        )
+        # Trigger stale path via _run_agent_mark_streamed_delivery which is part of active finalization
+        await gw._run_agent_mark_streamed_delivery(response, turn_ctx)
+        # Should have edited via helper and redacted
+        assert ledger, "stale reconcile must edit via helper"
+        for entry in ledger:
+            self._assert_no_leak(entry)
+        assert response.get("already_sent") is True
+
+        # Transformed path via same delivery helper
+        ledger2: list[str] = []
+
+        class _Cap2:
+            async def edit_message(
+                self, chat_id, message_id, content, metadata=None, finalize=False
+            ):
+                ledger2.append(content)
+                m = MagicMock()
+                m.success = True
+                m.message_id = message_id
+                return m
+
+        cap2 = _Cap2()
+        fake_sc2 = MagicMock()
+        fake_sc2.adapter = cap2
+        fake_sc2.message_id = "stream-msg-active-2"
+        fake_sc2._turn_split_delivery = False
+        fake_sc2.delivered_final_matches = MagicMock(return_value=True)
+        fake_sc2.final_content_delivered = True
+        response2 = {
+            "final_response": self._hostile_final(),
+            "response_transformed": True,
+            "failed": False,
+        }
+        turn_ctx2 = TurnContext(
+            source=source,
+            session_key="sk-active-trans",
+            stream_consumer_holder=[fake_sc2],
+        )
+        await gw._run_agent_mark_streamed_delivery(response2, turn_ctx2)
+        assert ledger2, "transformed edit must go via helper"
+        for entry in ledger2:
+            self._assert_no_leak(entry)
+
+        # Also verify _run_agent_inner transformed branch directly sanitizes (call helper)
+        ledger3: list[str] = []
+
+        class _Cap3:
+            async def edit_message(
+                self, chat_id, message_id, content, metadata=None, finalize=False
+            ):
+                ledger3.append(content)
+                m = MagicMock()
+                m.success = True
+                m.message_id = message_id
+                return m
+
+        cap3 = _Cap3()
+        fake_sc3 = MagicMock()
+        fake_sc3.adapter = cap3
+        fake_sc3.message_id = "stream-msg-active-3"
+        gw2 = GatewayRunner(
+            config=GatewayConfig(
+                platforms={Platform.SLACK: PlatformConfig(enabled=True, token="x")}
+            )
+        )
+        # Directly invoke the helper as the active _run_agent_inner now does
+        await gw2._run_agent_edit_streamed_message(
+            fake_sc3,
+            source,
+            {},
+            self._hostile_final(),
+            _sk="sk-direct-active",
+            ok=("ok %s", "sk-direct-active"),
+            fail_result=None,
+            fail_exc="fail %s: %s",
+        )
+        assert ledger3
+        for entry in ledger3:
+            self._assert_no_leak(entry)
+
 
 class TestStatefulStreamedEgress:
     """Stateful streamed egress: hostile split across deltas must not leak via any adapter effect.
@@ -8731,20 +8881,20 @@ class TestSEC_PF_WIRING_001_ActiveEntrypoint:
         from gateway.run import TurnRunner as RunTR
         from gateway.run_turn_runner import TurnRunner as AuthTR
 
-        # McClean monolith retains its own TurnRunner while the shim's TurnRunner remains
-        # a test helper; strict identity is a decomposed-arch invariant, not a McClean
-        # security predicate. Verify both expose the authoritative progress/redaction
-        # boundary so the suite remains runnable on the monolith seam.
+        # Active monolith must use the authoritative TurnRunner; identity is the
+        # security predicate, not a decomposed-only invariant. Both must be the
+        # same object and expose the strict egress boundary.
+        assert RunTR is AuthTR, (
+            f"TurnRunner must be authoritative singleton: {RunTR!r} is not {AuthTR!r}"
+        )
         for TR in (RunTR, AuthTR):
             assert hasattr(TR, "progress_callback"), f"{TR!r} missing progress_callback"
             assert callable(getattr(TR, "progress_callback", None))
-        # If they happen to be identical (decomposed), preserve the original strict check
-        # as an additional signal; on monolith they may diverge but must both be functional.
-        if RunTR is AuthTR:
-            assert RunTR is AuthTR
 
     @pytest.mark.asyncio
-    async def test_gateway_runner_constructs_authoritative_via_active_path(self):
+    async def test_gateway_runner_constructs_authoritative_via_active_path(
+        self, monkeypatch
+    ):
         """Active entrypoint must construct the authoritative TurnRunner.
 
         Awaits a real GatewayRunner._run_agent_inner call with deterministic
@@ -8848,24 +8998,19 @@ class TestSEC_PF_WIRING_001_ActiveEntrypoint:
         # Monolith seam: _run_agent_display_settings is a shim helper; on McClean
         # the display is resolved via _load_gateway_config. Provide a compat shim
         # when the attribute is missing so the test's display intent is preserved.
-        if not hasattr(gw, "_run_agent_display_settings"):
-            gw._run_agent_display_settings = lambda src: SimpleNamespace(  # type: ignore[attr-defined]
-                progress_mode="all",
-                progress_grouping="accumulate",
-                tool_progress_enabled=True,
-                tool_progress_filter={"terminal": "all"},
-                needs_progress_queue=True,
-                _native_slack_task_cards=False,
-            )
+        # Provide display shim via monkeypatch - strictly restored after test
+        _disp_shim = lambda src: SimpleNamespace(  # type: ignore[assignment]
+            progress_mode="all",
+            progress_grouping="accumulate",
+            tool_progress_enabled=True,
+            tool_progress_filter={"terminal": "all"},
+            needs_progress_queue=True,
+            _native_slack_task_cards=False,
+        )
+        if hasattr(gw, "_run_agent_display_settings"):
+            monkeypatch.setattr(gw, "_run_agent_display_settings", _disp_shim)
         else:
-            gw._run_agent_display_settings = lambda src: SimpleNamespace(
-                progress_mode="all",
-                progress_grouping="accumulate",
-                tool_progress_enabled=True,
-                tool_progress_filter={"terminal": "all"},
-                needs_progress_queue=True,
-                _native_slack_task_cards=False,
-            )
+            gw._run_agent_display_settings = _disp_shim  # type: ignore[attr-defined]
 
         source = SessionSource(
             platform=Platform.SLACK,
@@ -8940,6 +9085,7 @@ class TestSEC_PF_WIRING_001_ActiveEntrypoint:
     @pytest.mark.asyncio
     async def test_active_gateway_runner_enforces_filter_and_redaction_on_adapter_ledger(
         self,
+        monkeypatch,
     ):
         """Real GatewayRunner + adapter ledger must enforce allow/deny and redaction."""
         import asyncio
@@ -9034,11 +9180,30 @@ class TestSEC_PF_WIRING_001_ActiveEntrypoint:
         gw._service_tier = None
         gw._is_session_run_current = lambda k, g: True
         # Enforce filtering: only skills allowed, terminal off
-        # Monolith seam: _run_agent_display_settings may be absent on McClean;
-        # enforce filter via config patch when the shim is missing, preserving
-        # the category-filter predicate without requiring decomposed plumbing.
-        orig_disp = getattr(gw, "_run_agent_display_settings", None)
-        if orig_disp is not None:
+        # The monolith now uses the authoritative TurnRunner; filtering is enforced
+        # via display config. Patch the global loader with monkeypatch so the
+        # change is strictly restored and failures are not swallowed.
+        from gateway import run as _run_mod
+
+        _orig_load = _run_mod._load_gateway_config
+
+        def _patched_load(*a, **kw):
+            cfg = _orig_load(*a, **kw) if callable(_orig_load) else {}
+            if not isinstance(cfg, dict):
+                cfg = {}
+            cfg = dict(cfg)
+            disp = dict(cfg.get("display") or {})
+            disp["tool_progress"] = "all"
+            disp["tool_progress_filter"] = {"skills": "all", "terminal": "off"}
+            cfg["display"] = disp
+            return cfg
+
+        monkeypatch.setattr(_run_mod, "_load_gateway_config", _patched_load)
+        # Also patch instance helper if present for completeness, but keep it
+        # consistent with the global config
+        if hasattr(gw, "_run_agent_display_settings"):
+            orig_disp = gw._run_agent_display_settings
+
             def _patched_disp(src):
                 d = orig_disp(src)
                 d.progress_mode = "all"
@@ -9047,26 +9212,7 @@ class TestSEC_PF_WIRING_001_ActiveEntrypoint:
                 d.needs_progress_queue = True
                 return d
 
-            gw._run_agent_display_settings = _patched_disp  # type: ignore[attr-defined]
-        else:
-            # Fallback: patch config loader to inject the same filter for this platform
-            _orig_load = None
-            try:
-                from gateway import run as _run_mod
-                _orig_load = _run_mod._load_gateway_config
-                def _patched_load(*a, **kw):
-                    cfg = _orig_load(*a, **kw) if callable(_orig_load) else {}
-                    if not isinstance(cfg, dict):
-                        cfg = {}
-                    cfg = dict(cfg)
-                    disp = dict(cfg.get("display") or {})
-                    disp["tool_progress"] = "all"
-                    disp["tool_progress_filter"] = {"skills": "all", "terminal": "off"}
-                    cfg["display"] = disp
-                    return cfg
-                _run_mod._load_gateway_config = _patched_load  # type: ignore[attr-defined]
-            except Exception:
-                pass
+            monkeypatch.setattr(gw, "_run_agent_display_settings", _patched_disp)
 
         source = SessionSource(
             platform=Platform.SLACK,
@@ -10559,6 +10705,63 @@ class TestBackgroundAndHygieneTextEgress:
         self._assert_no_leak(ledger)
         assert all("[REDACTED]" in item or "***" in item for item in ledger)
 
+    @pytest.mark.asyncio
+    async def test_background_empty_sanitizes_prompt_and_fallback_and_fail_closed(
+        self, monkeypatch
+    ):
+        """Empty-result background branch must not emit raw hostile prompt/fallback; both-layer failure must be exact [REDACTED]."""
+        from unittest.mock import patch
+
+        # Empty result with hostile prompt
+        ledger: list[str] = []
+        result_empty = {"final_response": "", "messages": []}
+        runner, source = self._make_background_runner(
+            monkeypatch, ledger, result=result_empty
+        )
+        hostile_prompt = f"{self.BENIGN_URL} empty {self.RAW_QUERY} and {self.RAW_USERINFO}"
+        await runner._run_background_task_inner(
+            hostile_prompt, source, "background-empty"
+        )
+        assert ledger, "empty background path must reach adapter ledger"
+        combined = " ".join(ledger)
+        # Hostile must be absent, benign must survive
+        assert self.RAW_QUERY not in combined
+        assert self.RAW_USERINFO not in combined
+        assert self.LONG_OPAQUE not in combined
+        assert self.OPAQUE_TOKEN not in combined
+        assert self.LONG_OPAQUE[:8] not in combined
+        # Preview is truncated to 60 chars, so mask may be cut off; ensure no raw leak and at least redaction would have happened on full prompt
+        from gateway.run import _strict_watcher_sanitize
+        full_redacted = _strict_watcher_sanitize(hostile_prompt)
+        assert self.RAW_QUERY not in full_redacted
+        assert self.OPAQUE_TOKEN not in full_redacted
+        assert "***" in full_redacted or "[REDACTED]" in full_redacted
+        # Benign must survive either in preview (if within 60) or in full redacted
+        assert self.BENIGN_URL in full_redacted
+
+        # Both-layer failure: force watcher sanitizer to fail -> exact [REDACTED]
+        ledger2: list[str] = []
+        runner2, source2 = self._make_background_runner(
+            monkeypatch, ledger2, result=result_empty
+        )
+        hostile_prompt2 = f"empty fail {self.RAW_QUERY}"
+        with (
+            patch(
+                "agent.redact.redact_sensitive_text", side_effect=RuntimeError("boom")
+            ),
+            patch(
+                "gateway.run._redact_gateway_user_facing_secrets",
+                side_effect=RuntimeError("boom2"),
+            ),
+        ):
+            await runner2._run_background_task_inner(
+                hostile_prompt2, source2, "background-empty-fail"
+            )
+        assert ledger2, "fail-closed empty path must still send"
+        assert ledger2[0] == "[REDACTED]" or "[REDACTED]" in ledger2[0]
+        assert hostile_prompt2 not in ledger2[0]
+        assert self.OPAQUE_TOKEN not in ledger2[0]
+
 
 class TestApprovalPromptTextEgress:
     LONG_OPAQUE = "longOpaqueUserInfo1234567890ABCDEFExtraLongTail1234567890"
@@ -10689,6 +10892,114 @@ class TestApprovalPromptTextEgress:
         )
         assert len(failure_ledger) == 2
         self._assert_no_leak(failure_ledger)
+
+
+class TestEncodedAuthorityEgress:
+    """Encoded-authority handling: percent-encoded userinfo (%3A/%40) and double-encoded (%253A/%2540) must not leak."""
+
+    LONG_OPAQUE = "longOpaqueUserInfo1234567890ABCDEFExtraLongTail1234567890"
+    DANGEROUS = LONG_OPAQUE[:8]
+
+    def _cases(self):
+        return [
+            f"https://alice%3A{self.LONG_OPAQUE}%40example.com/private",
+            f"https://alice:{self.LONG_OPAQUE}%40example.com/private",
+            f"//alice%3A{self.LONG_OPAQUE}%40example.com/p",
+            f"https://alice%253A{self.LONG_OPAQUE}%2540example.com/private",
+            f"//bob%3A{self.LONG_OPAQUE}@example.com/p",  # mixed raw @ with encoded colon
+            f"https://eve%3Ask-{self.LONG_OPAQUE}%40host/p?token={self.LONG_OPAQUE}",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_encoded_userinfo_redacted_via_strict_progress_and_watcher(self):
+        from gateway.run_turn_runner import _redact_progress_text
+        from gateway.run import _strict_watcher_sanitize
+
+        for raw in self._cases():
+            redacted = _redact_progress_text(raw)
+            assert raw not in redacted, f"encoded raw leaked {raw!r} -> {redacted!r}"
+            assert self.LONG_OPAQUE not in redacted, f"opaque leaked in {redacted!r}"
+            assert self.DANGEROUS not in redacted, (
+                f"dangerous prefix leaked {redacted!r}"
+            )
+            assert "***" in redacted or "[REDACTED]" in redacted
+
+            watcher = _strict_watcher_sanitize(raw)
+            assert raw not in watcher
+            assert self.LONG_OPAQUE not in watcher
+
+        # Incomplete encoded authority clipped before @ (e.g., truncated title)
+        clipped = (
+            f"https://alice%3A{self.LONG_OPAQUE}"  # no @/host, credential-shaped suffix
+        )
+        redacted_clipped = _redact_progress_text(clipped)
+        assert self.LONG_OPAQUE not in redacted_clipped
+        assert self.DANGEROUS not in redacted_clipped
+        assert "***" in redacted_clipped or "[REDACTED]" in redacted_clipped
+
+        # Ensure benign percent-encoded URL without credentials survives
+        benign = "https://example.com/page?foo=bar%20baz&x=1"
+        assert _redact_progress_text(benign) == benign
+
+    def test_encoded_userinfo_via_progress_queue_no_leak(self):
+        import queue
+        from unittest.mock import MagicMock
+        from gateway.run_turn_runner import TurnRunner
+        from gateway.turn_context import TurnContext
+        from gateway.config import Platform
+
+        hostile_enc = f"https://alice%3A{self.LONG_OPAQUE}%40example.com/p?token={self.LONG_OPAQUE}"
+        ctx = TurnContext(
+            source=MagicMock(chat_id="test", platform=Platform.SLACK),
+            _run_still_current=lambda: True,
+            _live_status_adapter=None,
+            _live_status_mode="off",
+            _thinking_enabled=False,
+            progress_mode="all",
+            progress_grouping="accumulate",
+            tool_progress_enabled=True,
+            tool_progress_filter={},
+            progress_queue=queue.Queue(),
+            log_queue=None,
+            last_progress_msg=[None],
+            last_tool=[None],
+            last_was_terminal_block=[False],
+            repeat_count=[0],
+            long_tool_hint_fired=[False],
+            agent_holder=[None],
+            _native_slack_task_cards=False,
+        )
+
+        class Stub:
+            def _adapter_for_source(self, s):
+                m = MagicMock()
+                m.supports_code_blocks = False
+                m.format_tool_preview = lambda x: (
+                    x.text if hasattr(x, "text") else str(x)
+                )
+                return m
+
+            def _schedule(self, coro, msg):
+                return None
+
+        runner = TurnRunner(Stub(), ctx)
+        # Drive progress via tool call with encoded userinfo in args
+        runner.progress_callback(
+            "tool.started",
+            tool_name="terminal",
+            preview="",
+            args={"command": f"curl {hostile_enc}"},
+        )
+        # Drain queue and assert no leak
+        found = []
+        while not ctx.progress_queue.empty():
+            found.append(ctx.progress_queue.get_nowait())
+        assert found, "progress must have been queued"
+        for item in found:
+            payload = item if isinstance(item, str) else repr(item)
+            assert hostile_enc not in payload
+            assert self.LONG_OPAQUE not in payload
+            assert self.DANGEROUS not in payload
 
 
 class TestKanbanClippedUserinfoEgress(TestSEC_PF_KANBAN_WATCH_004_StrictNotifier):

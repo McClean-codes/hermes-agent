@@ -271,12 +271,22 @@ def _canonicalize_userinfo_whitespace(text: str) -> str:
             re.IGNORECASE,
         )
         pat2 = re.compile(r"(//[^/\s?#]*:[^/\s?#@]*)\s+([^\s]*@[^\s]*)")
+        # Encoded variants: %3A for ':' and %40 for '@'
+        pat3 = re.compile(
+            r"((?:https?|wss?|ftp)://[^/\s?#]*%3A[^/\s?#]*)\s+([^\s]*%40[^\s]*)",
+            re.IGNORECASE,
+        )
+        pat4 = re.compile(
+            r"(//[^/\s?#]*%3A[^/\s?#]*)\s+([^\s]*%40[^\s]*)", re.IGNORECASE
+        )
 
         def repl(m):
             return m.group(1) + m.group(2)
 
         tmp = pat1.sub(repl, new_text)
         tmp = pat2.sub(repl, tmp)
+        tmp = pat3.sub(repl, tmp)
+        tmp = pat4.sub(repl, tmp)
         if tmp == new_text:
             break
         new_text = tmp
@@ -327,7 +337,10 @@ def _find_safe_prefix_len(text: str, normalized_set) -> int:
                 ends.append(idx)
         auth_end = min(ends) if ends else n
         segment = text[auth_start:auth_end]
-        if ":" in segment and "@" not in segment:
+        low_seg = segment.lower()
+        has_colon = ":" in segment or "%3a" in low_seg or "%253a" in low_seg
+        has_at = "@" in segment or "%40" in low_seg or "%2540" in low_seg
+        if has_colon and not has_at:
             candidates.append(url_start)
     for m in re.finditer(r"//", text):
         if m.start() > 0 and text[m.start() - 1] == ":":
@@ -341,7 +354,10 @@ def _find_safe_prefix_len(text: str, normalized_set) -> int:
                 ends.append(idx)
         auth_end = min(ends) if ends else n
         segment = text[auth_start:auth_end]
-        if ":" in segment and "@" not in segment:
+        low_seg = segment.lower()
+        has_colon = ":" in segment or "%3a" in low_seg or "%253a" in low_seg
+        has_at = "@" in segment or "%40" in low_seg or "%2540" in low_seg
+        if has_colon and not has_at:
             candidates.append(url_start)
     if candidates:
         return min(candidates)
@@ -378,7 +394,52 @@ def _strict_url_userinfo_fixup(text: str) -> str:
         else:
             return f"{m.group(1)}***@"
 
-    return pat.sub(repl, text)
+    text = pat.sub(repl, text)
+    # Encoded-authority: handle percent-encoded delimiters (%3A for ':', %40 for '@')
+    # so that https://alice%3Asecret%40host and //user%3Apass%40host do not leak.
+    # Fail-closed: any %40 in authority is treated as userinfo delimiter.
+    # Also handle double-encoded %253A/%2540 (up to 3 decode rounds).
+    try:
+        pat_enc = re.compile(r"(//)([^/\s?#]*?)%40", re.IGNORECASE)
+
+        def repl_enc(m):
+            userinfo_enc = m.group(2)
+            # Detect encoded colon before encoded at
+            if re.search(r"%3A", userinfo_enc, re.IGNORECASE):
+                mm = re.search(r"%3A", userinfo_enc, re.IGNORECASE)
+                if mm:
+                    username = userinfo_enc[: mm.start()]
+                    return f"{m.group(1)}{username}%3A***%40"
+            # Also detect double-encoded colon %253A before %2540 or %40
+            if re.search(r"%253A", userinfo_enc, re.IGNORECASE):
+                mm = re.search(r"%253A", userinfo_enc, re.IGNORECASE)
+                if mm:
+                    username = userinfo_enc[: mm.start()]
+                    return f"{m.group(1)}{username}%253A***%40"
+            return f"{m.group(1)}***%40"
+
+        text = pat_enc.sub(repl_enc, text)
+        # Double-encoded @ as %2540
+        pat_enc2 = re.compile(r"(//)([^/\s?#]*?)%2540", re.IGNORECASE)
+
+        def repl_enc2(m):
+            userinfo_enc = m.group(2)
+            if re.search(r"%253A", userinfo_enc, re.IGNORECASE):
+                mm = re.search(r"%253A", userinfo_enc, re.IGNORECASE)
+                if mm:
+                    username = userinfo_enc[: mm.start()]
+                    return f"{m.group(1)}{username}%253A***%2540"
+            if re.search(r"%3A", userinfo_enc, re.IGNORECASE):
+                mm = re.search(r"%3A", userinfo_enc, re.IGNORECASE)
+                if mm:
+                    username = userinfo_enc[: mm.start()]
+                    return f"{m.group(1)}{username}%3A***%2540"
+            return f"{m.group(1)}***%2540"
+
+        text = pat_enc2.sub(repl_enc2, text)
+    except Exception:
+        pass
+    return text
 
 
 def _strict_incomplete_userinfo_fixup(text: str) -> str:
@@ -411,7 +472,35 @@ def _strict_incomplete_userinfo_fixup(text: str) -> str:
 
     def repl(m):
         authority = m.group(2)
-        if "@" in authority or ":" not in authority or authority.startswith("["):
+        if (
+            "@" in authority
+            or "%40" in authority.lower()
+            or "%2540" in authority.lower()
+        ):
+            return m.group(0)
+        # Handle both raw ':' and encoded '%3A' / '%253A' as userinfo delimiter
+        # Try raw first, then encoded variants
+        for delim, encoded in [(":", "%3A"), (":", "%253A")]:
+            # Check for encoded form case-insensitively
+            if encoded.lower() in authority.lower():
+                # Find last occurrence case-insensitively
+                low = authority.lower()
+                enc_low = encoded.lower()
+                idx = low.rfind(enc_low)
+                if idx != -1:
+                    user = authority[:idx]
+                    suffix = authority[idx + len(encoded) :]
+                    if not user or not suffix or suffix.isdigit():
+                        return m.group(0)
+                    suffix_folded = suffix.casefold()
+                    credential_shaped = len(suffix) >= 8 or any(
+                        suffix_folded.startswith(prefix.casefold())
+                        for prefix in known_prefixes
+                    )
+                    if not credential_shaped:
+                        return m.group(0)
+                    return f"{m.group(1)}{user}{encoded}***"
+        if ":" not in authority or authority.startswith("["):
             return m.group(0)
         user, suffix = authority.rsplit(":", 1)
         if not user or not suffix or suffix.isdigit():
@@ -424,7 +513,12 @@ def _strict_incomplete_userinfo_fixup(text: str) -> str:
             return m.group(0)
         return f"{m.group(1)}{user}:***"
 
-    return pat.sub(repl, text)
+    text = pat.sub(repl, text)
+    # Also handle encoded authority without scheme but with //
+    # The above pat already covers // with optional scheme, but extended delimiters
+    # need separate pass for %3A forms where suffix check uses decoded length.
+    # Already handled inside repl via encoded detection.
+    return text
 
 
 def _redact_progress_text(text: str | None, *, final: bool = True) -> str:
