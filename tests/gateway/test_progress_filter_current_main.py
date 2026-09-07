@@ -10718,7 +10718,9 @@ class TestBackgroundAndHygieneTextEgress:
         runner, source = self._make_background_runner(
             monkeypatch, ledger, result=result_empty
         )
-        hostile_prompt = f"{self.BENIGN_URL} empty {self.RAW_QUERY} and {self.RAW_USERINFO}"
+        hostile_prompt = (
+            f"{self.BENIGN_URL} empty {self.RAW_QUERY} and {self.RAW_USERINFO}"
+        )
         await runner._run_background_task_inner(
             hostile_prompt, source, "background-empty"
         )
@@ -10732,6 +10734,7 @@ class TestBackgroundAndHygieneTextEgress:
         assert self.LONG_OPAQUE[:8] not in combined
         # Preview is truncated to 60 chars, so mask may be cut off; ensure no raw leak and at least redaction would have happened on full prompt
         from gateway.run import _strict_watcher_sanitize
+
         full_redacted = _strict_watcher_sanitize(hostile_prompt)
         assert self.RAW_QUERY not in full_redacted
         assert self.OPAQUE_TOKEN not in full_redacted
