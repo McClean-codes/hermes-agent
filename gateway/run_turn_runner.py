@@ -971,6 +971,24 @@ class TurnRunner:
                 except Exception:
                     logger.debug("log queue put failed", exc_info=True)
             return
+        # Fire on_tool_call_start hook for dynamic reaction swapping.
+        # Runs before the progress_queue and effective-off guards so reactions work even when
+        # tool progress messages are off or filtered (Discord reaction test).
+        if (
+            event_type == "tool.started"
+            and tool_name
+            and getattr(ctx, "_status_adapter", None)
+            and ctx._run_still_current()
+        ):
+            try:
+                self._schedule(
+                    ctx._status_adapter._run_processing_hook(
+                        "on_tool_call_start", ctx.source, tool_name
+                    ),
+                    "on_tool_call_start scheduling error",
+                )
+            except Exception:
+                pass
         # Effective "off" suppresses chat progress (and live-status preview) for this tool.
         if (
             _effective_mode == "off"

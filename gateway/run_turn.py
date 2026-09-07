@@ -2017,10 +2017,22 @@ class GatewayTurnMixin:
                 f"{prefix}{ln}" if ln else empty
                 for ln in display_reasoning.splitlines()
             )
-            return f"{header}\n{_quoted}\n\n{response}"
+            _assembled = f"{header}\n{_quoted}\n\n{response}"
+            try:
+                from gateway.run import _sanitize_gateway_final_response
+
+                return _sanitize_gateway_final_response(source.platform, _assembled)
+            except Exception:
+                return "[REDACTED]"
         # Escape ``` inside reasoning so inner fences don't break the outer code block.
         display_reasoning = escape_code_fences_for_display(display_reasoning)
-        return f"💭 **Reasoning:**\n```\n{display_reasoning}\n```\n\n{response}"
+        _assembled = f"💭 **Reasoning:**\n```\n{display_reasoning}\n```\n\n{response}"
+        try:
+            from gateway.run import _sanitize_gateway_final_response
+
+            return _sanitize_gateway_final_response(source.platform, _assembled)
+        except Exception:
+            return "[REDACTED]"
 
     def _hmwa_runtime_footer_line(self, agent_result, source, _turn_seconds):
         """Runtime-metadata footer for the FINAL message of the turn; off by default

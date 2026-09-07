@@ -22762,6 +22762,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # break the outer code block used to render it.
                         display_reasoning = escape_code_fences_for_display(display_reasoning)
                         response = f"💭 **Reasoning:**\n```\n{display_reasoning}\n```\n\n{response}"
+                    # SEC-PF-FINAL-REASONING-AUGMENTATION-EGRESS: strict sanitize assembled reasoning+final
+                    try:
+                        response = _sanitize_gateway_final_response(source.platform, response)
+                    except Exception:
+                        response = "[REDACTED]"
 
             # Runtime-metadata footer — only on the FINAL message of the turn.
             # Off by default (display.runtime_footer.enabled=false).  When
@@ -24947,24 +24952,47 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             # Extract media files from the response
             if response:
+                try:
+                    response = _strict_watcher_sanitize(response)
+                except Exception:
+                    response = "[REDACTED]"
                 media_files, response = adapter.extract_media(response)
                 from gateway.platforms.base import BasePlatformAdapter
                 media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
                 images, text_content = adapter.extract_images(response)
-
-                preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
+                try:
+                    text_content = _strict_watcher_sanitize(text_content) if text_content else text_content
+                except Exception:
+                    text_content = "[REDACTED]"
+                try:
+                    safe_prompt = _strict_watcher_sanitize(prompt)
+                except Exception:
+                    safe_prompt = "[REDACTED]"
+                preview = safe_prompt[:60] + ("..." if len(safe_prompt) > 60 else "")
                 header = f'✅ Background task complete\nPrompt: "{preview}"\n\n'
+                try:
+                    header = _strict_watcher_sanitize(header)
+                except Exception:
+                    header = "[REDACTED]"
 
                 if text_content:
+                    try:
+                        to_send = _strict_watcher_sanitize(header + text_content)
+                    except Exception:
+                        to_send = "[REDACTED]"
                     await adapter.send(
                         chat_id=source.chat_id,
-                        content=header + text_content,
+                        content=to_send,
                         metadata=_thread_metadata,
                     )
                 elif not images and not media_files:
+                    try:
+                        to_send2 = _strict_watcher_sanitize(header + "(No response generated)")
+                    except Exception:
+                        to_send2 = "[REDACTED]"
                     await adapter.send(
                         chat_id=source.chat_id,
-                        content=header + "(No response generated)",
+                        content=to_send2,
                         metadata=_thread_metadata,
                     )
 
@@ -25031,17 +25059,205 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             try:
                 await adapter.send(
                     chat_id=source.chat_id,
-                    content=f"❌ Background task {task_id} failed: {e}",
+                    content=_strict_watcher_sanitize(f"❌ Background task {task_id} failed: {e}"),
                     metadata=_thread_metadata,
                 )
             except Exception:
                 pass
 
+    @staticmethod
+    def _run_agent_stream_confirmed_final_delivery(
+        consumer, final_text: str, *, previewed: bool = False
+    ) -> bool:
+        """True only when the actual final reply reached the user: a finalize call may carry only the
+        last preview snapshot, so reconcile against the recorded payload — a demonstrable mismatch
+        (False) overrides the flag; None keeps legacy trust."""
+        from contextlib import suppress
 
+        if consumer is None:
+            return False
+        if getattr(consumer, "final_response_sent", False):
+            matcher = getattr(consumer, "delivered_final_matches", None)
+            if callable(matcher):
+                with suppress(Exception):
+                    if matcher(final_text) is False:
+                        return False
+            return True
+        if previewed:
+            has_delivered_text = getattr(consumer, "has_delivered_text", None)
+            if callable(has_delivered_text):
+                try:
+                    return bool(has_delivered_text(final_text))
+                except Exception:
+                    return False
+        return False
 
+    async def _run_agent_edit_streamed_message(
+        self,
+        _sc,
+        source,
+        response,
+        content,
+        *,
+        _sk,
+        ok,
+        fail_result,
+        fail_exc,
+    ) -> None:
+        """Edit the stream consumer's message in place with ``content``; on success mark
+        ``response["already_sent"]`` and log ``ok``. ``fail_result`` (None = trust the call) logs a
+        returned failure as ``(session, error)``; ``fail_exc`` logs an exception as ``(session, exc)``."""
+        # SEC-PF-STREAMED-FINAL-EDIT-EGRESS — strict URL-aware fail-closed sanitization
+        # after complete final assembly and before every adapter edit/update effect.
+        # Hostile opaque userinfo/query credentials must never reach the ledger.
+        try:
+            from gateway.run import _sanitize_gateway_final_response
 
+            sanitized_content = _sanitize_gateway_final_response(
+                source.platform, content
+            )
+        except Exception:
+            sanitized_content = "[REDACTED]"
+        try:
+            _res = await _sc.adapter.edit_message(
+                chat_id=source.chat_id,
+                message_id=_sc.message_id,
+                content=sanitized_content,
+                finalize=True,
+            )
+        except Exception as _edit_err:
+            logger.warning(fail_exc, _sk, _edit_err)
+            return
+        if fail_result is not None and not getattr(_res, "success", True):
+            logger.warning(fail_result, _sk, getattr(_res, "error", None))
+            return
+        response["already_sent"] = True
+        logger.info(*ok)
 
+    async def _run_agent_mark_streamed_delivery(
+        self, response: Any, turn_ctx
+    ) -> None:
+        """Set ``response["already_sent"]`` when streaming already delivered the final reply.
 
+        Never when the agent failed (the error is unseen content) or on "(empty)". Both suppression
+        flags reflect call success, not content, so reconcile against the recorded turn-final
+        payload: a mismatch (False, incl. payload-less split delivery) never suppresses; None (no
+        record) keeps legacy trust."""
+        from contextlib import suppress
+
+        _sc, source, session_key = (
+            turn_ctx.stream_consumer_holder[0],
+            turn_ctx.source,
+            turn_ctx.session_key,
+        )
+        if not isinstance(response, dict) or response.get("failed"):
+            return
+        _final = response.get("final_response") or ""
+        _is_empty_sentinel = not _final or _final == "(empty)"
+        _previewed = bool(response.get("response_previewed"))
+        _content_delivered = bool(
+            _sc and getattr(_sc, "final_content_delivered", False)
+        )
+        _stale_finalized = False
+        if _content_delivered and not _is_empty_sentinel:
+            _matcher = getattr(_sc, "delivered_final_matches", None)
+            if callable(_matcher):
+                with suppress(Exception):
+                    _stale_finalized = _matcher(_final) is False
+            if _stale_finalized:
+                _content_delivered = False
+        _transformed = bool(response.get("response_transformed"))
+        _streamed = self._run_agent_stream_confirmed_final_delivery(
+            _sc, _final, previewed=_previewed
+        )
+        if _is_empty_sentinel:
+            return
+        _sk = session_key or "?"
+        if not _transformed and (_streamed or _content_delivered):
+            logger.info(
+                "Suppressing normal final send for session %s: final delivery already confirmed (streamed=%s previewed=%s content_delivered=%s).",
+                _sk,
+                _streamed,
+                _previewed,
+                _content_delivered,
+            )
+            response["already_sent"] = True
+        elif not _transformed and _stale_finalized and _sc is not None:
+            _sc_msg_id = _sc.message_id
+            if getattr(_sc, "_turn_split_delivery", False):
+                logger.info(
+                    "Stale streamed finalize detected for session %s on a multi-message split; skipping the in-place reconciliation edit and delivering the complete response via normal final send (#78541).",
+                    _sk,
+                )
+            elif (
+                _sc_msg_id
+                and _sc_msg_id != "__no_edit__"
+                and getattr(_sc, "adapter", None) is not None
+            ):
+                await self._run_agent_edit_streamed_message(
+                    _sc,
+                    source,
+                    response,
+                    _final,
+                    _sk=_sk,
+                    ok=(
+                        "Reconciled stale streamed finalize for session %s: edited message %s with the complete response (#71643).",
+                        _sk,
+                        _sc_msg_id,
+                    ),
+                    fail_result="Stale-finalize reconciliation edit failed for session %s (%s); sending complete response via normal final send.",
+                    fail_exc="Stale-finalize reconciliation edit failed for session %s: %s; sending complete response via normal final send.",
+                )
+            else:
+                logger.info(
+                    "Stale streamed finalize detected for session %s with no editable message; delivering complete response via normal final send (#71643).",
+                    _sk,
+                )
+        elif _transformed and _sc is not None:
+            if _sc.message_id:
+                await self._run_agent_edit_streamed_message(
+                    _sc,
+                    source,
+                    response,
+                    response["final_response"],
+                    _sk=_sk,
+                    ok=(
+                        "Edited streamed message %s for session %s to include plugin-transformed content.",
+                        _sc.message_id,
+                        _sk,
+                    ),
+                    fail_result=None,
+                    fail_exc="Failed to edit streamed message for session %s: %s",
+                )
+        elif _sc is not None:
+            logger.warning(
+                "Normal final-send NOT suppressed despite active stream consumer for session %s: "
+                "streamed=%s previewed=%s content_delivered=%s transformed=%s final_len=%d — "
+                "possible duplicate send (see wecom ack-timeout RCA).",
+                _sk,
+                _streamed,
+                _previewed,
+                _content_delivered,
+                _transformed,
+                len(_final),
+            )
+
+    async def _hmwa_hygiene_notify(self, source, meta, message, what):
+        """Best-effort user notice on the hygiene thread; failure is logged, never raised."""
+        try:
+            _adapter = self._adapter_for_source(source)
+            if _adapter and source.chat_id:
+                try:
+                    sanitized = _strict_watcher_sanitize(message)
+                except Exception:
+                    sanitized = "[REDACTED]"
+                await _adapter.send(
+                    source.chat_id,
+                    sanitized,
+                    metadata=meta,
+                )
+        except Exception as _werr:
+            logger.warning("Failed to deliver %s to user: %s", what, _werr)
 
     async def _get_telegram_topic_capabilities(self, source: SessionSource) -> dict:
         """Read Telegram private-topic capability flags via Bot API getMe."""
@@ -28307,7 +28523,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _command = getattr(session, "command", "") or ""
                     _raw = strip_ansi(session.output_buffer) if session.output_buffer else ""
                     _raw = redact_terminal_output(_raw, _command)
-                    _command = _redact_gateway_user_facing_secrets(_command)
+                    try:
+                        _command = _strict_watcher_sanitize(_command)
+                    except Exception:
+                        _command = "[REDACTED]"
                     # Truncate at line boundaries so notifications never start
                     # mid-line (fixes #23284). Keep the last ~2000 chars but
                     # snap to the nearest preceding newline, then prepend a
@@ -28320,7 +28539,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _out = f"[… output truncated — showing last {len(_tail)} chars]\n{_tail}"
                     else:
                         _out = _raw
-                    _out = _redact_gateway_user_facing_secrets(_out)
+                    try:
+                        _out = _strict_watcher_sanitize(_out)
+                    except Exception:
+                        _out = "[REDACTED]"
                     completion_evt = {
                         "type": "completion",
                         "session_id": session_id,
@@ -28390,15 +28612,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         new_output = redact_terminal_output(
                             new_output, getattr(session, "command", "") or ""
                         )
-                        # redact_terminal_output() is unforced, so it returns raw
-                        # text when security.redact_secrets is off.  This send
-                        # goes straight to the platform adapter, so it needs the
-                        # same unconditional floor as the agent-notify path.
-                        new_output = _redact_gateway_user_facing_secrets(new_output)
+                        # Strict fail-closed: use authoritative progress sanitizer before adapter ledger
+                        try:
+                            new_output = _strict_watcher_sanitize(new_output)
+                        except Exception:
+                            new_output = "[REDACTED]"
                     if notify_mode == "concise":
-                        _cmd_disp = _redact_gateway_user_facing_secrets(
-                            getattr(session, "command", "") or ""
-                        )
+                        try:
+                            _cmd_disp = _strict_watcher_sanitize(
+                                getattr(session, "command", "") or ""
+                            )
+                        except Exception:
+                            _cmd_disp = "[REDACTED]"
                         _started = getattr(session, "started_at", None)
                         _dur = None
                         if isinstance(_started, (int, float)):
@@ -28423,6 +28648,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if adapter and chat_id:
                         try:
                             send_meta = {"thread_id": thread_id} if thread_id else None
+                            try:
+                                message_text = _strict_watcher_sanitize(message_text)
+                            except Exception:
+                                message_text = "[REDACTED]"
                             await adapter.send(
                                 chat_id,
                                 message_text,
@@ -28441,7 +28670,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     new_output = redact_terminal_output(
                         new_output, getattr(session, "command", "") or ""
                     )
-                    new_output = _redact_gateway_user_facing_secrets(new_output)
+                    try:
+                        new_output = _strict_watcher_sanitize(new_output)
+                    except Exception:
+                        new_output = "[REDACTED]"
                 message_text = (
                     f"[Background process {session_id} is still running~ "
                     f"New output:\n{new_output}]"
@@ -28454,6 +28686,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if adapter and chat_id:
                     try:
                         send_meta = {"thread_id": thread_id} if thread_id else None
+                        try:
+                            message_text = _strict_watcher_sanitize(message_text)
+                        except Exception:
+                            message_text = "[REDACTED]"
                         await adapter.send(
                             chat_id,
                             message_text,
