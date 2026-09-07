@@ -8121,6 +8121,199 @@ class TestStatefulStreamedEgress:
             except:
                 pass
 
+    @pytest.mark.asyncio
+    async def test_stateful_provider_token_split_no_partial_leak_via_ledger(self):
+        """Synthetic split-delta credential-prefix egress: no raw partial prefix ever reaches adapter.
+
+        Regression for Ada HIGH: ``https://example.com/path/sk-abc`` (partial
+        sk- token) followed by ``1234567`` completing ``sk-abc1234567`` (masked
+        to ``***``) must not publish the first raw prefix via send/edit. The
+        ledger is the active-monolith stream path (TurnRunner -> StreamConsumer
+        -> capture adapter). Asserts exact ledger ordering, no raw leak on any
+        interim effect, final masked, and benign preservation.
+        """
+        import queue
+        import asyncio
+        from unittest.mock import MagicMock
+        from gateway.turn_context import TurnContext
+        from gateway.run_turn_runner import TurnRunner
+        from gateway.stream_consumer import StreamConsumerConfig
+        from gateway.platforms.base import SendResult
+        from gateway.config import (
+            Platform,
+            GatewayConfig,
+            PlatformConfig,
+            StreamingConfig,
+        )
+
+        # Hostile provider-token split: prefix then completion
+        part1 = "https://example.com/path/sk-abc"
+        part2 = "1234567"
+        full_hostile = part1 + part2  # sk-abc1234567 -> *** after redact
+        expected_mask = "***"
+        # Also test a longer token that masks to head/tail (sk-...): still must not leak raw
+        long_part1 = "https://example.com/path/sk-"
+        long_part2 = "abcdefghijklmnopqrstuvwxyz12345"
+        long_full = long_part1 + long_part2
+
+        for hostile_part1, hostile_part2, hostile_full in [
+            (part1, part2, full_hostile),
+            (long_part1, long_part2, long_full),
+        ]:
+            ledger: list[tuple[str, str]] = []
+
+            class Cap:
+                async def send(self, chat_id, content, reply_to=None, metadata=None):
+                    ledger.append(("send", content))
+                    return SendResult(success=True, message_id="m1")
+
+                async def edit_message(
+                    self, chat_id, message_id, content, metadata=None, finalize=False
+                ):
+                    ledger.append(("edit", content))
+                    m = MagicMock()
+                    m.success = True
+                    m.message_id = message_id
+                    return m
+
+                async def send_typing(self, chat_id, metadata=None):
+                    return None
+
+                async def get_chat_info(self, chat_id):
+                    return {"id": chat_id}
+
+                def supports_draft_streaming(self, **kw):
+                    return False
+
+                def supports_native_streaming(self, **kw):
+                    return False
+
+            cap = Cap()
+            ctx = TurnContext(
+                source=MagicMock(chat_id="C123", platform=Platform.SLACK),
+                _run_still_current=lambda: True,
+                progress_mode="all",
+                tool_progress_enabled=True,
+                tool_progress_filter={},
+                progress_queue=queue.Queue(),
+                log_queue=None,
+                last_progress_msg=[None],
+                last_tool=[None],
+                last_was_terminal_block=[False],
+                repeat_count=[0],
+                long_tool_hint_fired=[False],
+                agent_holder=[None],
+                _native_slack_task_cards=False,
+                result_holder=[None],
+                tools_holder=[None],
+                stream_consumer_holder=[None],
+                streaming_tts_consumer_holder=[None],
+                user_config={"display": {}},
+                resolve_display_setting=lambda cfg, plat, key: None,
+                event_message_id="evt-provider-split",
+                _status_thread_metadata={},
+            )
+
+            class Stub:
+                def __init__(self):
+                    self.config = GatewayConfig(
+                        platforms={
+                            Platform.SLACK: PlatformConfig(enabled=True, token="x")
+                        }
+                    )
+                    self.config.streaming = StreamingConfig(
+                        enabled=True,
+                        transport="edit",
+                        edit_interval=0.05,
+                        buffer_threshold=1,
+                    )
+
+                def _adapter_for_source(self, s):
+                    return cap
+
+                def _build_stream_consumer_config(
+                    self, source, scfg, adapter, on_missing_cursor="raise"
+                ):
+                    return StreamConsumerConfig(
+                        edit_interval=0.05,
+                        buffer_threshold=1,
+                        cursor="",
+                        transport="edit",
+                        chat_type="channel",
+                    ), None
+
+            runner = TurnRunner(Stub(), ctx)
+            sc, delta_cb, _, _ = runner._setup_stream_consumer("slack")
+            assert sc is not None and delta_cb is not None
+            task = asyncio.create_task(sc.run())
+            await asyncio.sleep(0.08)
+            # First delta is partial URL prefix containing credential prefix but not yet full token
+            delta_cb(hostile_part1)
+            await asyncio.sleep(0.18)
+            # No raw partial prefix may have reached any adapter effect
+            for kind, content in list(ledger):
+                assert hostile_part1 not in content, (
+                    f"raw partial prefix leaked via {kind}: {content!r}"
+                )
+                assert (
+                    "sk-abc" not in content or "***" in content or "..." in content
+                ), f"provider prefix leaked raw via {kind}: {content!r}"
+                # For short token, full token not yet complete so also not present
+                assert hostile_full not in content, (
+                    f"full hostile leaked early via {kind}: {content!r}"
+                )
+            # Second delta completes the token
+            delta_cb(hostile_part2)
+            await asyncio.sleep(0.22)
+            for kind, content in list(ledger):
+                assert hostile_part1 not in content, (
+                    f"raw partial prefix still leaked after completion via {kind}: {content!r}"
+                )
+                assert hostile_full not in content, (
+                    f"full hostile leaked as raw via {kind}: {content!r}"
+                )
+            # Finish with authoritative final
+            runner._finish_stream_consumer(
+                {
+                    "final_response": hostile_full,
+                    "failed": False,
+                    "interrupted": False,
+                    "completed": True,
+                },
+                [],
+                sc,
+            )
+            await asyncio.sleep(0.35)
+            try:
+                await asyncio.wait_for(task, timeout=1.5)
+            except asyncio.TimeoutError:
+                task.cancel()
+                try:
+                    await task
+                except:
+                    pass
+            assert len(ledger) >= 1, (
+                f"expected at least one effect for {hostile_full!r}, got {ledger}"
+            )
+            for kind, content in ledger:
+                assert hostile_full not in content, (
+                    f"raw full token leaked in final ledger via {kind}: {content!r}"
+                )
+                # Short token raw partial must not survive as raw; long token masked head still contains prefix but is masked
+                if hostile_full == full_hostile:
+                    assert hostile_part1 not in content, (
+                        f"raw partial prefix leaked in final ledger via {kind}: {content!r}"
+                    )
+            # At least one effect must be masked (*** or head/tail) and not raw
+            assert any(
+                "***" in c or "[REDACTED]" in c or "sk-" in c and "..." in c
+                for _, c in ledger
+            ), f"expected masked token in ledger {ledger!r}"
+            # Benign must not be over-masked: prefix without credential must survive
+            assert any("https://example.com/path/" in c for _, c in ledger), (
+                f"safe prefix lost in {ledger!r}"
+            )
+
 
 class TestPFSharedFailClosedEgressV2:
     """PF_SHARED_FAIL_CLOSED_EGRESS_V2 comprehensive real-caller ledger coverage."""

@@ -364,6 +364,103 @@ def _find_safe_prefix_len(text: str, normalized_set) -> int:
     return n
 
 
+def _find_stream_safe_prefix_len(text: str, normalized_set) -> int:
+    """Streaming-safe prefix that holds any trailing credential-prefix candidate.
+
+    Extends _find_safe_prefix_len with credential-token awareness: a known
+    provider token prefix (sk-, ghp_, etc.) or its 2+-char fragment at the tail
+    must not be emitted until the next delta proves it benign or fully masks.
+    This closes the split-delta egress where ``sk-abc`` + ``DEF...`` leaked
+    the partial prefix raw. Query/userinfo boundaries remain via the base
+    helper; this adds the fail-closed tail hold. Returns safe length to emit
+    now; the remainder is retained as pending.
+    """
+    n = len(text)
+    if n == 0:
+        return 0
+    base = _find_safe_prefix_len(text, normalized_set)
+    candidate = base
+    # Provider-token prefixes
+    try:
+        from agent.redact import _PREFIX_SUBSTRINGS as _ps
+
+        prefixes = _ps
+    except Exception:
+        prefixes = (
+            "sk-",
+            "ghp_",
+            "gho_",
+            "ghu_",
+            "ghs_",
+            "ghr_",
+            "xox",
+            "xapp-",
+            "AIza",
+            "AKIA",
+            "glpat-",
+            "pplx-",
+            "hf_",
+            "gAAAA",
+        )
+    tail_limit = 500
+    for p in prefixes:
+        if not p:
+            continue
+        idx = text.rfind(p)
+        while idx != -1:
+            if idx == 0 or (
+                not text[idx - 1].isalnum() and text[idx - 1] not in ("_", "-")
+            ):
+                if n - idx <= tail_limit and idx < candidate:
+                    candidate = idx
+            if idx == 0:
+                break
+            idx = text.rfind(p, 0, idx)
+        for k in range(2, len(p)):
+            frag = p[:k]
+            if n >= len(frag) and text.endswith(frag):
+                start = n - len(frag)
+                if start == 0 or (
+                    not text[start - 1].isalnum() and text[start - 1] not in ("_", "-")
+                ):
+                    if start < candidate:
+                        candidate = start
+    # Hold trailing sensitive query-key prefix without value (\"?tok\" -> \"?token=\")
+    if normalized_set is not None:
+        try:
+            last_delim = -1
+            last_char = ""
+            for delim in ("?", "&", ";", "#"):
+                pos = text.rfind(delim)
+                if pos > last_delim:
+                    last_delim = pos
+                    last_char = delim
+            if last_delim != -1 and n - last_delim <= 80:
+                raw_after = text[last_delim + 1 :].lstrip(" \t\n\r")
+                if "=" not in raw_after:
+                    frag_key = raw_after.strip(" \t\n\r")
+                    if frag_key:
+                        frag_norm = (
+                            frag_key.casefold().replace("-", "_").replace(" ", "_")
+                        )
+                        for skey in normalized_set:
+                            if (
+                                len(frag_norm) >= 2
+                                and skey.startswith(frag_norm)
+                                and frag_norm not in ("_", "-")
+                            ):
+                                if last_delim < candidate:
+                                    candidate = last_delim
+                                break
+                            if len(frag_key) >= 2 and skey.startswith(frag_key.lower()):
+                                if last_delim < candidate:
+                                    candidate = last_delim
+                                break
+        except Exception:
+            pass
+    return candidate if candidate <= n else n
+
+
 def _strict_url_param_fixup(text: str, normalized_set) -> str:
     import re
 
@@ -632,6 +729,8 @@ class _StatefulStreamRedactor:
 
     def __init__(self) -> None:
         self._raw: str = ""
+        self._pending: str = ""
+        self._safe_raw: str = ""
         self._sanitized_flushed: str = ""
         self._sanitized_full: str = ""
         self._failure_latch: str = "none"
@@ -685,25 +784,46 @@ class _StatefulStreamRedactor:
         if not s:
             return None
         self._raw += s
+        combined = self._pending + s
         try:
-            sanitized_full = self._sanitize(self._raw, final=False)
+            normalized_set = _get_normalized_sensitive_set()
         except Exception:
-            sanitized_full = "[REDACTED]"
-        self._sanitized_full = sanitized_full
-        if sanitized_full == "[REDACTED]":
+            normalized_set = None
+        try:
+            safe_len = _find_stream_safe_prefix_len(combined, normalized_set)
+        except Exception:
+            logger.debug("stream safe len failed", exc_info=True)
+            try:
+                safe_len = _find_safe_prefix_len(combined, normalized_set)
+            except Exception:
+                safe_len = len(combined)
+        safe_len = max(0, min(safe_len, len(combined)))
+        safe_part = combined[:safe_len]
+        self._pending = combined[safe_len:]
+        new_safe_raw = self._safe_raw + safe_part
+        try:
+            sanitized = self._sanitize(new_safe_raw, final=False)
+        except Exception:
+            sanitized = "[REDACTED]"
+        self._sanitized_full = sanitized
+        if sanitized == "[REDACTED]":
             if not self._sanitized_flushed:
-                self._sanitized_flushed = sanitized_full
+                self._sanitized_flushed = sanitized
                 self._failure_latch = "both_failed"
-                return sanitized_full
+                self._safe_raw = new_safe_raw
+                return sanitized
             self._failure_latch = "both_failed"
+            self._safe_raw = new_safe_raw
             return None
-        if len(sanitized_full) < len(
+        if len(sanitized) < len(self._sanitized_flushed) or not sanitized.startswith(
             self._sanitized_flushed
-        ) or not sanitized_full.startswith(self._sanitized_flushed):
+        ):
             self._failure_latch = "both_failed"
+            self._safe_raw = new_safe_raw
             return None
-        new_part = sanitized_full[len(self._sanitized_flushed) :]
-        self._sanitized_flushed = sanitized_full
+        new_part = sanitized[len(self._sanitized_flushed) :]
+        self._sanitized_flushed = sanitized
+        self._safe_raw = new_safe_raw
         return new_part if new_part else None
 
     def sanitize_final(self, final_text: str | None) -> str | None:
@@ -719,6 +839,8 @@ class _StatefulStreamRedactor:
 
     def on_segment_break(self) -> None:
         self._raw = ""
+        self._pending = ""
+        self._safe_raw = ""
         self._sanitized_flushed = ""
         self._sanitized_full = ""
         self._failure_latch = "none"
