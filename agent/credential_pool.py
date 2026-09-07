@@ -2202,6 +2202,17 @@ class CredentialPool:
             # can remain unhydrated; never lease or select it as an empty key.
             if entry.auth_type == AUTH_TYPE_API_KEY and not entry.runtime_api_key:
                 continue
+            # Fail-closed for env-backed rows: an env:VAR entry whose VAR is
+            # currently unset/empty must never be selected, even if a stale
+            # in-memory token remains from a legacy persisted raw value that
+            # was sanitized on disk. The disk row is retained
+            # (prune_env_sources=False) for cross-process safety, but this
+            # process must treat it as unavailable until the env source is
+            # active again.
+            if entry.source.startswith("env:"):
+                _env_name = entry.source.split(":", 1)[1]
+                if _env_name and not get_env_prefer_dotenv(_env_name):
+                    continue
             # For anthropic claude_code entries, sync from the credentials file
             # before any status/refresh checks. This picks up tokens refreshed
             # by other processes (Claude Code CLI, other Hermes profiles).
@@ -3400,6 +3411,31 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
                 base_url=base_url,
             ),
         )
+    # Fail-closed: clear stale in-memory token for env sources that are not
+    # active. The disk row is retained (load_pool uses prune_env_sources=False)
+    # for cross-process safety, but this process must not select a legacy
+    # persisted token when its env var is unset/empty. Preserve a fingerprint
+    # for audit before clearing so disk sanitization still leaves a trace.
+    for _stale in list(entries):
+        if not _stale.source.startswith("env:"):
+            continue
+        _stale_env = _stale.source.split(":", 1)[1]
+        if not _stale_env or _stale.source in active_sources:
+            continue
+        if _stale.access_token:
+            try:
+                _fp = fingerprint_secret_value(_stale.access_token)
+            except Exception:
+                _fp = None
+            _new_extra = dict(_stale.extra) if _stale.extra else {}
+            if _fp:
+                _new_extra["secret_fingerprint"] = _fp
+            _cleared = replace(_stale, access_token="", extra=_new_extra)
+            for _idx, _ent in enumerate(entries):
+                if _ent.id == _stale.id:
+                    entries[_idx] = _cleared
+                    break
+            changed = True
     return changed, active_sources
 
 

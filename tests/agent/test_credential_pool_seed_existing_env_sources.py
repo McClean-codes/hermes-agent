@@ -59,7 +59,7 @@ def _read_auth(home: Path) -> dict:
 
 
 @pytest.fixture
-def isolated_hermes_home(tmp_path, monkeypatch):
+def isolated_hermes_home(tmp_path, monkeypatch, request):
     """Fresh HERMES_HOME with .env cache cleared and credential envs blanked."""
     home = tmp_path / ".hermes"
     home.mkdir()
@@ -80,20 +80,23 @@ def isolated_hermes_home(tmp_path, monkeypatch):
     for key in list(os.environ.keys()):
         if "_API_KEY" in key or key.endswith("_TOKEN") or key.endswith("_BASE_URL"):
             monkeypatch.delenv(key, raising=False)
-    # Guarantee no stray secret scope from prior test
-    try:
-        from agent.secret_scope import set_secret_scope, set_multiplex_active
-        # Clear scope, disable multiplex so get_secret fallback is predictable
+    # Guarantee no stray secret scope from prior test — deterministic, no blanket swallow
+    from agent.secret_scope import _SECRET_SCOPE, is_multiplex_active, set_multiplex_active
+
+    _SECRET_SCOPE.set(None)
+    set_multiplex_active(False)
+    invalidate_env_cache()
+    assert _SECRET_SCOPE.get() is None, "secret scope not cleared at fixture setup"
+    assert not is_multiplex_active(), "multiplex still active at fixture setup"
+
+    def _finalizer():
+        _SECRET_SCOPE.set(None)
         set_multiplex_active(False)
-        # ensure no scope installed
-        from agent.secret_scope import _SECRET_SCOPE
-        if _SECRET_SCOPE.get() is not None:
-            tok = set_secret_scope(None)
-            # reset immediately — leave clean
-            from agent.secret_scope import reset_secret_scope
-            reset_secret_scope(tok)
-    except Exception:
-        pass
+        invalidate_env_cache()
+        assert _SECRET_SCOPE.get() is None, "secret scope not cleared at fixture teardown"
+        assert not is_multiplex_active(), "multiplex still active at fixture teardown"
+
+    request.addfinalizer(_finalizer)
     return home
 
 
@@ -430,3 +433,65 @@ class TestSeedFromEnvRespectsExistingPoolEntries:
         assert "env:" not in active_sources
         # Malformed entry stays empty
         assert entries[0].access_token == ""
+
+    def test_legacy_env_source_with_persisted_token_not_selected_when_env_unset(self, tmp_path, monkeypatch):
+        """Regression: legacy env:VAR row with persisted token must not be selected when VAR is unset.
+
+        Disk may have carried a raw access_token from before sanitization; after
+        load_pool the raw must be sanitized (no raw on disk) and the in-memory
+        entry must be unavailable — select() must not return it.
+        """
+        home = tmp_path / "hermes"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        from hermes_cli.config import invalidate_env_cache
+
+        invalidate_env_cache()
+        for key in ["PROVIDER_API_KEY", "PROVIDER_API_KEY_2", "PROVIDER_API_KEY_3"]:
+            monkeypatch.delenv(key, raising=False)
+            os.environ.pop(key, None)
+        from agent.secret_scope import _SECRET_SCOPE, is_multiplex_active, set_multiplex_active
+
+        _SECRET_SCOPE.set(None)
+        set_multiplex_active(False)
+        invalidate_env_cache()
+        assert _SECRET_SCOPE.get() is None
+        assert not is_multiplex_active()
+
+        legacy_token = SYN_PRIMARY
+        _write_auth(home, {
+            "opencode-go": [
+                {"id": "leg123", "label": "legacy", "auth_type": "api_key", "priority": 0, "source": "env:PROVIDER_API_KEY", "access_token": legacy_token},
+            ]
+        })
+        (home / ".env").write_text("", encoding="utf-8")
+        invalidate_env_cache()
+
+        # Direct _seed_from_env path must also clear stale token
+        from agent.credential_pool import PooledCredential, _seed_from_env
+
+        pconfig = _make_pconfig("opencode-go", ["PROVIDER_API_KEY"])
+        stale = PooledCredential(provider="opencode-go", id="leg123", label="legacy", auth_type="api_key", priority=0, source="env:PROVIDER_API_KEY", access_token=legacy_token)
+        entries = [stale]
+        with patch("agent.credential_pool.PROVIDER_REGISTRY", {"opencode-go": pconfig}):
+            changed, active = _seed_from_env("opencode-go", entries)
+        assert "env:PROVIDER_API_KEY" not in active
+        assert entries[0].access_token == "", "stale token not cleared by _seed_from_env"
+
+        # Full load_pool path — must sanitize disk and not select
+        from agent.credential_pool import load_pool
+
+        pool = load_pool("opencode-go")
+        raw = (home / "auth.json").read_text(encoding="utf-8")
+        assert legacy_token not in raw, "raw legacy token leaked to disk"
+        data = _read_auth(home)
+        disk_entries = data.get("credential_pool", {}).get("opencode-go", [])
+        assert len(disk_entries) == 1
+        assert disk_entries[0].get("source") == "env:PROVIDER_API_KEY"
+        assert disk_entries[0].get("access_token") in (None, ""), "disk still has raw access_token"
+        avail, _ = pool._available_entries()
+        assert len(avail) == 0, f"stale env entry incorrectly available: {avail!r}"
+        assert pool.select() is None, "select() returned stale env entry when env var unset"
+        assert pool.peek() is None
+        assert _SECRET_SCOPE.get() is None
+        assert not is_multiplex_active()
