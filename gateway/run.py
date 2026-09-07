@@ -876,14 +876,14 @@ def _redact_approval_command(cmd: "str | None") -> str:
     Tirith's *findings* are already redacted, but the gateway approval prompt
     is built from the raw command string, so a credential-shaped value Tirith
     flagged would otherwise be echoed verbatim to the chat platform (#48456).
-    Uses ``redact_sensitive_text(force=True)`` — the same Tirith-grade redactor
-    — so the prompt honors redaction even when ``security.redact_secrets`` is
-    off. Module-level so the wiring is unit-testable (the call site is a deeply
-    nested gateway closure that cannot be driven directly).
+    Uses the strict gateway egress sanitizer so opaque URL query parameters and userinfo
+    are covered in both interactive and text approval transports, before either path clips or formats it.
     """
-    from agent.redact import redact_sensitive_text
-
-    return redact_sensitive_text(str(cmd or ""), force=True)
+    try:
+        redacted = _strict_watcher_sanitize(str(cmd or ""))
+    except Exception:
+        return "[REDACTED]"
+    return redacted if isinstance(redacted, str) else "[REDACTED]"
 
 
 def _format_exec_approval_fallback(
@@ -1019,7 +1019,14 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     if str(text).strip().startswith(INTERRUPT_WAITING_FOR_MODEL_PREFIX):
         return ""
 
-    redacted = _redact_gateway_user_facing_secrets(str(text))
+    # SEC-PF-FINAL-URL-EGRESS: strict URL-aware fail-closed redaction via shared boundary
+    try:
+        from gateway.run_turn_runner import _redact_progress_text as _strict_redact  # type: ignore[import]
+
+        redacted = _strict_redact(text, final=True)
+    except Exception:
+        logger.debug("final response redaction unavailable", exc_info=True)
+        redacted = "[REDACTED]"
     if _looks_like_gateway_provider_error(redacted):
         return _gateway_provider_error_reply(redacted)
     return redacted
@@ -1037,7 +1044,14 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
     if _gateway_surface_passes_raw_text(platform):
         return text
 
-    text = _redact_gateway_user_facing_secrets(text)
+    # SEC-PF-006 live-status: use authoritative progress redaction via shared boundary
+    try:
+        from gateway.run_turn_runner import _redact_progress_text as _strict_redact  # type: ignore[import]
+
+        text = _strict_redact(text, final=True)
+    except Exception:
+        logger.debug("status redaction unavailable", exc_info=True)
+        text = "[REDACTED]"
     if _TELEGRAM_NOISY_STATUS_RE.search(text):
         # Opt-in #52995: `compression.progress_notices: true` lets ROUTINE
         # compression progress statuses through to chat platforms. The
@@ -1053,6 +1067,39 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
     if _looks_like_gateway_provider_error(text):
         return _gateway_provider_error_reply(text)
     return text
+
+
+def _strict_watcher_sanitize(text: str) -> str:
+    """Strict fail-closed sanitizer for background watcher human-facing sends.
+
+    Watcher notifications go directly to adapters without passing through the
+    turn-bound redaction boundary, so they use the same authoritative progress
+    sanitizer immediately before delivery. Any failure returns a fixed safe
+    placeholder rather than raw watcher output.
+    """
+    s = str(text or "")
+    if not s:
+        return s
+    try:
+        from gateway.run_turn_runner import _redact_progress_text as _strict_redact
+
+        sanitized = _strict_redact(s, final=True)
+        if not isinstance(sanitized, str):
+            raise TypeError("watcher sanitizer returned a non-string result")
+        return sanitized
+    except Exception:
+        logger.debug("watcher strict redaction unavailable", exc_info=True)
+        try:
+            from agent.redact import _PREFIX_SUBSTRINGS
+
+            for pref in _PREFIX_SUBSTRINGS:
+                if pref and pref in s:
+                    return "[REDACTED]"
+        except Exception:
+            for pref in ("sk-", "ghp_", "gho_", "xox", "AIza", "AKIA", "glpat-"):
+                if pref in s:
+                    return "[REDACTED]"
+        return "[REDACTED]" if s.strip() else ""
 
 
 def render_notice_line(notice) -> str:
@@ -4676,6 +4723,170 @@ def _reconnect_needs_attention(info: dict, now: float) -> bool:
     return (now - queued_at) >= _RECONNECT_ATTENTION_AFTER_SECONDS
 
 
+# ---- progress filter helpers (per-tool + category) ---------------------------
+# Category aliases supported in display.tool_progress_filter keys. Normalized to lower case.
+# "skills" covers skill_manage/skill_view etc; "mcp" covers all MCP-discovered tools;
+# "plugins" covers tools registered by hermes_plugins. Unknown categories are stored but
+# never match, failing safe (no effect). Individual tool names take precedence over
+# categories.
+
+_CATEGORY_ALIASES: dict[str, str] = {
+    "skill": "skills",
+    "skills": "skills",
+    "mcp": "mcp",
+    "mcp_tools": "mcp",
+    "mcp-tools": "mcp",
+    "mcp_tool": "mcp",
+    "plugin": "plugins",
+    "plugins": "plugins",
+}
+
+_SKILL_TOOL_NAMES = frozenset({
+    "skill_manage",
+    "skill_view",
+    "skill_ledger",
+    "skill_evaluator",
+    "skill_usage",
+    "skills_tool",
+    "skills_hub",
+    "skill_manager_tool",
+})
+
+
+def _normalize_filter_key(key: str) -> str:
+    k = key.strip().lower()
+    return _CATEGORY_ALIASES.get(k, k)
+
+
+def _get_tool_categories(tool_name: str) -> list[str]:
+    if not tool_name or not isinstance(tool_name, str):
+        return []
+    name_lower = tool_name.strip().lower()
+    cats: list[str] = []
+    try:
+        from tools.registry import registry as _reg
+
+        entry = None
+        try:
+            entry = _reg.get_entry(tool_name) or _reg.get_entry(name_lower)
+        except Exception:
+            entry = None
+        toolset = None
+        try:
+            toolset = _reg.get_toolset_for_tool(tool_name)
+            if toolset is None:
+                toolset = _reg.get_toolset_for_tool(name_lower)
+        except Exception:
+            toolset = None
+
+        if entry is not None:
+            is_plugin = False
+            try:
+                owner = (
+                    _reg._plugin_owner_of(entry.handler)
+                    if hasattr(_reg, "_plugin_owner_of")
+                    else None
+                )
+                if owner:
+                    is_plugin = True
+            except Exception:
+                pass
+            if (
+                not is_plugin
+                and toolset
+                and isinstance(toolset, str)
+                and "plugin" in toolset.lower()
+            ):
+                is_plugin = True
+            if not is_plugin:
+                try:
+                    ts2 = (
+                        _reg.get_toolset_for_tool(entry.name)
+                        if hasattr(entry, "name")
+                        else None
+                    )
+                    if ts2 and isinstance(ts2, str) and "plugin" in ts2.lower():
+                        is_plugin = True
+                except Exception:
+                    pass
+            is_mcp = False
+            if toolset and isinstance(toolset, str) and toolset.startswith("mcp-"):
+                is_mcp = True
+            else:
+                try:
+                    ts_mcp = toolset or (
+                        _reg.get_toolset_for_tool(entry.name)
+                        if hasattr(entry, "name")
+                        else None
+                    )
+                    if ts_mcp and isinstance(ts_mcp, str) and ts_mcp.startswith("mcp-"):
+                        is_mcp = True
+                except Exception:
+                    pass
+            is_skills = False
+            try:
+                effective_toolset = toolset
+                if effective_toolset is None and hasattr(entry, "name"):
+                    try:
+                        effective_toolset = _reg.get_toolset_for_tool(entry.name)
+                    except Exception:
+                        effective_toolset = None
+                if effective_toolset == "skills" and not is_plugin and not is_mcp:
+                    is_skills = True
+            except Exception:
+                pass
+
+            if is_plugin:
+                cats.append("plugins")
+            elif is_mcp:
+                cats.append("mcp")
+            elif is_skills:
+                cats.append("skills")
+        else:
+            if name_lower in _SKILL_TOOL_NAMES:
+                cats.append("skills")
+            if toolset and isinstance(toolset, str) and toolset.startswith("mcp-"):
+                if "mcp" not in cats:
+                    cats.append("mcp")
+            if toolset and isinstance(toolset, str) and "plugin" in toolset.lower():
+                if "plugins" not in cats:
+                    cats.append("plugins")
+    except Exception:
+        if name_lower in _SKILL_TOOL_NAMES:
+            if "skills" not in cats:
+                cats.append("skills")
+    seen = set()
+    uniq = []
+    for c in cats:
+        if c not in seen:
+            seen.add(c)
+            uniq.append(c)
+    return uniq
+
+
+def _resolve_effective_mode(
+    tool_name: str, global_mode: str, filter_dict: dict | None
+) -> str:
+    if not filter_dict:
+        return global_mode
+    canonical_map: dict[str, str] = {}
+    for k, v in filter_dict.items():
+        if not isinstance(k, str):
+            continue
+        ck = _normalize_filter_key(k.strip().lower())
+        canonical_map[ck] = v  # type: ignore[assignment]
+    raw_lower_map = {
+        str(k).strip().lower(): v for k, v in filter_dict.items() if isinstance(k, str)
+    }
+    name_lower = tool_name.strip().lower() if isinstance(tool_name, str) else ""
+    if name_lower and name_lower in raw_lower_map:
+        return raw_lower_map[name_lower]
+    for cat in _get_tool_categories(tool_name):
+        if cat in canonical_map:
+            return canonical_map[cat]
+    return global_mode
+
+
 class TurnRunner:
     """Per-turn collaborator carrying the tool-progress callbacks that used to
     be nested closures inside ``GatewayRunner._run_agent_inner``.
@@ -4691,6 +4902,7 @@ class TurnRunner:
     def __init__(self, runner: "GatewayRunner", ctx: TurnContext) -> None:
         self._runner = runner
         self._ctx = ctx
+        self._hidden_native_call_ids: set[str] = set()
 
     def progress_callback(self, event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
         """Callback invoked by agent on tool lifecycle events."""
@@ -4853,7 +5065,7 @@ class TurnRunner:
         # (e.g. {"skill_view": "all", "terminal": "off"} with global "all" →
         # terminal suppressed, skill_view shown.)
         _filter = ctx.tool_progress_filter or {}
-        _effective_mode = _filter.get(tool_name, ctx.progress_mode) if _filter else ctx.progress_mode
+        _effective_mode = _resolve_effective_mode(str(tool_name or ""), ctx.progress_mode, _filter)
         if _effective_mode == "off":
             return
 
@@ -5634,6 +5846,43 @@ class TurnRunner:
                 return
         except Exception:
             pass
+        # Apply the same per-tool/category filter as the ordinary progress rail;
+        # hidden starts must be remembered so a later completion cannot resurrect.
+        try:
+            _filter = getattr(self._ctx, "tool_progress_filter", None)
+            if (
+                not _filter
+                and self._ctx.progress_mode == "off"
+                and self._ctx._native_slack_task_cards
+            ):
+                _eff = "all"
+            else:
+                _eff = _resolve_effective_mode(
+                    str(tool_name or ""), self._ctx.progress_mode, _filter
+                )
+        except Exception:
+            _eff = self._ctx.progress_mode
+            try:
+                if (
+                    not getattr(self._ctx, "tool_progress_filter", None)
+                    and self._ctx.progress_mode == "off"
+                    and self._ctx._native_slack_task_cards
+                ):
+                    _eff = "all"
+            except Exception:
+                pass
+        if _eff in ("off", "log"):
+            cid = str(call_id or "")
+            if cid:
+                self._hidden_native_call_ids.add(cid)
+                try:
+                    if hasattr(self._ctx, "_hidden_native_call_ids") and hasattr(
+                        self._ctx._hidden_native_call_ids, "add"
+                    ):
+                        self._ctx._hidden_native_call_ids.add(cid)
+                except Exception:
+                    pass
+            return
         from agent.display import build_tool_preview
 
         ctx.progress_queue.put(
@@ -5659,6 +5908,54 @@ class TurnRunner:
                 return
         except Exception:
             pass
+        cid = str(call_id or "")
+        # Suppress completion for a call that was hidden at start time
+        if cid and cid in self._hidden_native_call_ids:
+            return
+        try:
+            if (
+                hasattr(self._ctx, "_hidden_native_call_ids")
+                and cid
+                and cid in self._ctx._hidden_native_call_ids
+            ):
+                return
+        except Exception:
+            pass
+        # Completion-only events (no prior start) must also be gated by effective mode
+        try:
+            _filter = getattr(self._ctx, "tool_progress_filter", None)
+            if (
+                not _filter
+                and self._ctx.progress_mode == "off"
+                and self._ctx._native_slack_task_cards
+            ):
+                _eff = "all"
+            else:
+                _eff = _resolve_effective_mode(
+                    str(tool_name or ""), self._ctx.progress_mode, _filter
+                )
+        except Exception:
+            _eff = self._ctx.progress_mode
+            try:
+                if (
+                    not getattr(self._ctx, "tool_progress_filter", None)
+                    and self._ctx.progress_mode == "off"
+                    and self._ctx._native_slack_task_cards
+                ):
+                    _eff = "all"
+            except Exception:
+                pass
+        if _eff in ("off", "log"):
+            if cid:
+                self._hidden_native_call_ids.add(cid)
+                try:
+                    if hasattr(self._ctx, "_hidden_native_call_ids") and hasattr(
+                        self._ctx._hidden_native_call_ids, "add"
+                    ):
+                        self._ctx._hidden_native_call_ids.add(cid)
+                except Exception:
+                    pass
+            return
         from agent.display import _detect_tool_failure
 
         is_error, _ = _detect_tool_failure(str(tool_name or "tool"), result)
@@ -7332,6 +7629,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     Manages the lifecycle of all platform adapters and routes
     messages to/from the agent.
     """
+
+    @dataclasses.dataclass
+    class _RunAgentDisplay:
+        """Per-turn display / progress settings resolved by ``_run_agent_display_settings``."""
+        user_config: Any = None
+        platform_key: Any = None
+        enabled_toolsets: Any = None
+        disabled_toolsets: Any = None
+        resolve_display_setting: Any = None
+        progress_mode: Any = None
+        progress_grouping: Any = None
+        _display_surface_mode: Any = None
+        tool_progress_enabled: Any = None
+        tool_progress_filter: Any = None
+        _live_status_mode: Any = None
+        _live_status_adapter: Any = None
+        log_mode_enabled: Any = None
+        log_queue: Any = None
+        interim_assistant_messages_enabled: Any = None
+        _thinking_enabled: Any = None
+        _native_slack_task_cards: Any = None
+        needs_progress_queue: Any = None
+        _generic_status_phrase: Any = None
 
     # Class-level defaults so partial construction in tests doesn't
     # blow up on attribute access.
@@ -30343,12 +30663,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Per-tool progress filter: allows overriding the global mode for
         # specific tools (e.g., show skill_manage even when global is "off").
-        # Check platform-level first, fall back to global display config.
-        _tool_progress_filter = (
-            _platform_cfg.get("tool_progress_filter")
-            if isinstance(_platform_cfg, dict)
-            else None
-        ) or _display_cfg.get("tool_progress_filter") or {}
+        # Uses the canonical display_config resolver so list shorthand,
+        # alias canonicalization, and platform-merge are handled in one place.
+        from gateway.display_config import resolve_tool_progress_filter
+
+        _tool_progress_filter = resolve_tool_progress_filter(user_config, platform_key)
         # If global is "off" but filter has entries that aren't "off", we still
         # need the progress queue active so filtered tools can emit messages.
         if not tool_progress_enabled and _tool_progress_filter and source.platform != Platform.WEBHOOK:

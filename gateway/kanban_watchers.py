@@ -11,6 +11,7 @@ behavior-neutral move that lifts ~1,000 LOC out of run.py.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import os
 import re
@@ -49,6 +50,117 @@ def _safe_review_reason(value: Any, limit: int = 160) -> str:
     if len(reason) > limit:
         reason = reason[: limit - 1].rstrip() + "…"
     return reason
+
+
+def _kanban_sanitize_text(text: str) -> str:
+    """Sanitize one human-facing Kanban message at the adapter boundary.
+
+    The lazy import avoids the gateway/run ↔ watcher import cycle. Any missing,
+    failing, or malformed sanitizer is fail-closed so a notifier never sends
+    its raw task title, summary, reason, or error.
+    """
+    try:
+        from gateway.run import _strict_watcher_sanitize
+    except Exception:
+        return "[REDACTED]"
+    try:
+        sanitized = _strict_watcher_sanitize(text)
+        return sanitized if isinstance(sanitized, str) else "[REDACTED]"
+    except Exception:
+        return "[REDACTED]"
+
+
+_KANBAN_TEXT_PAYLOAD_KEYS = frozenset({
+    "summary",
+    "reason",
+    "error",
+    "reviewer",
+    "implementer",
+    "status",
+})
+
+
+def _sanitize_kanban_delivery(delivery: dict) -> dict:
+    """Sanitize complete notifier values before the notifier clips or formats them.
+
+    ``_KanbanNotification`` owns the legacy formatting code and clips titles,
+    summaries, and reasons before its adapter call. A clipped credential-shaped
+    URL can evade a final sanitizer, so sanitize the delivery snapshot first.
+    The snapshot contains freshly loaded task/event objects and is never written
+    back to the board.
+    """
+    task = delivery.get("task")
+    if task is not None:
+        for attribute in ("title", "result", "assignee"):
+            value = getattr(task, attribute, None)
+            if isinstance(value, str):
+                setattr(task, attribute, _kanban_sanitize_text(value))
+
+    for event in delivery.get("events") or ():
+        payload = getattr(event, "payload", None)
+        if not isinstance(payload, dict):
+            continue
+        for key in _KANBAN_TEXT_PAYLOAD_KEYS:
+            value = payload.get(key)
+            if isinstance(value, str):
+                payload[key] = _kanban_sanitize_text(value)
+    return delivery
+
+
+class _KanbanSanitizingNotification:
+    """Notifier that sanitizes pre-clipped sources and assembled wake text."""
+
+    def __init__(self, runner: Any, delivery: dict, **kwargs: Any) -> None:
+        # We don't have the original _KanbanNotification class at McClean's large file;
+        # this shim sanitizes the delivery dict directly and will be used to wrap msg building.
+        self.delivery = _sanitize_kanban_delivery(delivery)
+        self.runner = runner
+
+    def sanitize_msg(self, msg: str) -> str:
+        return _kanban_sanitize_text(msg)
+
+
+class _KanbanSanitizingAdapter:
+    """Proxy an adapter and sanitize direct text sends from the notifier."""
+
+    def __init__(self, adapter: Any) -> None:
+        self._adapter = adapter
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._adapter, name)
+
+    async def handle_message(self, event: Any) -> Any:
+        """Sanitize push-wake text before forwarding the synthetic event."""
+        try:
+            safe_event = dataclasses.replace(
+                event,
+                text=_kanban_sanitize_text(str(getattr(event, "text", "") or "")),
+            )
+        except Exception as exc:
+            raise RuntimeError("kanban wake event sanitization failed") from exc
+        return await self._adapter.handle_message(safe_event)
+
+    async def send(self, chat_id: str, content: Any, *args: Any, **kwargs: Any) -> Any:
+        return await self._adapter.send(
+            chat_id,
+            _kanban_sanitize_text(str(content or "")),
+            *args,
+            **kwargs,
+        )
+
+
+class _KanbanSanitizingRunner:
+    """Runner facade that applies the notifier adapter proxy without editing its module."""
+
+    def __init__(self, runner: Any) -> None:
+        self._runner = runner
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._runner, name)
+
+    def _authorization_adapter(self, platform: Any, profile: Optional[str] = None) -> Any:
+        adapter = self._runner._authorization_adapter(platform, profile)
+        return _KanbanSanitizingAdapter(adapter) if adapter is not None else None
 
 
 def _resolve_auto_decompose_settings(
@@ -517,6 +629,7 @@ class GatewayKanbanWatchersMixin:
 
                 deliveries = await asyncio.to_thread(_collect)
                 for d in deliveries:
+                    d = _sanitize_kanban_delivery(d)
                     sub = d["sub"]
                     task = d["task"]
                     board_slug = d.get("board")
@@ -785,7 +898,7 @@ class GatewayKanbanWatchersMixin:
                                         sub["task_id"], _seed_exc,
                                     )
                             _send_res = await adapter.send(
-                                sub["chat_id"], msg, metadata=notify_metadata,
+                                sub["chat_id"], _kanban_sanitize_text(msg), metadata=notify_metadata,
                             )
                             # A SendResult(success=False) without an exception
                             # (returned by push-capable adapters on a genuine
@@ -961,6 +1074,7 @@ class GatewayKanbanWatchersMixin:
                             _synth += "\n\n" + t(
                                 "gateway.kanban.wake.guidance"
                             )
+                            _synth = _kanban_sanitize_text(_synth)
 
                         if not _is_push_adapter and _wake_kinds and _session_key:
                             # Wake self-post IS the delivery on this path —
