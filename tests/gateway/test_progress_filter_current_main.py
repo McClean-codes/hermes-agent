@@ -8313,6 +8313,200 @@ class TestStatefulStreamedEgress:
                 f"safe prefix lost in {ledger!r}"
             )
 
+    @pytest.mark.asyncio
+    async def test_stateful_on_delta_forced_failure_emits_REDACTED_no_raw_prefix_via_ledger(
+        self,
+    ):
+        """Forced stateful-redactor on_delta failure must fail closed.
+
+        Regression for Ada HIGH after 26ebb5b2: the exception handler
+        around stream_delta_cb previously forwarded raw
+        ``prefix sk-`` via _redact_progress_text(final=True).
+        This active-ledger probe forces _StatefulStreamRedactor.on_delta
+        to raise on a synthetic split provider-token prefix and asserts
+        no raw prefix reaches any adapter send/edit, the placeholder
+        is exactly [REDACTED], and the final flush remains masked.
+        """
+
+        import asyncio
+        import queue
+
+        from unittest.mock import MagicMock, patch
+
+        from gateway.config import (
+            GatewayConfig,
+            Platform,
+            PlatformConfig,
+            StreamingConfig,
+        )
+        from gateway.platforms.base import SendResult
+        from gateway.stream_consumer import StreamConsumerConfig
+        from gateway.turn_context import TurnContext
+        from gateway.run_turn_runner import TurnRunner
+
+        ledger: list[tuple[str, str]] = []
+
+        class Cap:
+            async def send(self, chat_id, content, reply_to=None, metadata=None):
+                ledger.append(("send", content))
+                return SendResult(success=True, message_id="m1")
+
+            async def edit_message(
+                self, chat_id, message_id, content, metadata=None, finalize=False
+            ):
+                ledger.append(("edit", content))
+                m = MagicMock()
+                m.success = True
+                m.message_id = message_id
+                return m
+
+            async def send_typing(self, chat_id, metadata=None):
+                return None
+
+            async def get_chat_info(self, chat_id):
+                return {"id": chat_id}
+
+            def supports_draft_streaming(self, **kw):
+                return False
+
+            def supports_native_streaming(self, **kw):
+                return False
+
+        cap = Cap()
+        ctx = TurnContext(
+            source=MagicMock(chat_id="C123", platform=Platform.SLACK),
+            _run_still_current=lambda: True,
+            progress_mode="all",
+            tool_progress_enabled=True,
+            tool_progress_filter={},
+            progress_queue=queue.Queue(),
+            log_queue=None,
+            last_progress_msg=[None],
+            last_tool=[None],
+            last_was_terminal_block=[False],
+            repeat_count=[0],
+            long_tool_hint_fired=[False],
+            agent_holder=[None],
+            _native_slack_task_cards=False,
+            result_holder=[None],
+            tools_holder=[None],
+            stream_consumer_holder=[None],
+            streaming_tts_consumer_holder=[None],
+            user_config={"display": {}},
+            resolve_display_setting=lambda cfg, plat, key: None,
+            event_message_id="evt-forced-redactor",
+            _status_thread_metadata={},
+        )
+
+        class Stub:
+            def __init__(self):
+                self.config = GatewayConfig(
+                    platforms={Platform.SLACK: PlatformConfig(enabled=True, token="x")}
+                )
+                self.config.streaming = StreamingConfig(
+                    enabled=True,
+                    transport="edit",
+                    edit_interval=0.05,
+                    buffer_threshold=1,
+                )
+
+            def _adapter_for_source(self, s):
+                return cap
+
+            def _build_stream_consumer_config(
+                self, source, scfg, adapter, on_missing_cursor="raise"
+            ):
+                return StreamConsumerConfig(
+                    edit_interval=0.05,
+                    buffer_threshold=1,
+                    cursor="",
+                    transport="edit",
+                    chat_type="channel",
+                ), None
+
+        runner = TurnRunner(Stub(), ctx)
+        sc, delta_cb, _, _ = runner._setup_stream_consumer("slack")
+        assert sc is not None and delta_cb is not None
+        task = asyncio.create_task(sc.run())
+        await asyncio.sleep(0.08)
+
+        hostile_full = "https://example.com/path/sk-abc1234567"
+        # Force stateful redactor failure on synthetic split provider prefix
+        with patch(
+            "gateway.run_turn_runner._StatefulStreamRedactor.on_delta",
+            side_effect=RuntimeError("forced on_delta boom"),
+        ):
+            delta_cb("prefix sk-")
+            await asyncio.sleep(0.22)
+            assert len(ledger) >= 1, (
+                f"expected at least one effect for forced failure, got {ledger!r}"
+            )
+            for kind, content in list(ledger):
+                assert "prefix sk-" not in content, (
+                    f"raw prefix leaked via {kind}: {content!r}"
+                )
+                # Any raw sk- fragment must be masked, not forwarded verbatim
+                if "sk-" in content:
+                    assert content == "[REDACTED]" or "***" in content, (
+                        f"raw sk- fragment leaked via {kind}: {content!r}"
+                    )
+            assert any(c == "[REDACTED]" for _, c in ledger), (
+                f"expected exact [REDACTED] placeholder, got {ledger!r}"
+            )
+            assert all(c == "[REDACTED]" for _, c in ledger), (
+                f"all effects must be [REDACTED] under forced failure, got {ledger!r}"
+            )
+            # Second split continuation while still forced must stay fail-closed
+            ledger.clear()
+            delta_cb("abc123")
+            await asyncio.sleep(0.18)
+            # Consumer may coalesce; if any effect emitted it must be REDACTED
+            # The StreamConsumer accumulates deltas, so two successive
+            # [REDACTED] deltas become [REDACTED][REDACTED]. Allow repetition.
+            for kind, content in list(ledger):
+                stripped = content.replace("[REDACTED]", "")
+                assert stripped == "", (
+                    f"continuation leaked raw via {kind}: {content!r}"
+                )
+            if ledger:
+                assert all(c.replace("[REDACTED]", "") == "" for _, c in ledger)
+
+        # Final flush after forced path must still mask the full hostile
+        runner._finish_stream_consumer(
+            {
+                "final_response": hostile_full,
+                "failed": False,
+                "interrupted": False,
+                "completed": True,
+            },
+            [],
+            sc,
+        )
+        await asyncio.sleep(0.35)
+        try:
+            await asyncio.wait_for(task, timeout=1.5)
+        except asyncio.TimeoutError:
+            task.cancel()
+            try:
+                await task
+            except BaseException:
+                pass
+        assert len(ledger) >= 1, f"expected at least one final effect, got {ledger!r}"
+        for kind, content in ledger:
+            assert hostile_full not in content, (
+                f"raw hostile leaked in final via {kind}: {content!r}"
+            )
+            assert "prefix sk-" not in content, (
+                f"raw prefix leaked in final via {kind}: {content!r}"
+            )
+            # After forced path the final must be masked
+            assert (
+                "***" in content
+                or "[REDACTED]" in content
+                or "sk-" in content
+                and "..." in content
+            ), f"final not masked {ledger!r}"
+
 
 class TestPFSharedFailClosedEgressV2:
     """PF_SHARED_FAIL_CLOSED_EGRESS_V2 comprehensive real-caller ledger coverage."""

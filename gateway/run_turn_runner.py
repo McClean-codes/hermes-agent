@@ -2409,13 +2409,7 @@ class TurnRunner:
                     sanitized = _stream_redactor.on_delta(text)
                 except Exception:
                     logger.debug("stateful redactor on_delta failed", exc_info=True)
-                    try:
-                        sanitized = _redact_progress_text(text)
-                    except Exception:
-                        sanitized = "[REDACTED]"
-                    # On failure of stateful path, forward sanitized chunk if it contains no raw credential
-                    if sanitized is None:
-                        sanitized = "[REDACTED]"
+                    sanitized = "[REDACTED]"
                 if sanitized is None:
                     return
                 for sink in delta_sinks:
