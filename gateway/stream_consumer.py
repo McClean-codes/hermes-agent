@@ -497,8 +497,9 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         logger.warning("%s boundary: finalize not confirmed, "
                        "falling back to send() for pre-prompt text (chat=%s)",
                        _reason, self.chat_id)
+        fallback_text = self._strict_egress_text(finalize_text)
         try:
-            if getattr(await self.adapter.send(self.chat_id, finalize_text), "success", False):
+            if getattr(await self.adapter.send(self.chat_id, fallback_text), "success", False):
                 return True
         except Exception as send_err:
             logger.warning("%s boundary: fallback send also failed: %s", _reason, send_err)

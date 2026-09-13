@@ -1600,15 +1600,18 @@ async def test_stream_transport_fails_closed_when_gateway_egress_helper_is_unava
 class _FallbackEgressLedgerAdapter:
     """Recording adapter that rejects instance wrapping like production adapters can."""
 
-    __slots__ = ("calls", "fail_send", "MAX_MESSAGE_LENGTH")
+    __slots__ = ("calls", "fail_send", "fail_stream_finalize", "MAX_MESSAGE_LENGTH")
 
-    def __init__(self, *, fail_send=False):
+    def __init__(self, *, fail_send=False, fail_stream_finalize=False):
         self.calls = []
         self.fail_send = fail_send
+        self.fail_stream_finalize = fail_stream_finalize
         self.MAX_MESSAGE_LENGTH = 600
 
     async def send_stream_frame(self, text, *, finalize=False, **kwargs):
         self.calls.append(("stream", text, finalize))
+        if finalize and self.fail_stream_finalize:
+            return False
         return True
 
     async def send_draft(self, *, chat_id, draft_id, content, metadata=None):
@@ -1699,3 +1702,83 @@ async def test_production_stream_fallback_direct_seams_fail_closed_on_redactor_f
     sends = [content for kind, content, _finalize in adapter.calls if kind == "send"]
     assert len(sends) == 4
     assert sends == ["[REDACTED]"] * 4
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("redaction_policy", ["identity", "disabled"])
+async def test_production_constructor_native_boundary_fallback_redacts_nonwrappable_adapter(
+    monkeypatch, redaction_policy,
+):
+    """A failed native finalize cannot bypass egress on a slot-only adapter."""
+    import agent.redact as redact_module
+
+    adapter = _FallbackEgressLedgerAdapter(fail_stream_finalize=True)
+    raw = "https://opaque-user:opaque-password@example.test/?token=opaque-query-secret"
+    if redaction_policy == "identity":
+        monkeypatch.setattr(redact_module, "redact_sensitive_text", lambda text, **kwargs: text)
+    else:
+        monkeypatch.setattr(redact_module, "_REDACT_ENABLED", False)
+
+    consumer = GatewayStreamConsumer(adapter, "chat", StreamConsumerConfig(cursor=""))
+    consumer._use_native_streaming = True
+    consumer._native_stream_opened = True
+    consumer._accumulated = raw
+
+    assert not hasattr(adapter, "_hermes_strict_send_boundary")
+    assert await consumer._finalize_boundary_stream("Approval") is True
+    assert adapter.calls == [
+        ("stream", "https://***@example.test/?token=***", True),
+        ("send", "https://***@example.test/?token=***", False),
+    ]
+    assert all(raw_value not in content for _kind, content, _finalize in adapter.calls
+               for raw_value in ("opaque-user", "opaque-password", "opaque-query-secret"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("primary_result", ["raise", "none", "non_string"])
+async def test_production_constructor_native_boundary_fallback_fails_closed_on_primary_redactor_result(
+    monkeypatch, primary_result,
+):
+    """A primary redactor failure emits only the fixed placeholder on fallback."""
+    import agent.redact as redact_module
+
+    def broken_redactor(text, **kwargs):
+        if primary_result == "raise":
+            raise RuntimeError("boom")
+        if primary_result == "none":
+            return None
+        return object()
+
+    monkeypatch.setattr(redact_module, "redact_sensitive_text", broken_redactor)
+    adapter = _FallbackEgressLedgerAdapter(fail_stream_finalize=True)
+    raw = "https://opaque-user:opaque-password@example.test/?token=opaque-query-secret"
+    consumer = GatewayStreamConsumer(adapter, "chat", StreamConsumerConfig(cursor=""))
+    consumer._use_native_streaming = True
+    consumer._native_stream_opened = True
+    consumer._accumulated = raw
+
+    assert await consumer._finalize_boundary_stream("Approval") is True
+    assert adapter.calls == [
+        ("stream", "[REDACTED]", True),
+        ("send", "[REDACTED]", False),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_production_constructor_native_boundary_fallback_preserves_benign_url(monkeypatch):
+    """The direct fallback sanitizer masks secrets without changing benign URLs."""
+    import agent.redact as redact_module
+
+    monkeypatch.setattr(redact_module, "redact_sensitive_text", lambda text, **kwargs: text)
+    adapter = _FallbackEgressLedgerAdapter(fail_stream_finalize=True)
+    benign = "See https://example.test/docs?a=1#section"
+    consumer = GatewayStreamConsumer(adapter, "chat", StreamConsumerConfig(cursor=""))
+    consumer._use_native_streaming = True
+    consumer._native_stream_opened = True
+    consumer._accumulated = benign
+
+    assert await consumer._finalize_boundary_stream("Approval") is True
+    assert adapter.calls == [
+        ("stream", benign, True),
+        ("send", benign, False),
+    ]
