@@ -11448,3 +11448,70 @@ class TestKanbanClippedUserinfoEgress(TestSEC_PF_KANBAN_WATCH_004_StrictNotifier
         assert self.LONG_OPAQUE not in message
         assert "***" in message or "[REDACTED]" in message
         assert task_id in message
+
+
+def test_unicode_split_query_key_is_safe_through_progress_and_status_rails():
+    """Raw Unicode-split query keys are safe even when the primary pass is identity."""
+    from gateway.run_turn_runner import _redact_progress_text
+
+    raw = "https://example.test/?to\u200bken=opaque-query-secret"
+    ctx = _make_ctx(
+        progress_mode="all",
+        tool_progress_filter={"terminal": "all"},
+    )
+
+    class StatusAdapter:
+        def __init__(self):
+            self.values = []
+
+        def set_status_text(self, _chat_id, value):
+            self.values.append(value)
+
+    status = StatusAdapter()
+    ctx._live_status_adapter = status
+    ctx._live_status_mode = "full"
+    runner = _make_runner(ctx)
+
+    with patch("agent.redact.redact_sensitive_text", side_effect=lambda text, **_: text):
+        runner.progress_callback(
+            "tool.started",
+            tool_name="terminal",
+            preview=raw,
+            args={"command": raw},
+        )
+        with patch("agent.display.build_status_phrase", return_value=raw):
+            # The production method imports build_status_phrase from agent.display;
+            # patch the source binding so the status effect receives raw model-shaped input.
+            runner._progress_live_status("tool.started", "terminal", {"command": raw})
+        sanitized = _redact_progress_text(raw)
+
+    messages = _drain(ctx.progress_queue)
+    assert messages
+    progress_payload = "\n".join(str(item) for item in messages)
+    assert "opaque-query-secret" not in progress_payload
+    assert status.values
+    assert all(value is None or "opaque-query-secret" not in value for value in status.values)
+    assert "opaque-query-secret" not in sanitized
+
+
+@pytest.mark.parametrize("malformed", [None, 12345])
+def test_unicode_split_query_key_fails_closed_for_malformed_primary_result(malformed):
+    from gateway.run_turn_runner import _redact_progress_text
+
+    raw = "https://example.test/?to\u200bken=opaque-query-secret"
+    ctx = _make_ctx(
+        progress_mode="all",
+        tool_progress_filter={"terminal": "all"},
+    )
+    runner = _make_runner(ctx)
+    with patch("agent.redact.redact_sensitive_text", return_value=malformed):
+        runner.progress_callback(
+            "tool.started",
+            tool_name="terminal",
+            preview=raw,
+            args={"command": raw},
+        )
+        sanitized = _redact_progress_text(raw)
+    payload = "\n".join(str(item) for item in _drain(ctx.progress_queue))
+    assert "opaque-query-secret" not in payload
+    assert "opaque-query-secret" not in sanitized

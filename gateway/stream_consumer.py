@@ -427,19 +427,12 @@ class GatewayStreamConsumer:
 
 
     def _strict_egress_text(self, text: Any) -> str:
-        """Sanitize model-derived text immediately before native or fallback send."""
+        """Sanitize model-derived text immediately before an adapter effect."""
         try:
-            import re
-
             from gateway.run_turn_runner import _redact_progress_text
 
             redacted = _redact_progress_text(text, final=True)
-            if not isinstance(redacted, str):
-                return "[REDACTED]"
-            # Native/fallback adapters are a non-wrappable boundary: do not
-            # preserve any userinfo identifier after the shared sanitizer masks
-            # its credential component.
-            return re.sub(r"(//)[^/\s?#@]+@", r"\1***@", redacted)
+            return redacted if isinstance(redacted, str) else "[REDACTED]"
         except Exception:
             return "[REDACTED]"
 
@@ -568,6 +561,7 @@ class GatewayStreamConsumer:
         finalize: bool = False,
     ):
         """Edit via the adapter, passing routing metadata when supported."""
+        content = self._strict_egress_text(content)
         kwargs = {
             "chat_id": self.chat_id,
             "message_id": message_id,
@@ -934,6 +928,11 @@ class GatewayStreamConsumer:
                 finalize_text = self._strict_egress_text(
                     self._accumulated or self._boundary_placeholder
                 )
+                # Interaction prompts use a fully opaque userinfo projection;
+                # normal stream edits retain the public username after masking
+                # only its credential component.
+                import re
+                finalize_text = re.sub(r"(//)[^/\s?#@]+@", r"\1***@", finalize_text)
                 finalize_ok = False
                 try:
                     result = await self.adapter.send_stream_frame(
@@ -2070,7 +2069,7 @@ class GatewayStreamConsumer:
 
         Returns the message_id so callers can thread subsequent chunks.
         """
-        text = self._clean_for_display(text)
+        text = self._strict_egress_text(self._clean_for_display(text))
         if not text.strip():
             return reply_to_id
         try:
@@ -2183,7 +2182,7 @@ class GatewayStreamConsumer:
 
         Retries each chunk once on flood-control failures with a short delay.
         """
-        final_text = self._clean_for_display(text)
+        final_text = self._strict_egress_text(self._clean_for_display(text))
         # Ensure balanced code fences before computing continuation,
         # so the closing fence reaches the user even when the fallback
         # only delivers the tail after mid-stream edits failed.
@@ -2287,12 +2286,16 @@ class GatewayStreamConsumer:
         last_successful_chunk = ""
         sent_any_chunk = False
         for chunk in chunks:
+            # Sanitize each retry immediately before the adapter effect.  The
+            # loop may run after a failed edit or flood-control delay, so do
+            # not rely only on the earlier whole-response projection.
+            safe_chunk = self._strict_egress_text(chunk)
             # Try sending with one retry on flood-control errors.
             result = None
             for attempt in range(2):
                 result = await self.adapter.send(
                     chat_id=self.chat_id,
-                    content=chunk,
+                    content=safe_chunk,
                     metadata=self._metadata_for_send(final=True),
                 )
                 if result.success:
@@ -2328,7 +2331,7 @@ class GatewayStreamConsumer:
                 self._fallback_prefix = ""
                 return
             sent_any_chunk = True
-            last_successful_chunk = chunk
+            last_successful_chunk = safe_chunk
             last_message_id = result.message_id or last_message_id
             # Each fallback chunk is a fresh platform message — notify
             # so any stale tool-progress bubble gets closed off.
@@ -2371,7 +2374,7 @@ class GatewayStreamConsumer:
         # substitutes the unsplit ledger so the sealed heads count as
         # delivered too (#78541).
         self._record_turn_final_payload(final_text)
-        self._last_sent_text = chunks[-1]
+        self._last_sent_text = last_successful_chunk
         self._fallback_prefix = ""
         self._fallback_preserve_partial_messages = False
 
@@ -2382,6 +2385,7 @@ class GatewayStreamConsumer:
         gateway can safely retry, and ``ambiguous`` when a timeout may have
         reached the platform already.
         """
+        final_text = self._strict_egress_text(final_text)
         # Tool/segment boundaries intentionally preserve the run-wide preview
         # IDs for normal fresh-final cleanup.  This recovery replaces only the
         # active final segment, so never delete an earlier finalized preamble.
@@ -2596,6 +2600,7 @@ class GatewayStreamConsumer:
             # set in tandem with _draft_id in run().  Disable to be safe.
             self._use_draft_streaming = False
             return False
+        text = self._strict_egress_text(text)
         # Carry the per-turn identity on EVERY frame (review B2): the
         # turn-final send goes out via _metadata_for_send, which stamps
         # reply_to_message_id — the relay adapter keys draft/seal state on
@@ -2652,9 +2657,12 @@ class GatewayStreamConsumer:
             _md = dict(self.metadata) if self.metadata else {}
             if self._initial_reply_to_id:
                 _md.setdefault("reply_to_message_id", self._initial_reply_to_id)
+            content = self._strict_egress_text(
+                self._last_sent_text or self._clean_for_display(self._accumulated)
+            )
             await self.adapter.abandon_open_draft(
                 self.chat_id,
-                self._last_sent_text or self._clean_for_display(self._accumulated),
+                content,
                 metadata=_md or None,
             )
         except Exception as e:
@@ -2679,7 +2687,7 @@ class GatewayStreamConsumer:
         tail = self._accumulated
         if visible and tail.startswith(visible):
             tail = tail[len(visible):].lstrip()
-        tail = self._clean_for_display(tail)
+        tail = self._strict_egress_text(self._clean_for_display(tail))
         if not tail.strip():
             return
         try:
@@ -2721,7 +2729,7 @@ class GatewayStreamConsumer:
 
     async def _send_commentary(self, text: str) -> bool:
         """Send a completed interim assistant commentary message."""
-        text = self._clean_for_display(text)
+        text = self._strict_egress_text(self._clean_for_display(text))
         if not text.strip():
             return False
         try:
@@ -2890,6 +2898,7 @@ class GatewayStreamConsumer:
 
         Ported from openclaw/openclaw#72038.
         """
+        text = self._strict_egress_text(text)
         # Every preview message the user has seen for this response: the
         # current one plus any continuation fragments tracked while streaming
         # (an oversized reply split across the platform's edit limit).  All of
@@ -3039,7 +3048,7 @@ class GatewayStreamConsumer:
         # Strip MEDIA: directives so they don't appear as visible text.
         # Media files are delivered as native attachments after the stream
         # finishes (via _deliver_media_from_response in gateway/run.py).
-        text = self._clean_for_display(text)
+        text = self._strict_egress_text(self._clean_for_display(text))
         # Preserve the pre-fence-closed form for stream-is-the-message draft
         # frames: appending a closing ``` to a mid-code-block frame makes
         # frame N not a prefix of frame N+1, so the connector's append-only

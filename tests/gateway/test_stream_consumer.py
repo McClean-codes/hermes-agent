@@ -3,7 +3,7 @@
 import asyncio
 import logging
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -1582,4 +1582,187 @@ def test_integrated_root_discord_extra_values_keep_precedence(tmp_path, monkeypa
     assert extra["persona_emoji"] == "explicit"
     assert extra["dynamic_reactions"] == "true"
     assert extra["reaction_cooldown"] == 7
+
+
+class _NonWrappableEgressAdapter:
+    """Production-shaped effect ledger with no instance ``__dict__``."""
+
+    __slots__ = ()
+    MAX_MESSAGE_LENGTH = 4096
+    effects = []
+    send_results = []
+    _next_id = 0
+
+    @classmethod
+    def reset(cls):
+        cls.effects = []
+        cls.send_results = []
+        cls._next_id = 0
+
+    @classmethod
+    def _result(cls):
+        cls._next_id += 1
+        if cls.send_results:
+            return cls.send_results.pop(0)
+        return SimpleNamespace(success=True, message_id=f"msg-{cls._next_id}")
+
+    async def send(self, chat_id, content=None, reply_to=None, metadata=None, text=None):
+        del chat_id, reply_to, metadata
+        content = content if content is not None else text
+        type(self).effects.append(("send", content))
+        return type(self)._result()
+
+    async def edit_message(
+        self, chat_id, message_id, content, finalize=False, metadata=None
+    ):
+        del chat_id, message_id, finalize, metadata
+        type(self).effects.append(("edit", content))
+        return SimpleNamespace(success=True, message_id="edited")
+
+    async def send_draft(self, chat_id, draft_id, content, metadata=None):
+        del chat_id, draft_id, metadata
+        type(self).effects.append(("draft", content))
+        return SimpleNamespace(success=True)
+
+    async def send_stream_frame(
+        self, content, *, finalize=False, chat_id=None, reply_to=None, turn_id=None
+    ):
+        del finalize, chat_id, reply_to, turn_id
+        type(self).effects.append(("native", content))
+        return True
+
+    async def delete_message(self, chat_id, message_id):
+        del chat_id
+        type(self).effects.append(("delete", message_id))
+        return True
+
+    async def abandon_open_draft(self, chat_id, content, metadata=None):
+        del chat_id, metadata
+        type(self).effects.append(("abandon", content))
+
+
+@pytest.mark.asyncio
+async def test_non_wrappable_stream_effect_ledger_sanitizes_all_content_families():
+    """Every direct stream adapter effect receives strict text, not raw model input."""
+    raw = "https://example.test/?to\u200bken=opaque-query-secret"
+    adapter = _NonWrappableEgressAdapter()
+    adapter.reset()
+
+    def make_consumer():
+        return GatewayStreamConsumer(
+            adapter,
+            "chat-1",
+            StreamConsumerConfig(cursor=""),
+        )
+
+    with patch("agent.redact.redact_sensitive_text", side_effect=lambda text, **_: text):
+        first = make_consumer()
+        await first._send_or_edit(raw, finalize=True)
+
+        edit = make_consumer()
+        await edit._send_or_edit("visible", finalize=True)
+        edit._message_id = "existing"
+        await edit._send_or_edit(raw, finalize=True)
+
+        split = make_consumer()
+        await split._send_new_chunk(raw, None, final=True)
+
+        fallback = make_consumer()
+        await fallback._send_fallback_final(raw)
+
+        empty_fallback = make_consumer()
+        assert await empty_fallback._send_empty_fallback_final(raw) == "delivered"
+
+        fresh = make_consumer()
+        fresh._message_id = "preview"
+        fresh._preview_message_ids = {"preview"}
+        assert await fresh._try_fresh_final(raw) is True
+
+        commentary = make_consumer()
+        assert await commentary._send_commentary(raw) is True
+
+        draft = make_consumer()
+        draft._draft_id = 1
+        assert await draft._send_draft_frame(raw) is True
+
+        native = make_consumer()
+        native._use_native_streaming = True
+        native._native_stream_opened = True
+        assert await native._send_or_edit(raw, finalize=True) is True
+
+        tail = make_consumer()
+        tail._fallback_final_send = True
+        tail._accumulated = raw
+        await tail._flush_segment_tail_on_edit_failure()
+
+        cursor = make_consumer()
+        cursor._message_id = "cursor-preview"
+        cursor._last_sent_text = raw + " ▉"
+        cursor.cfg.cursor = " ▉"
+        await cursor._try_strip_cursor()
+
+        boundary = make_consumer()
+        boundary._use_native_streaming = True
+        boundary._native_stream_opened = True
+        boundary._accumulated = raw
+        await boundary._handle_approval_boundary(None)
+
+    assert not hasattr(adapter, "__dict__")
+    content_effects = [payload for kind, payload in adapter.effects if kind != "delete"]
+    assert len(content_effects) >= 12
+    assert all(isinstance(payload, str) for payload in content_effects)
+    assert all("opaque-query-secret" not in payload for payload in content_effects)
+    assert all(raw not in payload for payload in content_effects)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "redactor",
+    [
+        pytest.param(lambda text, **_: text, id="identity"),
+        pytest.param(
+            lambda text, **_: (_ for _ in ()).throw(RuntimeError("boom")),
+            id="raise",
+        ),
+        pytest.param(lambda text, **_: None, id="none"),
+        pytest.param(lambda text, **_: 12345, id="non-string"),
+    ],
+)
+async def test_non_wrappable_stream_fails_closed_for_primary_redactor_variants(redactor):
+    raw = "https://example.test/?to\u200bken=opaque-query-secret"
+    adapter = _NonWrappableEgressAdapter()
+    adapter.reset()
+    consumer = GatewayStreamConsumer(adapter, "chat-1", StreamConsumerConfig(cursor=""))
+
+    with patch("agent.redact.redact_sensitive_text", side_effect=redactor):
+        assert await consumer._send_or_edit(raw, finalize=True) is True
+
+    payloads = [payload for kind, payload in adapter.effects if kind != "delete"]
+    assert payloads
+    assert all("opaque-query-secret" not in payload for payload in payloads)
+
+
+@pytest.mark.asyncio
+async def test_non_wrappable_stream_preserves_benign_url_and_retries_safely():
+    benign = "https://example.test/callback?state=public&redirect_uri=https%3A%2F%2Fclient.example%2Fcb"
+    raw = "https://example.test/?to\u200bken=opaque-query-secret"
+    adapter = _NonWrappableEgressAdapter()
+    adapter.reset()
+    _NonWrappableEgressAdapter.send_results = [
+        SimpleNamespace(success=False, error="rate limit", retry_after=0),
+        SimpleNamespace(success=True, message_id="retry-ok"),
+    ]
+    consumer = GatewayStreamConsumer(adapter, "chat-1", StreamConsumerConfig(cursor=""))
+
+    with patch("agent.redact.redact_sensitive_text", side_effect=lambda text, **_: text):
+        await consumer._send_fallback_final(raw)
+        benign_consumer = GatewayStreamConsumer(
+            adapter, "chat-1", StreamConsumerConfig(cursor="")
+        )
+        await benign_consumer._send_or_edit(benign, finalize=True)
+
+    sends = [payload for kind, payload in adapter.effects if kind == "send"]
+    assert len(sends) >= 3
+    assert all("opaque-query-secret" not in payload for payload in sends)
+    assert benign in sends
 

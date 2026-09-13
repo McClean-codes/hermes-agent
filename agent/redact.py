@@ -12,6 +12,7 @@ import os
 import re
 import shlex
 import threading
+import unicodedata
 from urllib.parse import unquote_plus
 
 # Basenames treated as ``.env`` files by _command_reads_env_file. Imported
@@ -443,7 +444,8 @@ _URL_USERINFO_RE = re.compile(
 # the key is decoded separately for classification. Values stop at query or
 # fragment pair separators; both ``&`` and ``;`` are valid in deployed URLs.
 _STRICT_URL_PARAM_RE = re.compile(
-    r"([?#&;])([A-Za-z0-9_.~+%\-]+)=([^#&;\s\"'<>]*)"
+    r"([?#&;])([^?#&=\r\n\t\f\v\x00-\x1f\x7f-\x9f\"'<>]+?)="
+    r"([^#&;\s\"'<>]*)"
 )
 
 # Match userinfo in both absolute (``scheme://user:pass@host``) and
@@ -635,7 +637,7 @@ def _redact_query_string(query: str) -> str:
             parts.append(pair)
             continue
         key, _, value = pair.partition("=")
-        if key.lower() in _SENSITIVE_QUERY_PARAMS:
+        if _canonical_url_param_name(key) in _SENSITIVE_QUERY_PARAMS:
             parts.append(f"{key}=***")
         else:
             parts.append(pair)
@@ -670,15 +672,27 @@ def _redact_url_userinfo(text: str) -> str:
     )
 
 
+def _compact_url_param_name(name: str) -> str:
+    """Remove Unicode format/separator characters used to split query keys."""
+    return "".join(
+        char
+        for char in name
+        if not (
+            unicodedata.category(char) == "Cf"
+            or unicodedata.category(char).startswith("Z")
+        )
+    )
+
+
 def _canonical_url_param_name(name: str) -> str:
-    """Decode a URL parameter name for bounded, case-insensitive matching."""
+    """Decode and compact a URL parameter name for bounded matching."""
     decoded = name
     for _ in range(3):
         next_value = unquote_plus(decoded)
         if next_value == decoded:
             break
         decoded = next_value
-    return decoded.casefold().replace("-", "_")
+    return _compact_url_param_name(decoded).casefold().replace("-", "_")
 
 
 def _redact_strict_url_credentials(text: str) -> str:

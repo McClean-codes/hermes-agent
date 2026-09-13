@@ -15,6 +15,7 @@ import queue
 import re
 import threading
 import time
+import unicodedata
 from contextlib import suppress
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
@@ -36,8 +37,20 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 logger = logging.getLogger("gateway.run")
 
 
+def _compact_query_key(name: str) -> str:
+    """Remove Unicode format/separator characters used to split query keys."""
+    return "".join(
+        char
+        for char in name
+        if not (
+            unicodedata.category(char) == "Cf"
+            or unicodedata.category(char).startswith("Z")
+        )
+    )
+
+
 def _normalize_param_name(name: str) -> str:
-    """Normalize a query param name for sensitive comparison: 3-round unquote_plus, casefold, hyphen/space to underscore."""
+    """Normalize a query param name for bounded sensitive comparison."""
     from urllib.parse import unquote_plus
 
     decoded = name
@@ -49,7 +62,7 @@ def _normalize_param_name(name: str) -> str:
         if nxt == decoded:
             break
         decoded = nxt
-    return decoded.casefold().replace("-", "_").replace(" ", "_")
+    return _compact_query_key(decoded).casefold().replace("-", "_")
 
 
 def _get_normalized_sensitive_set():
@@ -227,7 +240,9 @@ def _canonicalize_query_whitespace(text: str, normalized_set) -> str:
             return text
     import re
 
-    pattern = re.compile(r"([?&#;])\s*([^=\s&;#\"'<>]+?)\s*=")
+    pattern = re.compile(
+        r"([?&#;])\s*([^=?&#;\"'<>\x00-\x1f\x7f-\x9f]+?)\s*="
+    )
     segments = []
     for m in pattern.finditer(text):
         key = m.group(2)
@@ -307,7 +322,9 @@ def _find_safe_prefix_len(text: str, normalized_set) -> int:
     candidates = []
     import re
 
-    pattern = re.compile(r"([?&#;])\s*([^=\s&;#\"'<>]+?)\s*=")
+    pattern = re.compile(
+        r"([?&#;])\s*([^=?&#;\"'<>\x00-\x1f\x7f-\x9f]+?)\s*="
+    )
     for m in pattern.finditer(text):
         key = m.group(2)
         if not _is_sensitive_key(key, normalized_set):
@@ -464,10 +481,13 @@ def _strict_url_param_fixup(text: str, normalized_set) -> str:
     import re
 
     if normalized_set is None:
-        return text
-    # Whitespace-tolerant: allow space/tab/newline around delimiter, key, and '=' so
-    # padded forms like "?  token = value" or "&api_key\t=\nvalue" are still masked.
-    pat = re.compile(r"([?#&;])\s*([A-Za-z0-9_.~+%\-]+)\s*=\s*([^#&;\s\"'<>]*)")
+        return "[REDACTED]" if text and text.strip() else ""
+    # Keep Unicode format/separator characters inside the key capture so the
+    # normalized classifier can compact them before sensitive-key matching.
+    pat = re.compile(
+        r"([?#&;])\s*([^=?#&;\"'<>\x00-\x1f\x7f-\x9f]+?)\s*="
+        r"([^#&;\s\"'<>]*)"
+    )
 
     def repl(m):
         key = m.group(2)
@@ -643,6 +663,8 @@ def _redact_progress_text(text: str | None, *, final: bool = True) -> str:
             redacted = redact_sensitive_text(
                 canonical, force=True, redact_url_credentials=True
             )
+            if not isinstance(redacted, str):
+                return "[REDACTED]"
             try:
                 fixed = _strict_url_param_fixup(redacted, normalized_set)
                 fixed = _strict_url_userinfo_fixup(fixed)

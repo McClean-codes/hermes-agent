@@ -745,3 +745,43 @@ def test_review_requested_does_not_wake_a_notify_only_subscription(
     assert adapter.handled == [], (
         "notify-only subscriptions must not be woken by a review handoff"
     )
+
+
+def test_notifier_sanitizes_unicode_split_query_key_at_delivery_boundary(
+    tmp_path, monkeypatch,
+):
+    """SQLite subscription delivery must never publish a raw Unicode-split key."""
+    raw = "https://example.test/?to\u200bken=opaque-query-secret"
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="unicode egress task", assignee="worker")
+        kb.add_notify_sub(
+            conn,
+            task_id=task_id,
+            platform="telegram",
+            chat_id="chat-1",
+            notifier_profile="main",
+            delivery_mode="notify",
+        )
+        kb.block_task(conn, task_id, reason=raw, kind="needs_input")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner._active_profile_name = lambda: "main"
+    from unittest.mock import patch
+
+    with patch("agent.redact.redact_sensitive_text", side_effect=lambda text, **_: text):
+        asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    message = adapter.sent[0]["text"]
+    assert "opaque-query-secret" not in message
+    assert "to\u200bken=***" in message
+    assert task_id in message

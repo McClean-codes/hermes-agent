@@ -1078,6 +1078,23 @@ class TestMaskSecretControlStripping:
     def test_printable_mask_unchanged(self):
         assert mask_secret("abcdef0123456789zzzz") == "abcd...zzzz"
 
+
+class TestStrictUrlQueryKeyNormalization:
+    def test_unicode_format_split_sensitive_key_is_redacted(self):
+        from agent.redact import _redact_strict_url_credentials
+
+        raw = "https://example.test/?to\u200bken=opaque-query-secret"
+        result = _redact_strict_url_credentials(raw)
+
+        assert result == "https://example.test/?to\u200bken=***"
+        assert "opaque-query-secret" not in result
+
+    def test_benign_url_controls_are_preserved(self):
+        from agent.redact import _redact_strict_url_credentials
+
+        url = "https://example.test/callback?state=public&redirect_uri=https%3A%2F%2Fclient.example%2Fcb"
+        assert _redact_strict_url_credentials(url) == url
+
     def test_all_control_value_returns_empty_fallback(self):
         assert mask_secret("\n\x85\u200b") == ""
         assert mask_secret("\n\x85\u200b", empty="(not set)") == "(not set)"
