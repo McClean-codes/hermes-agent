@@ -8568,7 +8568,7 @@ class TestPFSharedFailClosedEgressV2:
                 "network",
                 "//alice:opaque .tail@ex.test/p",
                 ["opaque", ".tail"],
-                "//alice:***@ex.test/p",
+                "//***@ex.test/p",
             ),
             (
                 "hyphen",
@@ -8604,7 +8604,7 @@ class TestPFSharedFailClosedEgressV2:
                 "userinfo_nl",
                 "https://alice:longOpaqueUserInfo1234567890ABCDEFExtraLongTail1234567890\nOpaqueTail@ex.com/p",
                 ["longOpaqueUserInfo1234567890ABCDEFExtraLongTail1234567890"],
-                "https://alice:***@ex.com/p",
+                "https://***@ex.com/p",
             ),
         ]
         for name, hostile, opaque_values, expected_mask in variants:

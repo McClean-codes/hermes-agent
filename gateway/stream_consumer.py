@@ -432,7 +432,19 @@ class GatewayStreamConsumer:
             from gateway.run_turn_runner import _redact_progress_text
 
             redacted = _redact_progress_text(text, final=True)
-            return redacted if isinstance(redacted, str) else "[REDACTED]"
+            if not isinstance(redacted, str):
+                return "[REDACTED]"
+            # Stream output is a non-navigation egress boundary.  Once the
+            # shared strict projection has identified a user:password-shaped
+            # authority (the password is now ``***``), hide the username too so
+            # opaque credential-shaped userinfo cannot reach any direct effect.
+            import re
+
+            return re.sub(
+                r"(//)[^/\s?#@:]+:\*\*\*@",
+                r"\1***@",
+                redacted,
+            )
         except Exception:
             return "[REDACTED]"
 
@@ -928,9 +940,8 @@ class GatewayStreamConsumer:
                 finalize_text = self._strict_egress_text(
                     self._accumulated or self._boundary_placeholder
                 )
-                # Interaction prompts use a fully opaque userinfo projection;
-                # normal stream edits retain the public username after masking
-                # only its credential component.
+                # The final adapter egress is non-navigation: userinfo is
+                # fully opaque after strict redaction, including the username.
                 import re
                 finalize_text = re.sub(r"(//)[^/\s?#@]+@", r"\1***@", finalize_text)
                 finalize_ok = False

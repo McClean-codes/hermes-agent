@@ -1642,9 +1642,21 @@ class _NonWrappableEgressAdapter:
 
 
 @pytest.mark.asyncio
-async def test_non_wrappable_stream_effect_ledger_sanitizes_all_content_families():
+@pytest.mark.parametrize(
+    "raw",
+    [
+        pytest.param(
+            "https://opaque-user:opaque-password@example.test/?token=opaque-query-secret",
+            id="credential-shaped-url",
+        ),
+        pytest.param(
+            "https://example.test/?to\u200bken=opaque-query-secret",
+            id="unicode-split-query-key",
+        ),
+    ],
+)
+async def test_non_wrappable_stream_effect_ledger_sanitizes_all_content_families(raw):
     """Every direct stream adapter effect receives strict text, not raw model input."""
-    raw = "https://example.test/?to\u200bken=opaque-query-secret"
     adapter = _NonWrappableEgressAdapter()
     adapter.reset()
 
@@ -1711,7 +1723,8 @@ async def test_non_wrappable_stream_effect_ledger_sanitizes_all_content_families
     content_effects = [payload for kind, payload in adapter.effects if kind != "delete"]
     assert len(content_effects) >= 12
     assert all(isinstance(payload, str) for payload in content_effects)
-    assert all("opaque-query-secret" not in payload for payload in content_effects)
+    for secret in ("opaque-user", "opaque-password", "opaque-query-secret"):
+        assert all(secret not in payload for payload in content_effects), secret
     assert all(raw not in payload for payload in content_effects)
 
 

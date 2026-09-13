@@ -752,8 +752,9 @@ def test_notifier_sanitizes_unicode_split_query_key_at_delivery_boundary(
 ):
     """SQLite subscription delivery must never publish a raw Unicode-split key."""
     raw = "https://example.test/?to\u200bken=opaque-query-secret"
-    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
-    monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
+    kanban_home = tmp_path / "hermes-home"
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(kanban_home))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(kanban_home / "kanban.db"))
     monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
     kb.init_db()
 
