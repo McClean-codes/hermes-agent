@@ -449,3 +449,27 @@ class TestRichAwareOverflow:
         adapter.delete_message.assert_awaited_once_with("12345", "preview1")
         assert consumer.final_response_sent is True
 
+
+@pytest.mark.asyncio
+async def test_real_draft_constructor_redacts_draft_and_final_effects():
+    adapter = _make_draft_capable_adapter()
+    raw = "https://opaque-user:opaque-password@example.test/?token=opaque-query-secret"
+    consumer = GatewayStreamConsumer(
+        adapter, "12345", StreamConsumerConfig(
+            transport="auto", chat_type="dm", edit_interval=0.01,
+            buffer_threshold=5, cursor="",
+        ),
+    )
+
+    consumer.on_delta(raw)
+    task = asyncio.create_task(consumer.run())
+    await asyncio.sleep(0.05)
+    consumer.finish()
+    await task
+
+    contents = [call["content"] for call in adapter.draft_calls]
+    contents.extend(call.kwargs.get("content", "") for call in adapter.send.call_args_list)
+    assert contents
+    assert all("opaque-query-secret" not in content for content in contents)
+    assert all("opaque-password" not in content for content in contents)
+    assert all("opaque-user" not in content for content in contents)

@@ -441,7 +441,11 @@ class GatewayTurnMixin:
                     session_info = await asyncio.to_thread(self._reset_notice_session_info, source)
                     if session_info:
                         notice = f"{notice}\n\n{session_info}"
-                await adapter.send(source.chat_id, notice, metadata=self._thread_metadata_for_source(source))
+                from gateway.run import _strict_gateway_egress_text
+                await adapter.send(
+                    source.chat_id, _strict_gateway_egress_text(notice),
+                    metadata=self._thread_metadata_for_source(source),
+                )
         except Exception as e:
             logger.debug("Auto-reset notification failed (non-fatal): %s", e)
 
@@ -778,7 +782,10 @@ class GatewayTurnMixin:
         try:
             _adapter = self._adapter_for_source(source)
             if _adapter and source.chat_id:
-                await _adapter.send(source.chat_id, message, metadata=meta)
+                from gateway.run import _strict_gateway_egress_text
+                await _adapter.send(
+                    source.chat_id, _strict_gateway_egress_text(message), metadata=meta,
+                )
         except Exception as _werr:
             logger.warning("Failed to deliver %s to user: %s", what, _werr)
 
@@ -1077,8 +1084,8 @@ class GatewayTurnMixin:
             )
             if not _hyg_fence_cancelled:
                 # Force-redact: provider exception text may contain credentials; this reaches users.
-                from agent.redact import redact_sensitive_text
-                _err = redact_sensitive_text(getattr(_comp, "_last_summary_error", None) or "unknown error", force=True)
+                from gateway.run import _strict_gateway_egress_text
+                _err = _strict_gateway_egress_text(getattr(_comp, "_last_summary_error", None) or "unknown error")
                 await self._hmwa_hygiene_notify(
                     source, attempt.meta, "⚠️ Context compression aborted "
                     f"({_err}). No messages were dropped — "
@@ -1436,7 +1443,7 @@ class GatewayTurnMixin:
     def _hmwa_prepend_reasoning(self, agent_result, response, source, _intentional_silence):
         """Prepend the last reasoning block when show_reasoning is on for this platform. Mattermost
         requires an explicit per-platform opt-in (scratch text, not final-answer content)."""
-        from gateway.run import _load_gateway_config, _platform_config_key, _resolve_gateway_display_bool
+        from gateway.run import _load_gateway_config, _platform_config_key, _resolve_gateway_display_bool, _strict_gateway_egress_text
         try:
             _show_reasoning_effective = _resolve_gateway_display_bool(
                 _load_gateway_config(), _platform_config_key(source.platform), "show_reasoning",
@@ -1447,7 +1454,7 @@ class GatewayTurnMixin:
             _show_reasoning_effective = (
                 False if source.platform == Platform.MATTERMOST else getattr(self, "_show_reasoning", False)
             )
-        last_reasoning = agent_result.get("last_reasoning")
+        last_reasoning = _strict_gateway_egress_text(agent_result.get("last_reasoning") or "")
         if not (_show_reasoning_effective and response and not _intentional_silence and last_reasoning):
             return response
         from gateway.stream_consumer_fences import escape_code_fences_for_display
@@ -1768,6 +1775,10 @@ class GatewayTurnMixin:
             logger.info("Suppressing intentional silence marker for session %s", session_entry.session_id)
             response = ""
 
+        # Re-sanitize after reasoning/footer augmentation and before any adapter effect.
+        from gateway.run import _strict_gateway_egress_text
+        response = _strict_gateway_egress_text(response)
+        _footer_line = _strict_gateway_egress_text(_footer_line or "") if _footer_line else _footer_line
         adapter = self._adapter_for_source(source)
         # Auto voice reply (TTS audio before the text) unless streaming TTS already delivered audio.
         _streaming_tts_done = adapter is not None and bool(
@@ -2175,6 +2186,7 @@ class GatewayTurnMixin:
             logger.warning("No adapter for platform %s in background task %s", source.platform, task_id)
             return
         _thread_metadata = self._thread_metadata_for_source(source, event_message_id)
+        from gateway.run import _strict_gateway_egress_text
 
         try:
             user_config = _load_gateway_config()
@@ -2182,7 +2194,9 @@ class GatewayTurnMixin:
             if not runtime_kwargs.get("api_key"):
                 await adapter.send(
                     source.chat_id,
-                    f"❌ Background task {task_id} failed: no provider credentials configured.",
+                    _strict_gateway_egress_text(
+                        f"❌ Background task {task_id} failed: no provider credentials configured."
+                    ),
                     metadata=_thread_metadata,
                 )
                 return
@@ -2250,24 +2264,33 @@ class GatewayTurnMixin:
             # Fresh conversation, so history_offset=0: every message in the run belongs to this turn.
             if response:
                 response = repair_explicit_computer_use_media_paths(response, result.get("messages", []))
+                response = _strict_gateway_egress_text(response)
 
-            preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
-            header = f'✅ Background task complete\nPrompt: "{preview}"\n\n'
+            preview_source = _strict_gateway_egress_text(prompt)
+            preview = _strict_gateway_egress_text(preview_source[:60] + ("..." if len(preview_source) > 60 else ""))
+            header = _strict_gateway_egress_text(f'✅ Background task complete\nPrompt: "{preview}"\n\n')
             images, media_files, text_content = [], [], ""
             if response:
                 media_files, response = adapter.extract_media(response)
                 media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
                 images, text_content = adapter.extract_images(response)
             if text_content:
-                await adapter.send(chat_id=source.chat_id, content=header + text_content, metadata=_thread_metadata)
+                await adapter.send(
+                    chat_id=source.chat_id,
+                    content=_strict_gateway_egress_text(header + text_content),
+                    metadata=_thread_metadata,
+                )
             elif not images and not media_files:
                 await adapter.send(
-                    chat_id=source.chat_id, content=header + "(No response generated)", metadata=_thread_metadata,
+                    chat_id=source.chat_id,
+                    content=_strict_gateway_egress_text(header + "(No response generated)"),
+                    metadata=_thread_metadata,
                 )
             for image_url, alt_text in (images or []):
                 with suppress(Exception):
                     await adapter.send_image(
-                        chat_id=source.chat_id, image_url=image_url, caption=alt_text, metadata=_thread_metadata,
+                        chat_id=source.chat_id, image_url=_strict_gateway_egress_text(image_url),
+                        caption=_strict_gateway_egress_text(alt_text), metadata=_thread_metadata,
                     )
             # Route each media file by type (voice bubble / video / image / document), as the
             # streaming + kanban paths do.
@@ -2293,7 +2316,7 @@ class GatewayTurnMixin:
             logger.exception("Background task %s failed", task_id)
             with suppress(Exception):
                 await adapter.send(
-                    chat_id=source.chat_id, content=f"❌ Background task {task_id} failed: {e}",
+                    chat_id=source.chat_id, content=_strict_gateway_egress_text(f"❌ Background task {task_id} failed: {e}"),
                     metadata=_thread_metadata,
                 )
 
@@ -3245,11 +3268,14 @@ class GatewayTurnMixin:
         if not _warn_adapter:
             return
         try:
+            from gateway.run import _strict_gateway_egress_text
             await _warn_adapter.send(
-                source.chat_id, f"⚠️ No activity for {int(worker.agent_warning // 60) or 1} min. "
-                "If the agent does not respond soon, it will be timed out in "
-                f"{int((worker.agent_timeout - worker.agent_warning) // 60) or 1} min. "
-                "You can continue waiting or use /reset.",
+                source.chat_id, _strict_gateway_egress_text(
+                    f"⚠️ No activity for {int(worker.agent_warning // 60) or 1} min. "
+                    "If the agent does not respond soon, it will be timed out in "
+                    f"{int((worker.agent_timeout - worker.agent_warning) // 60) or 1} min. "
+                    "You can continue waiting or use /reset."
+                ),
                 metadata=_interim_metadata(_status_thread_metadata),
             )
         except Exception as _warn_err:
@@ -3832,7 +3858,7 @@ class GatewayTurnMixin:
 
         Interval: agent.gateway_notify_interval / HERMES_AGENT_NOTIFY_INTERVAL (default 180s; 0 or
         long_running_notifications=off disables)."""
-        from gateway.run import _float_env, _interim_metadata, _non_conversational_metadata
+        from gateway.run import _float_env, _interim_metadata, _non_conversational_metadata, _strict_gateway_egress_text
         _notify_start = time.time()
         _NOTIFY_INTERVAL = _float_env("HERMES_AGENT_NOTIFY_INTERVAL", 180)
         _long_running_mode = disp._display_surface_mode("long_running_notifications", default=True, allow_generic=True)
@@ -3867,7 +3893,7 @@ class GatewayTurnMixin:
                         _parts.append(str(_action))
                     if _parts:
                         _status_detail = " — " + ", ".join(_parts)
-            _heartbeat_text = (
+            _heartbeat_text = _strict_gateway_egress_text(
                 disp._generic_status_phrase("status")
                 if _long_running_mode == "generic"
                 else f"⏳ Working — {_elapsed_mins} min{_status_detail}"

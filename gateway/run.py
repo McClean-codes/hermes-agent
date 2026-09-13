@@ -28,6 +28,7 @@ from contextvars import copy_context
 from pathlib import Path
 from datetime import datetime
 from typing import Callable, Dict, Optional, Any, List, Tuple, cast
+from urllib.parse import unquote_plus
 
 from agent.async_utils import safe_schedule_threadsafe
 from agent.conversation_compression import (
@@ -543,50 +544,131 @@ def _gateway_loop_exception_handler(
     loop.default_exception_handler(context)
 
 
+_EGRESS_REDACTION_PLACEHOLDER = "[REDACTED]"
+_EGRESS_SENSITIVE_URL_PARAM_NAMES = frozenset({
+    "access_token", "refresh_token", "id_token", "token", "api_key", "apikey",
+    "client_secret", "password", "auth", "jwt", "session", "secret", "key",
+    "code", "signature", "x_amz_signature",
+})
+# The primary redactor intentionally leaves ordinary web URLs unchanged. These
+# egress-only passes preserve URL spelling while masking credential-bearing
+# query values and userinfo, including percent-encoded and control-split keys.
+_EGRESS_URL_PARAM_RE = re.compile(r"([?&#;])([A-Za-z0-9_.~+%\-]+)=([^#&;\s\"'<>]*)")
+_EGRESS_SPLIT_URL_PARAM_RE = re.compile(
+    r"([?&#;])((?:[A-Za-z0-9_.~+%\-][\x00-\x20]?){1,96})=([^#&;\"'<>]*)"
+)
+_EGRESS_URL_USERINFO_RE = re.compile(
+    r"(?P<prefix>(?:[A-Za-z][A-Za-z0-9+.-]*:)?//)(?P<userinfo>[^/\s?#@]+)@"
+)
+
+
+def _egress_url_param_name(value: str) -> str:
+    decoded = value
+    for _ in range(3):
+        try:
+            next_value = unquote_plus(decoded)
+        except Exception:
+            return ""
+        if next_value == decoded:
+            break
+        decoded = next_value
+    return "".join(
+        ch for ch in decoded.casefold().replace("-", "_")
+        if not ord(ch) < 32 and ord(ch) not in {0x200b, 0x200c, 0x200d}
+    )
+
+
+def _strict_egress_url_redaction(text: str) -> str:
+    """Mask credential-bearing URL components without changing benign URLs."""
+    def _param_sub(match):
+        if _egress_url_param_name(match.group(2)) in _EGRESS_SENSITIVE_URL_PARAM_NAMES:
+            return f"{match.group(1)}{match.group(2)}=***"
+        return match.group(0)
+
+    # Run the control-tolerant pass first: a query can contain several
+    # parameters and a match beginning at ``?`` must not hide a later ``;``
+    # parameter from this pass.
+    text = _EGRESS_SPLIT_URL_PARAM_RE.sub(_param_sub, text)
+    text = _EGRESS_URL_PARAM_RE.sub(_param_sub, text)
+
+    def _userinfo_sub(match):
+        userinfo = match.group("userinfo")
+        if userinfo in {"***", _EGRESS_REDACTION_PLACEHOLDER}:
+            return match.group(0)
+        return f"{match.group('prefix')}***@"
+
+    return _EGRESS_URL_USERINFO_RE.sub(_userinfo_sub, text)
+
+
+def _egress_url_has_unmasked_credentials(text: str) -> bool:
+    """Validate the strict URL pass before allowing an effect to run."""
+    for pattern in (_EGRESS_URL_PARAM_RE, _EGRESS_SPLIT_URL_PARAM_RE):
+        for match in pattern.finditer(text):
+            if (
+                _egress_url_param_name(match.group(2)) in _EGRESS_SENSITIVE_URL_PARAM_NAMES
+                and match.group(3) not in {"", "***", _EGRESS_REDACTION_PLACEHOLDER}
+            ):
+                return True
+    for match in _EGRESS_URL_USERINFO_RE.finditer(text):
+        if match.group("userinfo") not in {"***", _EGRESS_REDACTION_PLACEHOLDER}:
+            return True
+    return False
+
+
 def _redact_gateway_user_facing_secrets(text: str) -> str:
-    """Secret redaction before text can leave the gateway.
+    """Strictly sanitize text before it leaves a gateway effect boundary.
 
-    Shared ``redact_sensitive_text`` with ``force=True`` (holds even when ``security.redact_secrets`` is off);
-    ``_GATEWAY_SECRET_PATTERNS`` is a second pass so redaction degrades gracefully if that import fails.
-
-    Delegates to the authoritative ``agent.redact.redact_sensitive_text`` — the same Tirith-grade redactor
-    already applied to logs, tool output, and approval-command prompts — so the outbound chat path masks the
-    full credential set the startup banner promises ("chat responses are scrubbed before delivery"), not a
-    divergent subset. See #23810.
+    The authoritative redactor is mandatory. A raised exception, non-string
+    result, or unmasked URL after the egress pass fails closed to a fixed
+    placeholder; no weaker local fallback may receive the raw value.
     """
-    redacted = str(text or "")
     try:
+        redacted = str(text or "")
         from agent.redact import redact_sensitive_text
 
-        redacted = redact_sensitive_text(redacted, force=True)
+        redacted = redact_sensitive_text(
+            redacted, force=True, redact_url_credentials=True,
+        )
+        if not isinstance(redacted, str):
+            raise TypeError("authoritative redactor returned a non-string")
+        redacted = _strict_egress_url_redaction(redacted)
+        for pattern in _GATEWAY_SECRET_PATTERNS:
+            redacted = pattern.sub(
+                lambda m: (m.group(1) if m.lastindex else "") + _EGRESS_REDACTION_PLACEHOLDER,
+                redacted,
+            )
+        # A formatter or an unusual encoded/split shape must never undo the
+        # strict URL guarantee, so validate after every transformation.
+        redacted = _strict_egress_url_redaction(redacted)
+        if _egress_url_has_unmasked_credentials(redacted):
+            raise ValueError("strict URL egress redaction could not prove safety")
+        return redacted
     except Exception:
-        pass  # fail-soft: the local pattern pass below still runs rather than leaking raw text to chat
-    for pattern in _GATEWAY_SECRET_PATTERNS:
-        redacted = pattern.sub(lambda m: (m.group(1) if m.lastindex else "") + "[REDACTED]", redacted)
-    return redacted
+        logger.debug("gateway egress redaction unavailable; using fixed placeholder", exc_info=True)
+        return _EGRESS_REDACTION_PLACEHOLDER
+
+
+def _strict_gateway_egress_text(text: Any) -> str:
+    """Common fail-closed sanitizer for every user-facing gateway effect."""
+    return _redact_gateway_user_facing_secrets(text)
 
 
 def _redact_approval_command(cmd: "str | None") -> str:
     """Redact credentials from a command before it goes into an approval prompt.
 
-    Else a Tirith-flagged credential echoes verbatim to chat; ``force=True`` holds even with redaction off.
-
-    Tirith's *findings* are already redacted, but the gateway approval prompt is built from the raw command
-    string, so a credential-shaped value Tirith flagged would otherwise be echoed verbatim to the chat
-    platform (#48456). Uses ``redact_sensitive_text(force=True)`` — the same Tirith-grade redactor — so the
-    prompt honors redaction even when ``security.redact_secrets`` is off. Module-level so the wiring is
-    unit-testable (the call site is a deeply nested gateway closure that cannot be driven directly).
+    The approval command is a user-facing effect, so it uses the same strict,
+    fail-closed URL-aware boundary as progress and final replies.
     """
-    from agent.redact import redact_sensitive_text
-
-    return redact_sensitive_text(str(cmd or ""), force=True)
+    return _strict_gateway_egress_text(cmd or "")
 
 
 def _format_exec_approval_fallback(
     command: str, description: str, command_prefix: str, *, allow_permanent: bool = True,
     allow_session: bool = True, smart_denied: bool = False) -> str:
-    """Render the text fallback from approval capabilities, not platform names."""
-    cmd_preview = command[:200] + "..." if len(command) > 200 else command
+    """Render a strictly sanitized text fallback from approval capabilities."""
+    command = _strict_gateway_egress_text(command)
+    description = _strict_gateway_egress_text(description)
+    cmd_preview = _strict_gateway_egress_text(command[:200] + "..." if len(command) > 200 else command)
     heading = ("⚠️ **Smart DENY — owner override for one operation:**" if smart_denied
                else "⚠️ **Dangerous command requires approval:**")
 
@@ -596,9 +678,10 @@ def _format_exec_approval_fallback(
         if allow_permanent:
             choices.append(f"`{command_prefix}approve always` to approve permanently")
     choices.append(f"`{command_prefix}deny` to cancel")
-    return (
+    return _strict_gateway_egress_text(
         f"{heading}\n```\n{cmd_preview}\n```\nReason: {description}\n\n"
-        + ", ".join(choices[:-1]) + f", or {choices[-1]}.")
+        + ", ".join(choices[:-1]) + f", or {choices[-1]}."
+    )
 
 # Ordered: auth beats policy beats rate-limit beats connection; first match wins.
 _PROVIDER_ERROR_REPLIES = (
@@ -708,6 +791,7 @@ async def _send_or_update_status_coro(adapter, chat_id, status_key, content, met
     See #30045.
     """
     sender = getattr(adapter, "send_or_update_status", None)
+    content = _strict_gateway_egress_text(content)
     if callable(sender):
         return await sender(chat_id, status_key, content, metadata=metadata)
     return await adapter.send(chat_id, content, metadata=metadata)

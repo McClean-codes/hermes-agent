@@ -338,3 +338,20 @@ class TestTelegramAdapterDeleteMessage:
         params = list(sig.parameters)
         assert params[:3] == ["self", "chat_id", "message_id"]
 
+
+@pytest.mark.asyncio
+async def test_real_constructor_fresh_final_redacts_before_send_and_delete():
+    adapter = _make_adapter()
+    consumer = GatewayStreamConsumer(
+        adapter=adapter, chat_id="chat", config=StreamConsumerConfig(cursor=""),
+    )
+    consumer._message_id = "preview"
+    consumer._preview_message_ids.add("preview")
+    raw = "https://opaque-user:opaque-password@example.test/?token=opaque-query-secret"
+
+    assert await consumer._try_fresh_final(raw) is True
+
+    sent = adapter.send.call_args.kwargs["content"]
+    assert "opaque-query-secret" not in sent
+    assert "opaque-password" not in sent
+    assert "opaque-user" not in sent

@@ -35,33 +35,27 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 logger = logging.getLogger("gateway.run")
 
 def _redact_progress_text(text: str | None) -> str:
-    """Fail-closed secret redaction for progress/preview/status text before chat publication.
+    """Strict fail-closed sanitizer for progress, preview, and status text."""
+    from gateway.run import _strict_gateway_egress_text
 
-    Delegates to the authoritative ``agent.redact.redact_sensitive_text`` with
-    ``force=True`` (same boundary as logs/tool-output), so progress previews
-    including terminal full blocks, verbose args, URLs/paths, plugin/MCP previews,
-    Codex/native-card content and live-status phrases never carry raw credentials
-    even when ``security.redact_secrets`` is off. Falls back to the gateway's
-    ``_redact_gateway_user_facing_secrets`` on import failure; never weakens
-    to a local marker filter.
-    """
-    if text is None:
-        return ""
-    s = str(text)
-    if not s:
-        return s
     try:
-        from agent.redact import redact_sensitive_text
-
-        return redact_sensitive_text(s, force=True)
+        return _strict_gateway_egress_text("" if text is None else text)
     except Exception:
-        try:
-            from gateway.run import _redact_gateway_user_facing_secrets
+        logger.debug("progress egress redaction unavailable", exc_info=True)
+        return "[REDACTED]"
 
-            return _redact_gateway_user_facing_secrets(s)
-        except Exception:
-            logger.debug("progress redaction unavailable", exc_info=True)
-            return "[REDACTED]"
+
+def _sanitize_progress_value(value: Any) -> Any:
+    """Sanitize display-only callback data before formatters can clip it."""
+    if isinstance(value, str):
+        return _redact_progress_text(value)
+    if isinstance(value, dict):
+        return {_sanitize_progress_value(key): _sanitize_progress_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_progress_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_sanitize_progress_value(item) for item in value)
+    return value
 
 # ---- progress filter helpers (per-tool + category) ---------------------------
 # Category aliases supported in display.tool_progress_filter keys. Normalized to lower case.
@@ -215,6 +209,12 @@ def _resolve_effective_mode(tool_name: str, global_mode: str, filter_dict: dict 
     return global_mode
 
 
+def _resolve_native_task_card_mode(tool_name: str, global_mode: str, filter_dict: dict | None, native: bool) -> str:
+    """Resolve native-card display using its opt-in ``all`` baseline."""
+    if native and global_mode == "off":
+        return _resolve_effective_mode(tool_name, "all", filter_dict)
+    return _resolve_effective_mode(tool_name, global_mode, filter_dict)
+
 
 class _ExecApprovalDeclined(RuntimeError):
     """The connector refused the approval card's destination.
@@ -300,8 +300,8 @@ class TurnRunner:
             if ctx.log_queue is not None:
                 try:
                     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    preview_str = f' "{preview}"' if preview else ""
-                    ctx.log_queue.put(f"{ts}  {tool_name}:{preview_str}".rstrip())
+                    preview_str = f' "{_redact_progress_text(preview)}"' if preview else ""
+                    ctx.log_queue.put(_redact_progress_text(f"{ts}  {tool_name}:{preview_str}".rstrip()))
                 except Exception:
                     logger.debug("log queue put failed", exc_info=True)
             return
@@ -331,7 +331,7 @@ class TurnRunner:
         if event_type == "_thinking" or tool_name == "_thinking":
             thinking_text = (preview if tool_name == "_thinking" else tool_name) if ctx._thinking_enabled else None
             if thinking_text:
-                ctx.progress_queue.put(f"💬 {thinking_text}")
+                ctx.progress_queue.put(_redact_progress_text(f"💬 {thinking_text}"))
             return
         # Native task cards consume the ID-bearing tool_start/tool_complete callbacks instead;
         # name-correlated text events would duplicate cards and mispair concurrent same-tool calls.
@@ -376,9 +376,12 @@ class TurnRunner:
             from tools.delegate_tool import SUBAGENT_FAILURE_STATUSES, format_subagent_failure_line
             if status in SUBAGENT_FAILURE_STATUSES and ctx._run_still_current():
                 line = format_subagent_failure_line(
-                    kwargs.get("goal"), status, error=kwargs.get("summary") or preview,
+                    _redact_progress_text(kwargs.get("goal") or ""),
+                    _redact_progress_text(status),
+                    error=_redact_progress_text(kwargs.get("summary") or preview or ""),
                     duration_seconds=kwargs.get("duration_seconds"),
                 )
+                line = _redact_progress_text(line)
                 self._schedule(self._runner._deliver_platform_notice(ctx.source, line), "subagent failure notice scheduling error")
         except Exception:
             logger.debug("subagent failure notice failed", exc_info=True)
@@ -393,7 +396,11 @@ class TurnRunner:
         try:
             if event_type == "tool.started" and tool_name and ctx._run_still_current():
                 from agent.display import build_status_phrase
-                _phrase = build_status_phrase(tool_name, args if ctx._live_status_mode == "full" else None)
+                display_args = _sanitize_progress_value(args)
+                display_tool_name = _redact_progress_text(tool_name)
+                _phrase = build_status_phrase(
+                    display_tool_name, display_args if ctx._live_status_mode == "full" else None,
+                )
                 _phrase = _redact_progress_text(_phrase)
                 adapter.set_status_text(ctx.source.chat_id, _phrase)
             elif event_type == "tool.completed":
@@ -414,7 +421,7 @@ class TurnRunner:
                 gate_on = is_truthy_value(cfg_get(cfg, "display", "tool_progress_command"), default=False)
                 if gate_on and not is_seen(cfg, TOOL_PROGRESS_FLAG):
                     ctx.long_tool_hint_fired[0] = True
-                    ctx.progress_queue.put(tool_progress_hint_gateway())
+                    ctx.progress_queue.put(_redact_progress_text(tool_progress_hint_gateway()))
                     mark_seen(_hermes_home / "config.yaml", TOOL_PROGRESS_FLAG)
         except Exception as err:
             logger.debug("tool-progress onboarding hint failed: %s", err)
@@ -456,12 +463,18 @@ class TurnRunner:
         """Render the progress line. Verbose mode queues directly (no dedup) and returns None."""
         ctx = self._ctx
         from agent.display import get_tool_emoji
-        emoji = get_tool_emoji(tool_name, default="⚙️")
+        display_tool_name = _redact_progress_text(tool_name or "")
+        emoji = get_tool_emoji(display_tool_name, default="⚙️")
+        # Formatters and preview builders clip callback data; sanitize the
+        # complete display-only value before that boundary, then sanitize their
+        # rendered output below as a defense in depth.
+        preview = _redact_progress_text(preview) if preview else preview
+        display_args = _sanitize_progress_value(args)
         try:
             adapter = self._runner._adapter_for_source(ctx.source)
         except Exception:
             adapter = None
-        code_full, code_short = self._progress_terminal_blocks(adapter, tool_name, args, emoji)
+        code_full, code_short = self._progress_terminal_blocks(adapter, display_tool_name, display_args, emoji)
         if _effective_mode is None:
             try:
                 _effective_mode = _resolve_effective_mode(tool_name, ctx.progress_mode, getattr(ctx, "tool_progress_filter", None))
@@ -471,21 +484,21 @@ class TurnRunner:
         code = code_full if verbose else code_short
         ctx.last_was_terminal_block[0] = code is not None
         if verbose:
-            if code is None and args:
+            if code is None and display_args:
                 from agent.display import get_tool_preview_max_len
                 pl = get_tool_preview_max_len()
-                args_str = json.dumps(args, ensure_ascii=False, default=str)
+                args_str = json.dumps(display_args, ensure_ascii=False, default=str)
                 args_str = _redact_progress_text(args_str)
                 # tool_preview_length 0 (default) = no truncation in verbose mode; the user asked
                 # for full detail and platform message-length limits handle the rest.
                 if pl > 0 and len(args_str) > pl:
                     args_str = args_str[:pl - 3] + "..."
-                code = f"{emoji} {tool_name}({list(args.keys())})\n{args_str}"
+                code = f"{emoji} {display_tool_name}({list(display_args.keys())})\n{args_str}"
                 code = _redact_progress_text(code)
             elif code is None:
                 # Preview-derived fallback must be redacted before publication
                 _pv = _redact_progress_text(preview) if preview else preview
-                code = f"{emoji} {tool_name}: \"{_pv}\"" if _pv else f"{emoji} {tool_name}..."
+                code = f"{emoji} {display_tool_name}: \"{_pv}\"" if _pv else f"{emoji} {display_tool_name}..."
                 code = _redact_progress_text(code)
             else:
                 # Terminal blocks are already redacted, but still pass through boundary for safety
@@ -495,24 +508,29 @@ class TurnRunner:
         if code is not None:
             return _redact_progress_text(code)
         if not preview:
-            return _redact_progress_text(f"{emoji} {tool_name}...")
+            return _redact_progress_text(f"{emoji} {display_tool_name}...")
         from agent.display import get_tool_verb, prepare_tool_preview, tool_verb_connector, verb_drops_preview
-        prepared = prepare_tool_preview(tool_name, args, fallback=preview, max_len=self._preview_cap())
+        prepared = prepare_tool_preview(
+            display_tool_name, display_args, fallback=preview, max_len=self._preview_cap(),
+        )
         preview_text = adapter.format_tool_preview(prepared) if adapter is not None else prepared.text
         preview_text = _redact_progress_text(preview_text)
         # Friendly labels: human-phrased line for built-in tools ("🔍 Searching the web for ...")
         # by prefixing the verb onto the computed preview, so the command/url/query is kept.
-        verb = get_tool_verb(tool_name)
+        verb = get_tool_verb(display_tool_name)
         if not verb:
-            return _redact_progress_text(f"{emoji} {tool_name}: \"{preview_text}\"")
-        if verb_drops_preview(tool_name):
+            return _redact_progress_text(f"{emoji} {display_tool_name}: \"{preview_text}\"")
+        if verb_drops_preview(display_tool_name):
             return _redact_progress_text(f"{emoji} {verb}")
-        return _redact_progress_text(f"{emoji} {verb}{tool_verb_connector(tool_name)}{preview_text}")
+        return _redact_progress_text(
+            f"{emoji} {verb}{tool_verb_connector(display_tool_name)}{preview_text}"
+        )
 
     def _progress_emit(self, msg: str) -> None:
         """Dedup consecutive identical lines (execute_code boilerplate), then route to the native
         stream bubble when the consumer accepts tool progress, else the progress queue."""
         ctx = self._ctx
+        msg = _redact_progress_text(msg)
         sc = self._stream_consumer()
         native = sc is not None and getattr(sc, "accepts_tool_progress", False)
         if msg == ctx.last_progress_msg[0]:
@@ -547,8 +565,10 @@ class TurnRunner:
 
         @staticmethod
         def _compact(value: Any, limit: int = 120) -> str:
-            text = re.sub(r"\s+", " ", str(value or "")).strip()
-            return text if len(text) <= limit else text[: limit - 3].rstrip() + "..."
+            text = _redact_progress_text(re.sub(r"\s+", " ", str(value or "")).strip())
+            if len(text) > limit:
+                text = text[: limit - 3].rstrip() + "..."
+            return _redact_progress_text(text)
 
         def visible_tasks(self) -> List[Dict[str, str]]:
             return [self.tasks[task_id] for task_id in self.task_order[-8:]]
@@ -556,7 +576,7 @@ class TurnRunner:
         def fallback_text(self) -> str:
             labels = {"in_progress": "running", "complete": "complete", "error": "error"}
             lines = [f"- {t['title']} - {labels.get(t['status'], t['status'])}" for t in self.visible_tasks()]
-            return "Hermes is working\n" + "\n".join(lines)
+            return _redact_progress_text("Hermes is working\n" + "\n".join(lines))
 
         def _upsert(self, call_id: str, title: str) -> Dict[str, str]:
             if call_id not in self.tasks:
@@ -585,7 +605,7 @@ class TurnRunner:
 
     async def _task_card_send_or_edit_fallback(self, st) -> None:
         ctx = self._ctx
-        text = st.fallback_text()
+        text = _redact_progress_text(st.fallback_text())
         from gateway.relay.egress import declined_send
 
         if getattr(st, "egress_declined", False):
@@ -621,9 +641,18 @@ class TurnRunner:
             # later publication would re-deliver the same task text there.
             return
         if not st.native_failed:
+            safe_tasks = [
+                {
+                    "id": _redact_progress_text(task.get("id")),
+                    "title": _redact_progress_text(task.get("title")),
+                    "status": _redact_progress_text(task.get("status")),
+                }
+                for task in st.visible_tasks()
+            ]
             result = await st.adapter.send_native_task_card_progress(
-                chat_id=ctx.source.chat_id, tasks=st.visible_tasks(), title="Hermes is working",
-                reply_to=ctx._progress_reply_to, metadata=ctx._progress_metadata, fallback_text=st.fallback_text(),
+                chat_id=ctx.source.chat_id, tasks=safe_tasks, title="Hermes is working",
+                reply_to=ctx._progress_reply_to, metadata=ctx._progress_metadata,
+                fallback_text=_redact_progress_text(st.fallback_text()),
             )
             if getattr(result, "success", False):
                 return
@@ -738,6 +767,7 @@ class TurnRunner:
 
     async def _edit_progress_message(self, st, message_id: str, content: str):
         ctx = self._ctx
+        content = _redact_progress_text(content)
         kwargs = {"chat_id": ctx.source.chat_id, "message_id": message_id, "content": content}
         if getattr(st.adapter, "REQUIRES_EDIT_FINALIZE", False):
             kwargs["finalize"] = True
@@ -763,6 +793,7 @@ class TurnRunner:
 
     async def _send_progress_text(self, st, text: str):
         ctx = self._ctx
+        text = _redact_progress_text(text)
         result = await st.adapter.send(
             chat_id=ctx.source.chat_id, content=text, reply_to=ctx._progress_reply_to, metadata=ctx._progress_metadata,
         )
@@ -971,17 +1002,12 @@ class TurnRunner:
         # explicitly denies the tool (otherwise Slack's always-off default would leave the feature dead).
         try:
             _filter = getattr(self._ctx, "tool_progress_filter", None)
-            if not _filter and self._ctx.progress_mode == "off" and self._ctx._native_slack_task_cards:
-                _eff = "all"
-            else:
-                _eff = _resolve_effective_mode(str(tool_name or ""), self._ctx.progress_mode, _filter)
+            _eff = _resolve_native_task_card_mode(
+                str(tool_name or ""), self._ctx.progress_mode, _filter,
+                self._ctx._native_slack_task_cards,
+            )
         except Exception:
             _eff = self._ctx.progress_mode
-            try:
-                if not getattr(self._ctx, "tool_progress_filter", None) and self._ctx.progress_mode == "off" and self._ctx._native_slack_task_cards:
-                    _eff = "all"
-            except Exception:
-                pass
         if _eff in ("off", "log"):
             cid = str(call_id or "")
             if cid:
@@ -994,8 +1020,9 @@ class TurnRunner:
                     pass
             return
         from agent.display import build_tool_preview
-        name = str(tool_name or "tool")
-        _preview_raw = build_tool_preview(name, args or {}, max_len=64) or ""
+        name = _redact_progress_text(str(tool_name or "tool"))
+        safe_args = _sanitize_progress_value(args or {})
+        _preview_raw = build_tool_preview(name, safe_args, max_len=64) or ""
         _preview = _redact_progress_text(_preview_raw)
         self._ctx.progress_queue.put({
             "type": "tool.started", "tool_call_id": str(call_id or ""), "tool_name": name,
@@ -1018,17 +1045,12 @@ class TurnRunner:
         # Completion-only events (no prior start) must also be gated by effective mode
         try:
             _filter = getattr(self._ctx, "tool_progress_filter", None)
-            if not _filter and self._ctx.progress_mode == "off" and self._ctx._native_slack_task_cards:
-                _eff = "all"
-            else:
-                _eff = _resolve_effective_mode(str(tool_name or ""), self._ctx.progress_mode, _filter)
+            _eff = _resolve_native_task_card_mode(
+                str(tool_name or ""), self._ctx.progress_mode, _filter,
+                self._ctx._native_slack_task_cards,
+            )
         except Exception:
             _eff = self._ctx.progress_mode
-            try:
-                if not getattr(self._ctx, "tool_progress_filter", None) and self._ctx.progress_mode == "off" and self._ctx._native_slack_task_cards:
-                    _eff = "all"
-            except Exception:
-                pass
         if _eff in ("off", "log"):
             if cid:
                 self._hidden_native_call_ids.add(cid)
@@ -1083,6 +1105,7 @@ class TurnRunner:
 
     def _send_status_text(self, text: str, metadata, log_message: str) -> None:
         ctx = self._ctx
+        text = _redact_progress_text(text)
         self._schedule(ctx._status_adapter.send(ctx._status_chat_id, text, metadata=metadata), log_message)
 
     def _attach_session_title_callback(self, agent, ctx) -> None:
@@ -2006,7 +2029,10 @@ class TurnRunner:
         every rebind. session_key propagates via contextvars (_set_session_env / set_current_session_key)
         — never os.environ["HERMES_SESSION_KEY"], which would misroute approvals across sessions.
         """
-        from gateway.run import _current_max_iterations, _normalize_empty_agent_response, _sanitize_gateway_final_response
+        from gateway.run import (
+            _current_max_iterations, _normalize_empty_agent_response,
+            _sanitize_gateway_final_response, _strict_gateway_egress_text,
+        )
         ctx = self._ctx
         runner = self._runner
         # Platform.LOCAL ("local") maps to the "cli" hint key the agent understands.
@@ -2083,7 +2109,7 @@ class TurnRunner:
             final_response = _normalize_empty_agent_response(result, final_response or "", history_len=len(agent_history))
             final_response = _sanitize_gateway_final_response(ctx.source.platform, final_response)
             if not final_response:
-                final_response = f"⚠️ {result['error']}" if result.get("error") else ""
+                final_response = _strict_gateway_egress_text(f"⚠️ {result['error']}") if result.get("error") else ""
             # NOTE: deliberately omits agent_persisted/last_reasoning/response_* — the caller
             # defaults agent_persisted differently when the key is absent.
             return {"final_response": final_response, **common}

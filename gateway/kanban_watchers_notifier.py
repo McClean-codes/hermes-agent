@@ -55,15 +55,22 @@ MAX_SEND_FAILURES = 12
 _LOCAL_PATH_RE = re.compile(r"(?<![\w:/])(?:/(?:Users|home|private|tmp|var|etc|workspace)/[^\s,;]+|" r"[A-Za-z]:\\[^\s,;]+)")
 
 
+def _strict_egress_text(value: Any) -> str:
+    """Use the gateway's fixed fail-closed sanitizer for notifier text."""
+    try:
+        from gateway.run import _strict_gateway_egress_text
+        return _strict_gateway_egress_text(value)
+    except Exception:
+        return "[REDACTED]"
+
+
 def _safe_review_reason(value: Any, limit: int = 160) -> str:
     """Return a mobile-friendly review reason safe for external delivery."""
-    from agent.redact import redact_sensitive_text
-
-    reason = redact_sensitive_text("" if value is None else str(value), force=True, redact_url_credentials=True)
+    reason = _strict_egress_text("" if value is None else value)
     reason = " ".join(_LOCAL_PATH_RE.sub("[local path]", reason).split())
     if len(reason) > limit:
         reason = reason[: limit - 1].rstrip() + "…"
-    return reason
+    return _strict_egress_text(reason)
 
 
 def _wake_scope_id(adapter: Any, sub: dict) -> Optional[str]:
@@ -241,7 +248,6 @@ class _Collector:
         """Claim events on one board, appending delivery dicts to ``deliveries``."""
         if not self._board_has_subs(slug):
             return
-        kb = self.kb
         try:
             conn = _kbc().connect(board=slug)
         except Exception as exc:
@@ -291,17 +297,23 @@ def _payload(ev: Any, key: str) -> Any:
 
 
 def _clip(ev: Any, key: str, fmt: str, limit: int) -> str:
-    """``fmt`` applied to the truncated payload value, or ``""`` when absent."""
+    """``fmt`` applied to a sanitized, truncated payload value, or ``""`` when absent."""
     value = _payload(ev, key)
-    return fmt.format(str(value)[:limit]) if value else ""
+    if not value:
+        return ""
+    safe_value = _strict_egress_text(value)
+    clipped = safe_value[:limit]
+    return _strict_egress_text(fmt.format(clipped))
 
 
 _NL = "\n{}"
 
 
 def _first_line(text: str, limit: int) -> str:
-    lines = text.strip().splitlines()
-    return lines[0][:limit] if lines else text[:limit]
+    safe_text = _strict_egress_text(text)
+    lines = safe_text.strip().splitlines()
+    line = lines[0] if lines else safe_text
+    return _strict_egress_text(line[:limit])
 
 
 def _fmt_completed(ev, n) -> tuple:
@@ -309,11 +321,11 @@ def _fmt_completed(ev, n) -> tuple:
     wake_handoff = None
     payload_summary = _payload(ev, "summary")
     if payload_summary:
-        wake_handoff = _first_line(str(payload_summary), 200)
+        wake_handoff = _first_line(payload_summary, 200)
     elif n.task and n.task.result:
         wake_handoff = _first_line(n.task.result, 160)
     handoff = f"\n{wake_handoff}" if wake_handoff is not None else ""
-    return f"✔ {n.head} done — {n.title}{handoff}", wake_handoff, None
+    return _strict_egress_text(f"✔ {n.head} done — {n.title}{handoff}"), wake_handoff, None
 
 
 def _fmt_review_requested(ev, n) -> tuple:
@@ -323,10 +335,11 @@ def _fmt_review_requested(ev, n) -> tuple:
     wake_handoff = None
     summary = _payload(ev, "summary")
     if summary:
-        summary = str(summary)
-        handoff = f"\n{summary[:200]}"
-        wake_handoff = _first_line(summary, 200)
-    return f"👀 {n.head} ready for review — {n.title}{handoff}", wake_handoff, None
+        safe_summary = _strict_egress_text(summary)
+        handoff = f"\n{_strict_egress_text(safe_summary[:200])}"
+        wake_handoff = _first_line(safe_summary, 200)
+    msg = _strict_egress_text(f"👀 {n.head} ready for review — {n.title}{handoff}")
+    return msg, wake_handoff, None
 
 
 def _fmt_changes_requested(ev, n) -> tuple:
@@ -390,11 +403,12 @@ class _KanbanNotification:
         self.platform_str = (sub["platform"] or "").lower()
         self.task_id = sub["task_id"]
         self.sub_profile = sub.get("notifier_profile") or ""
-        self.title = (task.title if task else sub["task_id"])[:120]
-        self.board_tag = f"[{self.board_slug}] " if self.board_slug else ""
+        safe_title = _strict_egress_text(task.title if task else sub["task_id"])
+        self.title = _strict_egress_text(safe_title[:120])
+        self.board_tag = _strict_egress_text(f"[{self.board_slug}] ") if self.board_slug else ""
         # Attribute the ping to the worker that did the work.
-        tag = f"@{task.assignee} " if task and task.assignee else ""
-        self.head = f"{self.board_tag}{tag}Kanban {self.task_id}"
+        tag = f"@{_strict_egress_text(task.assignee)} " if task and task.assignee else ""
+        self.head = _strict_egress_text(f"{self.board_tag}{tag}Kanban {self.task_id}")
         # The wake self-post path needs the key even when every event was skipped.
         self.sub_key = (sub["task_id"], sub["platform"], sub["chat_id"], sub.get("thread_id") or "")
         mode = sub.get("delivery_mode") or "notify"
@@ -449,10 +463,10 @@ class _KanbanNotification:
             return None
         msg, handoff, review_detail = formatter(ev, self)
         if handoff is not None:
-            self.wake_handoff = handoff
+            self.wake_handoff = _strict_egress_text(handoff)
         if review_detail is not None:
-            self.wake_review_detail = review_detail
-        return msg
+            self.wake_review_detail = _strict_egress_text(review_detail)
+        return _strict_egress_text(msg)
 
     def build_wake_text(self) -> None:
         """Set ``wake_kinds`` / ``session_key`` / ``synth`` for the wake paths."""
@@ -472,8 +486,8 @@ class _KanbanNotification:
         _status = t("gateway.kanban.wake.status_joiner").join(_parts) or t("gateway.kanban.wake.status_default")
         synth = t(
             "gateway.kanban.wake.message",
-            task_id=sub["task_id"], status=_status, title=self.title,
-            assignee=task.assignee if task else "", board=self.board_slug,
+            task_id=_strict_egress_text(sub["task_id"]), status=_strict_egress_text(_status), title=self.title,
+            assignee=_strict_egress_text(task.assignee if task else ""), board=_strict_egress_text(self.board_slug or ""),
         )
         # Label as an automatic notification and carry the handoff so the
         # creator inspects the board instead of re-decomposing.
@@ -481,7 +495,7 @@ class _KanbanNotification:
             synth += "\n" + t("gateway.kanban.wake.handoff", summary=self.wake_handoff)
         if self.wake_review_detail:
             synth += "\n" + t("gateway.kanban.wake.review_detail", reason=self.wake_review_detail)
-        self.synth = synth + "\n\n" + t("gateway.kanban.wake.guidance")
+        self.synth = _strict_egress_text(synth + "\n\n" + t("gateway.kanban.wake.guidance"))
 
     def _log_woke(self) -> None:
         logger.info("kanban notifier: woke agent for %s on %s/%s profile=%s events=%s",
@@ -498,8 +512,9 @@ class _KanbanNotification:
         return _async_profile_runtime_scope(runner._resolve_profile_home_for_source(source))
 
     async def wake(self) -> None:
-        """Wake the creator session (raises on failure): push adapters get a full SessionSource, non-push a raw self-post."""
+        """Wake the creator session with a final sanitized handoff."""
         from gateway.wake import deliver_wake
+        self.synth = _strict_egress_text(self.synth)
         sub = self.sub
         if not self.is_push_adapter:
             await deliver_wake(self.adapter, text=self.synth, session_id=self.session_key)
@@ -540,7 +555,7 @@ class _KanbanNotification:
         metadata: dict[str, Any] = dict(delivery_metadata) if isinstance(delivery_metadata, dict) else {}
         if sub.get("thread_id") and not metadata.get("thread_id"):
             metadata["thread_id"] = sub["thread_id"]
-        _send_res = await adapter.send(sub["chat_id"], msg, metadata=metadata)
+        _send_res = await adapter.send(sub["chat_id"], _strict_egress_text(msg), metadata=metadata)
         # SendResult(success=False) without an exception is a FAILED delivery
         # (else the event is lost); None / non-SendResult keeps the
         # "no exception == delivered" contract.

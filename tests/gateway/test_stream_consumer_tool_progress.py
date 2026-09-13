@@ -311,3 +311,20 @@ class TestToolProgressDrainLoop:
             assert "Searching" not in final_text
             assert "terminal" not in final_text
             assert "---" not in final_text
+
+
+@pytest.mark.asyncio
+async def test_real_native_tool_progress_effect_redacts_opaque_url_credentials():
+    consumer = _make_consumer()
+    raw = "https://opaque-user:opaque-password@example.test/?token=opaque-query-secret"
+    consumer.on_delta("answer")
+    consumer.on_tool_progress(raw)
+    consumer.finish()
+
+    await consumer.run()
+
+    contents = [frame["text"] for frame in consumer.adapter.frames]
+    assert contents
+    assert all("opaque-query-secret" not in content for content in contents)
+    assert all("opaque-password" not in content for content in contents)
+    assert all("opaque-user" not in content for content in contents)

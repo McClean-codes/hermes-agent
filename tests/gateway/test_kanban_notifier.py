@@ -748,3 +748,34 @@ def test_review_requested_does_not_wake_a_notify_only_subscription(
     assert adapter.handled == [], (
         "notify-only subscriptions must not be woken by a review handoff"
     )
+
+
+def test_completed_notifier_strict_redacts_title_handoff_and_wake(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "strict-completed.db"))
+    kb.init_db()
+    raw_url = "https://opaque-user:opaque-password@example.test/?token=opaque-query-secret"
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title=f"release {raw_url}",
+            assignee=f"owner {raw_url}",
+            session_id="agent:main:telegram:dm:chat-1",
+        )
+        kbn.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat-1",
+            chat_type="dm", delivery_mode="notify+wake",
+        )
+        kb.complete_task(conn, tid, summary=f"verified {raw_url}")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    texts = [item["text"] for item in adapter.sent]
+    texts.extend(event.text for event in adapter.handled)
+    assert texts
+    assert all("opaque-query-secret" not in text for text in texts)
+    assert all("opaque-password" not in text for text in texts)
+    assert all("opaque-user" not in text for text in texts)

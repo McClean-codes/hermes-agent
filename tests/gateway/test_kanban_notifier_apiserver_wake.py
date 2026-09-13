@@ -219,3 +219,36 @@ def test_apiserver_wake_failure_rewinds_then_retries_destination(
     assert "worker-session" not in attempted_sessions
     assert _unseen_terminal_events(tid, "api_server", "origin-session") == []
 
+
+def test_apiserver_wake_real_self_post_is_strictly_redacted(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "apiserver-redact.db"))
+    kb.init_db()
+    raw_url = "https://opaque-user:opaque-password@example.test/?token=opaque-query-secret"
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(
+            conn, title=f"task {raw_url}", assignee=f"owner {raw_url}",
+            session_id="worker-session",
+        )
+        kbn.add_notify_sub(conn, task_id=tid, platform="api_server", chat_id="origin-session")
+        kb.complete_task(conn, tid, summary=f"done {raw_url}")
+    finally:
+        conn.close()
+
+    posts = []
+
+    async def record_self_post(adapter, *, text, session_id):
+        posts.append({"text": text, "session_id": session_id})
+
+    import gateway.wake as wake_mod
+    monkeypatch.setattr(wake_mod, "_self_post_chat_completion", record_self_post)
+    runner = _make_runner({Platform.API_SERVER: ApiServerLikeAdapter()})
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(posts) == 1
+    assert posts[0]["session_id"] == "origin-session"
+    assert "opaque-query-secret" not in posts[0]["text"]
+    assert "opaque-password" not in posts[0]["text"]
+    assert "opaque-user" not in posts[0]["text"]
+

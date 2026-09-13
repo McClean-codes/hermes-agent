@@ -1488,3 +1488,110 @@ class TestFlushPendingSync:
         consumer.finish()
         await task
 
+
+class _EgressLedgerAdapter:
+    """Concrete adapter-shaped ledger for stream effect-boundary tests."""
+
+    def __init__(self):
+        self.calls = []
+
+    async def send_stream_frame(self, text, *, finalize=False, **kwargs):
+        self.calls.append(("stream", text, finalize))
+        return True
+
+    async def send_draft(self, *, chat_id, draft_id, content, metadata=None):
+        self.calls.append(("draft", content, False))
+        return SimpleNamespace(success=True, message_id=None)
+
+    async def send(self, *args, **kwargs):
+        content = kwargs.get("content") if "content" in kwargs else args[1]
+        self.calls.append(("send", content, False))
+        return SimpleNamespace(success=True, message_id="fresh-message")
+
+    async def edit_message(self, **kwargs):
+        self.calls.append(("edit", kwargs["content"], kwargs.get("finalize", False)))
+        return SimpleNamespace(success=True, message_id=kwargs["message_id"])
+
+    async def delete_message(self, *args, **kwargs):
+        self.calls.append(("delete", "", False))
+        return True
+
+
+def test_production_stream_constructor_redacts_every_transport_effect():
+    """Native, draft, edit, fresh-final, and first-send lanes share strict egress."""
+    adapter = _EgressLedgerAdapter()
+    raw = "https://opaque-user:opaque-password@example.test/?token=opaque-query-secret"
+    consumer = GatewayStreamConsumer(adapter, "chat", StreamConsumerConfig(cursor=""))
+
+    consumer._use_native_streaming = True
+    consumer._native_stream_opened = True
+    assert asyncio.run(consumer._send_or_edit(raw, finalize=True)) is True
+
+    consumer._use_native_streaming = False
+    consumer._use_draft_streaming = True
+    consumer._draft_id = 1
+    assert asyncio.run(consumer._send_draft_frame(raw)) is True
+
+    consumer._use_draft_streaming = False
+    consumer._message_id = "preview"
+    assert asyncio.run(consumer._edit_message(message_id="preview", content=raw))
+    assert asyncio.run(consumer._try_fresh_final(raw)) is True
+
+    # A fresh consumer exercises the first-send fallback independently.
+    fallback = GatewayStreamConsumer(adapter, "chat", StreamConsumerConfig(cursor=""))
+    assert asyncio.run(fallback._first_send(raw, finalize=True)) is True
+
+    delivered = [content for _kind, content, _finalize in adapter.calls if content]
+    assert delivered
+    assert all("opaque-query-secret" not in content for content in delivered)
+    assert all("opaque-password" not in content for content in delivered)
+    assert all("opaque-user" not in content for content in delivered)
+
+
+def test_production_stream_effect_fails_closed_when_primary_redactor_raises(monkeypatch):
+    import agent.redact as redact_module
+
+    adapter = _EgressLedgerAdapter()
+    consumer = GatewayStreamConsumer(adapter, "chat", StreamConsumerConfig(cursor=""))
+    consumer._use_native_streaming = True
+    consumer._native_stream_opened = True
+    raw = "https://user:opaque-password@example.test/?token=opaque-query-secret"
+
+    monkeypatch.setattr(redact_module, "redact_sensitive_text", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("boom")))
+    assert asyncio.run(consumer._send_or_edit(raw, finalize=True)) is True
+    assert adapter.calls == [("stream", "[REDACTED]", True)]
+
+
+@pytest.mark.asyncio
+async def test_native_boundary_fallback_is_covered_by_transport_egress_adapter():
+    adapter = _EgressLedgerAdapter()
+    raw = "https://opaque-user:opaque-password@example.test/?token=opaque-query-secret"
+
+    async def failed_stream_frame(text, **kwargs):
+        adapter.calls.append(("stream", text, kwargs.get("finalize", False)))
+        return False
+
+    adapter.send_stream_frame = failed_stream_frame
+    consumer = GatewayStreamConsumer(adapter, "chat", StreamConsumerConfig(cursor=""))
+    consumer._use_native_streaming = True
+    consumer._native_stream_opened = True
+    consumer._accumulated = raw
+
+    assert await consumer._finalize_boundary_stream("Approval") is True
+    sends = [entry for entry in adapter.calls if entry[0] == "send"]
+    assert sends == [("send", "https://***@example.test/?token=***", False)]
+
+
+@pytest.mark.asyncio
+async def test_stream_transport_fails_closed_when_gateway_egress_helper_is_unavailable(monkeypatch):
+    import gateway.run as run_mod
+
+    adapter = _EgressLedgerAdapter()
+    consumer = GatewayStreamConsumer(adapter, "chat", StreamConsumerConfig(cursor=""))
+    consumer._use_native_streaming = True
+    consumer._native_stream_opened = True
+    raw = "https://opaque-user:opaque-password@example.test/?token=opaque-query-secret"
+    monkeypatch.setattr(run_mod, "_strict_gateway_egress_text", lambda value: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    assert await consumer._send_or_edit(raw, finalize=True) is True
+    assert adapter.calls == [("stream", "[REDACTED]", True)]

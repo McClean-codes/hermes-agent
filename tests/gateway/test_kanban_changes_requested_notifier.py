@@ -183,3 +183,33 @@ def test_changes_requested_reason_is_redacted_path_safe_and_truncated(tmp_path, 
     assert "abcdefghijklmnopqrstuvwxyz" not in text
     assert "[local path]" in text
     assert "… — reviewer @claude-qa" in text
+
+
+def test_changes_requested_real_notifier_redacts_raw_url_at_clip_boundary(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "raw-url.db"))
+    kb.init_db()
+    raw_url = "https://opaque-user:opaque-password@example.test/?token=opaque-query-secret"
+    _create_review_block("notify", reason=("x" * 150) + raw_url + " trailing")
+    adapter = RecordingAdapter()
+
+    asyncio.run(_run_one_tick(monkeypatch, _runner(adapter)))
+
+    text = adapter.sent[0]["text"]
+    assert "opaque-query-secret" not in text
+    assert "opaque-password" not in text
+    assert "opaque-user" not in text
+
+
+def test_changes_requested_real_notifier_uses_placeholder_when_redactor_fails(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "redactor-failure.db"))
+    kb.init_db()
+    raw_url = "https://opaque-user:opaque-password@example.test/?token=opaque-query-secret"
+    _create_review_block("notify", reason=raw_url)
+    adapter = RecordingAdapter()
+    import agent.redact as redact_module
+
+    monkeypatch.setattr(redact_module, "redact_sensitive_text", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("boom")))
+    asyncio.run(_run_one_tick(monkeypatch, _runner(adapter)))
+
+    assert adapter.sent
+    assert adapter.sent[0]["text"] == "[REDACTED]"

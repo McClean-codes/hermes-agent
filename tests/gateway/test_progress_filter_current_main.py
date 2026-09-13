@@ -644,6 +644,47 @@ class TestImportantOutputDelivery:
         finally:
             run_mod.safe_schedule_threadsafe = orig  # type: ignore[assignment]
 
+    def test_subagent_failure_notice_sanitizes_before_error_clipping(self):
+        from gateway import run as run_mod
+
+        captured = []
+
+        def _fake_schedule(coro, loop, logger=None, log_message=None):
+            asyncio.run(coro)
+            return MagicMock()
+
+        original = run_mod.safe_schedule_threadsafe
+        run_mod.safe_schedule_threadsafe = _fake_schedule  # type: ignore[assignment]
+
+        class Stub:
+            def _adapter_for_source(self, source):
+                return None
+
+            async def _deliver_platform_notice(self, source, content):
+                captured.append(content)
+
+        raw = "https://opaque-user:opaque-password@example.test/?token=opaque-query-secret"
+        try:
+            ctx = TurnContext(
+                source=MagicMock(chat_id="c1"), _run_still_current=lambda: True,
+                progress_queue=queue.Queue(), _loop_for_step=None,
+                tool_progress_filter={}, tool_progress_enabled=False, progress_mode="off",
+            )
+            from gateway.run_turn_runner import TurnRunner
+
+            runner = TurnRunner(Stub(), ctx)  # type: ignore[arg-type]
+            with patch("agent.redact.redact_sensitive_text", side_effect=lambda text, **kwargs: text):
+                runner.progress_callback(
+                    "subagent.complete", preview=("x" * 140) + raw,
+                    status="failed", goal="do thing", duration_seconds=5,
+                )
+            assert len(captured) == 1
+            assert "opaque-query-secret" not in captured[0]
+            assert "opaque-password" not in captured[0]
+            assert "opaque-user" not in captured[0]
+        finally:
+            run_mod.safe_schedule_threadsafe = original  # type: ignore[assignment]
+
     def test_error_result_not_suppressed(self):
         # Errors/results must still be delivered even when progress for that tool is off – via real TurnRunner terminalization
         pq = queue.Queue()
@@ -1531,3 +1572,133 @@ class TestIntegration:
         # For read_file which is still log, it should go to log
         runner.progress_callback("tool.started", "read_file", "x", {"path": "/tmp/x"})
         assert not lq.empty()
+
+    def test_native_off_filter_keeps_unmatched_read_file_visible(self):
+        """Native Slack cards use the opt-in ``all`` baseline for unmatched tools."""
+        ctx = _make_ctx(
+            progress_mode="off", tool_progress_enabled=False,
+            tool_progress_filter={"terminal": "off"}, native=True,
+        )
+        ctx.progress_queue = queue.Queue()
+        runner = _make_runner(ctx)
+
+        runner.native_tool_start_callback("call-terminal", "terminal", {"command": "ls"})
+        assert ctx.progress_queue.empty()
+        assert "call-terminal" in runner._hidden_native_call_ids
+
+        runner.native_tool_start_callback("call-read", "read_file", {"path": "README.md"})
+        runner.native_tool_complete_callback("call-read", "read_file", {}, "contents")
+        events = _drain(ctx.progress_queue)
+        assert [event["type"] for event in events] == ["tool.started", "tool.completed"]
+        assert all(event["tool_call_id"] == "call-read" for event in events)
+
+    def test_native_off_unknown_filter_does_not_hide_unmatched_tool(self):
+        """Unknown filters are non-matches, not a reason to inherit global off."""
+        ctx = _make_ctx(
+            progress_mode="off", tool_progress_enabled=False,
+            tool_progress_filter={"unknown_category": "off"}, native=True,
+        )
+        ctx.progress_queue = queue.Queue()
+        runner = _make_runner(ctx)
+
+        runner.native_tool_start_callback("call-read-unknown", "read_file", {"path": "README.md"})
+        runner.native_tool_complete_callback("call-read-unknown", "read_file", {}, "contents")
+        events = _drain(ctx.progress_queue)
+        assert len(events) == 2
+        assert events[0]["tool_name"] == "read_file"
+
+
+def test_strict_gateway_egress_redacts_opaque_url_credentials_and_preserves_benign_urls():
+    from gateway.run import _redact_gateway_user_facing_secrets
+
+    raw = (
+        "See https://docs.example.test/path?next=ok&access_token=opaque-query-secret "
+        "and https://opaque-user:opaque-password@example.test/callback?code=split-secret"
+    )
+    redacted = _redact_gateway_user_facing_secrets(raw)
+
+    assert "https://docs.example.test/path?next=ok" in redacted
+    assert "opaque-query-secret" not in redacted
+    assert "opaque-user" not in redacted
+    assert "opaque-password" not in redacted
+    assert "split-secret" not in redacted
+
+
+def test_strict_gateway_egress_handles_encoded_and_split_query_keys():
+    from gateway.run import _redact_gateway_user_facing_secrets
+
+    raw = "https://example.test/?to%6ben=encoded-secret;si\x1bgnature=split-secret&public=ok"
+    redacted = _redact_gateway_user_facing_secrets(raw)
+
+    assert "encoded-secret" not in redacted
+    assert "split-secret" not in redacted
+    assert "public=ok" in redacted
+
+
+def test_strict_gateway_egress_fails_closed_when_primary_redactor_raises():
+    import agent.redact as redact_module
+    from gateway.run import _redact_gateway_user_facing_secrets
+
+    with patch.object(redact_module, "redact_sensitive_text", side_effect=RuntimeError("redactor unavailable")):
+        assert _redact_gateway_user_facing_secrets(
+            "https://user:opaque-password@example.test/?token=opaque-query-secret"
+        ) == "[REDACTED]"
+
+
+def test_strict_gateway_egress_fails_closed_on_malformed_primary_result():
+    import agent.redact as redact_module
+    from gateway.run import _redact_gateway_user_facing_secrets
+
+    with patch.object(redact_module, "redact_sensitive_text", return_value=None):
+        assert _redact_gateway_user_facing_secrets("opaque-query-secret") == "[REDACTED]"
+
+
+def test_thinking_progress_uses_strict_egress_redaction():
+    raw = "https://opaque-user:opaque-password@example.test/?token=opaque-query-secret"
+    ctx = _make_ctx(progress_mode="all", thinking_enabled=True)
+    runner = _make_runner(ctx)
+
+    runner.progress_callback("_thinking", "_thinking", raw, {})
+
+    messages = _drain(ctx.progress_queue)
+    assert len(messages) == 1
+    assert raw not in str(messages[0])
+    assert "opaque-query-secret" not in str(messages[0])
+    assert "opaque-password" not in str(messages[0])
+    assert "opaque-user" not in str(messages[0])
+
+
+def test_native_card_preview_sanitizes_before_builder_clipping():
+    from gateway.run_turn_runner import TurnRunner
+
+    raw = "https://opaque-user:" + ("opaque-password" * 5) + "@example.test/?public=ok"
+    ctx = _make_ctx(progress_mode="off", tool_progress_enabled=False, native=True)
+    runner = _make_runner(ctx)
+
+    with patch("agent.redact.redact_sensitive_text", side_effect=lambda text, **kwargs: text):
+        runner.native_tool_start_callback("call-clip", "web_search", {"query": raw})
+
+    events = _drain(ctx.progress_queue)
+    assert len(events) == 1
+    preview = events[0]["preview"]
+    assert "opaque-user" not in preview
+    assert "opaque-password" not in preview
+
+
+
+def test_final_status_and_approval_boundaries_use_strict_egress():
+    from gateway.run import (
+        _format_exec_approval_fallback, _prepare_gateway_status_message,
+        _sanitize_gateway_final_response,
+    )
+
+    raw = "https://opaque-user:opaque-password@example.test/?token=opaque-query-secret"
+    for output in (
+        _sanitize_gateway_final_response("telegram", f"answer {raw}"),
+        _prepare_gateway_status_message("telegram", "status", raw),
+        _format_exec_approval_fallback(raw, raw, "/"),
+    ):
+        assert output
+        assert "opaque-query-secret" not in output
+        assert "opaque-password" not in output
+        assert "opaque-user" not in output

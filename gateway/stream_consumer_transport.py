@@ -22,9 +22,47 @@ class StreamTransportMixin:
 
     _MIN_NEW_MSG_CHARS = 4
 
+    @staticmethod
+    def _strict_egress_text(text: Any) -> str:
+        """Sanitize every stream payload at the transport effect boundary."""
+        from gateway.run import _strict_gateway_egress_text
+
+        try:
+            return _strict_gateway_egress_text(text)
+        except Exception:
+            logger.debug("stream egress redaction unavailable", exc_info=True)
+            return "[REDACTED]"
+
+    def _install_send_egress_boundary(self) -> None:
+        """Cover the consumer's direct boundary fallback without changing adapter classes."""
+        adapter = self.adapter
+        if getattr(adapter, "_hermes_strict_send_boundary", False):
+            return
+        send = getattr(adapter, "send", None)
+        # Preserve AsyncMock observability in tests and leave adapters that reject
+        # instance attributes alone; normal concrete adapters use the wrapper.
+        if not callable(send) or hasattr(send, "assert_awaited"):
+            return
+
+        async def _safe_send(*args, **kwargs):
+            if "content" in kwargs:
+                kwargs["content"] = self._strict_egress_text(kwargs["content"])
+            elif len(args) >= 2:
+                args = (*args[:1], self._strict_egress_text(args[1]), *args[2:])
+            result = send(*args, **kwargs)
+            return await result if inspect.isawaitable(result) else result
+
+        try:
+            _safe_send._hermes_strict_send_wrapper = True
+            setattr(adapter, "send", _safe_send)
+            setattr(adapter, "_hermes_strict_send_boundary", True)
+        except Exception:
+            logger.debug("could not install stream send egress boundary", exc_info=True)
+
     async def _edit_message(self, *, message_id: str, content: str, finalize: bool = False):
         """Edit via the adapter, passing routing metadata when supported."""
         # Contract: adapters must accept finalize= even when False (test-guarded).
+        content = self._strict_egress_text(content)
         kwargs = dict(chat_id=self.chat_id, message_id=message_id, content=content,
                       finalize=finalize)
         if self.metadata:
@@ -59,6 +97,8 @@ class StreamTransportMixin:
 
     async def _send_frame(self, text: str, *, finalize: bool):
         """One native-stream frame; every frame carries the same chat/reply/turn routing."""
+        self._install_send_egress_boundary()
+        text = self._strict_egress_text(text)
         return await self.adapter.send_stream_frame(
             text, finalize=finalize, chat_id=self.chat_id, reply_to=self._initial_reply_to_id,
             turn_id=self._turn_id)
@@ -160,6 +200,7 @@ class StreamTransportMixin:
     async def _send_draft_frame(self, text: str) -> bool:
         """Emit one draft frame; any failure permanently disables drafts for this run.
         Drafts have no message_id and clear on the client when the final send lands."""
+        text = self._strict_egress_text(text)
         if self._draft_id is None:
             # Should never happen (set in tandem with _use_draft_streaming in run()).
             self._use_draft_streaming = False
@@ -203,7 +244,9 @@ class StreamTransportMixin:
             return
         try:
             await self.adapter.abandon_open_draft(
-                self.chat_id, self._last_sent_text or self._clean_for_display(self._accumulated),
+                self.chat_id, self._strict_egress_text(
+                    self._last_sent_text or self._clean_for_display(self._accumulated)
+                ),
                 metadata=self._draft_metadata())
         except Exception as e:
             logger.debug("abandon_open_draft failed (best-effort): %s", e)
@@ -273,6 +316,7 @@ class StreamTransportMixin:
         # after a split, deleting sealed heads would erase delivered text.
         if self._turn_split_delivery:
             return False
+        text = self._strict_egress_text(text)
         stale_ids = self._stale_preview_ids()
         try:
             result = await self.adapter.send(
@@ -309,11 +353,14 @@ class StreamTransportMixin:
         last edit.  Transport order: native frame → draft frame → edit existing → first
         send; a transport returns None to fall through to the next."""
         text = self._clean_for_display(text)
+        text = self._strict_egress_text(text)
         # Stream-is-the-message draft frames must stay prefix-stable: a closing ```
         # on a mid-code-block frame makes frame N not a prefix of N+1 and the
         # connector re-appends the whole snapshot.  The final is still fence-closed.
         pre_fence_text = text
         text = ensure_closed_code_fences(text)
+        # Fence closure is a formatter, so re-run strict redaction after it.
+        text = self._strict_egress_text(text)
         # A bare cursor renders as a stray tofu box on some clients.
         visible_stripped = (text.replace(self.cfg.cursor, "") if self.cfg.cursor else text).strip()
         if not visible_stripped:
@@ -430,6 +477,8 @@ class StreamTransportMixin:
 
     async def _first_send(self, text: str, *, finalize: bool) -> bool:
         """First send, threaded to the user's message (correct topic/thread)."""
+        self._install_send_egress_boundary()
+        text = self._strict_egress_text(text)
         if getattr(self, "_egress_declined", False):
             # The connector refused this destination earlier in the run (see
             # _send_draft_frame). This is where every fallback path converges,
