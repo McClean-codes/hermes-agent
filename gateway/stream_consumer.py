@@ -435,15 +435,18 @@ class GatewayStreamConsumer:
             if not isinstance(redacted, str):
                 return "[REDACTED]"
             # Stream output is a non-navigation egress boundary.  Once the
-            # shared strict projection has identified a user:password-shaped
-            # authority (the password is now ``***``), hide the username too so
-            # opaque credential-shaped userinfo cannot reach any direct effect.
+            # shared strict projection has identified URL authority userinfo,
+            # hide the entire opaque component so encoded delimiters cannot
+            # expose the username after only the password was masked.  The
+            # encoded forms are canonicalized to a valid opaque userinfo marker
+            # while path/query/fragment controls remain untouched.
             import re
 
             return re.sub(
-                r"(//)[^/\s?#@:]+:\*\*\*@",
+                r"(//)[^/\s?#@]+?(?:@|%2540|%40)",
                 r"\1***@",
                 redacted,
+                flags=re.IGNORECASE,
             )
         except Exception:
             return "[REDACTED]"

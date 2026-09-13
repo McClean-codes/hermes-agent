@@ -1650,6 +1650,18 @@ class _NonWrappableEgressAdapter:
             id="credential-shaped-url",
         ),
         pytest.param(
+            "https://opaque-user%3Aopaque-password%40example.test/?token=opaque-query-secret",
+            id="encoded-credential-shaped-url",
+        ),
+        pytest.param(
+            "https://opaque-user%3aopaque-password%40example.test/?token=opaque-query-secret",
+            id="encoded-credential-shaped-url-lowercase-colon",
+        ),
+        pytest.param(
+            "https://opaque-user%253Aopaque-password%2540example.test/?token=opaque-query-secret",
+            id="double-encoded-credential-shaped-url",
+        ),
+        pytest.param(
             "https://example.test/?to\u200bken=opaque-query-secret",
             id="unicode-split-query-key",
         ),
@@ -1659,6 +1671,16 @@ async def test_non_wrappable_stream_effect_ledger_sanitizes_all_content_families
     """Every direct stream adapter effect receives strict text, not raw model input."""
     adapter = _NonWrappableEgressAdapter()
     adapter.reset()
+    secrets = ("opaque-user", "opaque-password", "opaque-query-secret")
+
+    def assert_new_effects_are_safe(start, *, minimum=1):
+        effects = adapter.effects[start:]
+        content_effects = [payload for kind, payload in effects if kind != "delete"]
+        assert len(content_effects) >= minimum
+        assert all(isinstance(payload, str) for payload in content_effects)
+        assert all(raw not in payload for payload in content_effects)
+        for secret in secrets:
+            assert all(secret not in payload for payload in content_effects), secret
 
     def make_consumer():
         return GatewayStreamConsumer(
@@ -1669,61 +1691,100 @@ async def test_non_wrappable_stream_effect_ledger_sanitizes_all_content_families
 
     with patch("agent.redact.redact_sensitive_text", side_effect=lambda text, **_: text):
         first = make_consumer()
+        effect_start = len(adapter.effects)
         await first._send_or_edit(raw, finalize=True)
+        assert_new_effects_are_safe(effect_start)
 
         edit = make_consumer()
+        effect_start = len(adapter.effects)
         await edit._send_or_edit("visible", finalize=True)
+        assert_new_effects_are_safe(effect_start)
         edit._message_id = "existing"
+        effect_start = len(adapter.effects)
         await edit._send_or_edit(raw, finalize=True)
+        assert_new_effects_are_safe(effect_start)
 
         split = make_consumer()
+        effect_start = len(adapter.effects)
         await split._send_new_chunk(raw, None, final=True)
+        assert_new_effects_are_safe(effect_start)
 
         fallback = make_consumer()
+        effect_start = len(adapter.effects)
         await fallback._send_fallback_final(raw)
+        assert_new_effects_are_safe(effect_start)
 
         empty_fallback = make_consumer()
+        effect_start = len(adapter.effects)
         assert await empty_fallback._send_empty_fallback_final(raw) == "delivered"
+        assert_new_effects_are_safe(effect_start)
 
         fresh = make_consumer()
         fresh._message_id = "preview"
         fresh._preview_message_ids = {"preview"}
+        effect_start = len(adapter.effects)
         assert await fresh._try_fresh_final(raw) is True
+        assert_new_effects_are_safe(effect_start)
 
         commentary = make_consumer()
+        effect_start = len(adapter.effects)
         assert await commentary._send_commentary(raw) is True
+        assert_new_effects_are_safe(effect_start)
 
         draft = make_consumer()
         draft._draft_id = 1
+        effect_start = len(adapter.effects)
         assert await draft._send_draft_frame(raw) is True
+        assert_new_effects_are_safe(effect_start)
 
         native = make_consumer()
         native._use_native_streaming = True
         native._native_stream_opened = True
+        effect_start = len(adapter.effects)
         assert await native._send_or_edit(raw, finalize=True) is True
+        assert_new_effects_are_safe(effect_start)
 
         tail = make_consumer()
         tail._fallback_final_send = True
         tail._accumulated = raw
+        effect_start = len(adapter.effects)
         await tail._flush_segment_tail_on_edit_failure()
+        assert_new_effects_are_safe(effect_start)
 
         cursor = make_consumer()
         cursor._message_id = "cursor-preview"
         cursor._last_sent_text = raw + " ▉"
         cursor.cfg.cursor = " ▉"
+        effect_start = len(adapter.effects)
         await cursor._try_strip_cursor()
+        assert_new_effects_are_safe(effect_start)
 
         boundary = make_consumer()
         boundary._use_native_streaming = True
         boundary._native_stream_opened = True
         boundary._accumulated = raw
+        effect_start = len(adapter.effects)
         await boundary._handle_approval_boundary(None)
+        assert_new_effects_are_safe(effect_start)
+
+        # Exercise the real fallback retry loop with this same raw parameter,
+        # including the credential-shaped case, rather than a separate fixture.
+        retry = make_consumer()
+        retry_start = len(adapter.effects)
+        _NonWrappableEgressAdapter.send_results = [
+            SimpleNamespace(success=False, error="rate limit", retry_after=0.001),
+            SimpleNamespace(success=True, message_id="retry-ok"),
+        ]
+        await retry._send_fallback_final(raw)
+        retry_effects = adapter.effects[retry_start:]
+        assert [kind for kind, _ in retry_effects] == ["send", "send"]
+        assert_new_effects_are_safe(retry_start, minimum=2)
 
     assert not hasattr(adapter, "__dict__")
     content_effects = [payload for kind, payload in adapter.effects if kind != "delete"]
-    assert len(content_effects) >= 12
+    assert len(content_effects) >= 14
     assert all(isinstance(payload, str) for payload in content_effects)
-    for secret in ("opaque-user", "opaque-password", "opaque-query-secret"):
+    for secret in secrets:
         assert all(secret not in payload for payload in content_effects), secret
     assert all(raw not in payload for payload in content_effects)
 
