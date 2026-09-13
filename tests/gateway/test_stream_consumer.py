@@ -1,11 +1,13 @@
 """Tests for GatewayStreamConsumer — media directive stripping in streaming."""
 
 import asyncio
+import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from gateway.config import load_gateway_config
 from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
 
 
@@ -1487,4 +1489,97 @@ class TestFlushPendingSync:
 
         consumer.finish()
         await task
+
+
+class _NativeBoundaryLedgerAdapter:
+    """Slot-only adapter proving the consumer owns the final egress boundary."""
+
+    __slots__ = ("calls",)
+
+    def __init__(self):
+        self.calls = []
+
+    async def send_stream_frame(self, text, *, finalize=False, **kwargs):
+        self.calls.append(("stream", text, finalize))
+        return False
+
+    async def send(self, chat_id, text, **kwargs):
+        self.calls.append(("send", text, False))
+        return SimpleNamespace(success=True)
+
+
+@pytest.mark.asyncio
+async def test_integrated_native_boundary_fallback_redacts_opaque_url_values(monkeypatch):
+    """A failed native finalize cannot bypass the strict fallback sanitizer."""
+    import agent.redact as redact_module
+
+    monkeypatch.setattr(redact_module, "redact_sensitive_text", lambda text, **kwargs: text)
+    raw = "https://opaque-user:opaque-password@example.test/?token=opaque-query-secret"
+    adapter = _NativeBoundaryLedgerAdapter()
+    consumer = GatewayStreamConsumer(adapter, "chat", StreamConsumerConfig(cursor=""))
+    consumer._use_native_streaming = True
+    consumer._native_stream_opened = True
+    consumer._accumulated = raw
+
+    await consumer._handle_approval_boundary(None)
+
+    assert adapter.calls == [
+        ("stream", "https://***@example.test/?token=***", True),
+        ("send", "https://***@example.test/?token=***", False),
+    ]
+    assert all(secret not in content for _, content, _ in adapter.calls for secret in (
+        "opaque-user",
+        "opaque-password",
+        "opaque-query-secret",
+    ))
+
+
+@pytest.mark.asyncio
+async def test_integrated_native_boundary_primary_redactor_failure_stays_fail_closed(monkeypatch):
+    """A broken primary redactor still produces sanitized boundary effects."""
+    import agent.redact as redact_module
+
+    def broken_redactor(text, **kwargs):
+        raise RuntimeError("redactor unavailable")
+
+    monkeypatch.setattr(redact_module, "redact_sensitive_text", broken_redactor)
+    raw = "https://opaque-user:opaque-password@example.test/?token=opaque-query-secret"
+    adapter = _NativeBoundaryLedgerAdapter()
+    consumer = GatewayStreamConsumer(adapter, "chat", StreamConsumerConfig(cursor=""))
+    consumer._use_native_streaming = True
+    consumer._native_stream_opened = True
+    consumer._accumulated = raw
+
+    previous_disable = logging.root.manager.disable
+    logging.disable(logging.CRITICAL)
+    try:
+        await consumer._handle_approval_boundary(None)
+    finally:
+        logging.disable(previous_disable)
+
+    assert len(adapter.calls) == 2
+    assert all(secret not in content for _, content, _ in adapter.calls for secret in (
+        "opaque-user",
+        "opaque-password",
+        "opaque-query-secret",
+    ))
+
+
+def test_integrated_root_discord_extra_values_keep_precedence(tmp_path, monkeypatch):
+    """Root bridge values never overwrite an explicit Discord extra value."""
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        """\nplatforms:\n  discord:\n    enabled: true\n    extra:\n      persona_emoji: explicit\n      dynamic_reactions: 'true'\n      reaction_cooldown: 7\ndiscord:\n  persona_emoji: root\n  dynamic_reactions: 'false'\n  reaction_cooldown: 2\n""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    config = load_gateway_config()
+
+    discord = next(platform for platform in config.platforms if platform.value == "discord")
+    extra = config.platforms[discord].extra
+    assert extra["persona_emoji"] == "explicit"
+    assert extra["dynamic_reactions"] == "true"
+    assert extra["reaction_cooldown"] == 7
 

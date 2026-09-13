@@ -1690,7 +1690,7 @@ def load_gateway_config() -> GatewayConfig:
                 # ``_merge_platform_map`` already merged it with the correct
                 # precedence, so re-applying it here would overwrite that.
                 if not _cfg_toplevel:
-                    for _src in (gateway_platforms, yaml_cfg.get("platforms")):
+                    for _src in (yaml_cfg.get("platforms"), gateway_platforms):
                         if isinstance(_src, dict):
                             _candidate = _src.get(plat.value)
                             if isinstance(_candidate, dict):
@@ -1764,6 +1764,17 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["typing_indicator"] = platform_cfg["typing_indicator"]
                 if "typing_status_text" in platform_cfg:
                     bridged["typing_status_text"] = platform_cfg["typing_status_text"]
+                if plat == Platform.DISCORD:
+                    # Persona reaction settings use the same root/nested bridge as
+                    # the other adapter keys, while an explicit extra value stays
+                    # authoritative in PlatformConfig.from_dict.
+                    for _reaction_key in (
+                        "persona_emoji",
+                        "dynamic_reactions",
+                        "reaction_cooldown",
+                    ):
+                        if _reaction_key in platform_cfg:
+                            bridged[_reaction_key] = platform_cfg[_reaction_key]
                 # Bridge top-level port/host/secret into extra for platforms
                 # whose adapters read these from config.extra (webhook,
                 # msgraph_webhook, api_server).  Without this, YAML like:
@@ -1806,7 +1817,8 @@ def load_gateway_config() -> GatewayConfig:
                     # (slack, telegram, matrix, dingtalk, whatsapp, feishu …)
                     # instead of re-enabling them on token/SDK presence. #41112.
                     extra["_enabled_explicit"] = True
-                extra.update(bridged)
+                for _bridge_key, _bridge_value in bridged.items():
+                    extra.setdefault(_bridge_key, _bridge_value)
 
             # Plugin-owned YAML→env config bridges (#24836).  See
             # ``PlatformEntry.apply_yaml_config_fn`` for the hook contract.
@@ -1824,7 +1836,7 @@ def load_gateway_config() -> GatewayConfig:
                     # (e.g. ``platforms.discord.extra.allow_from``) and not via a
                     # top-level ``discord:`` block.
                     if not isinstance(platform_cfg, dict):
-                        for _src in (gateway_platforms, yaml_cfg.get("platforms")):
+                        for _src in (yaml_cfg.get("platforms"), gateway_platforms):
                             if isinstance(_src, dict):
                                 _candidate = _src.get(entry.name)
                                 if isinstance(_candidate, dict):

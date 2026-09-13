@@ -426,6 +426,23 @@ class GatewayStreamConsumer:
         self._tool_progress_active: bool = False
 
 
+    def _strict_egress_text(self, text: Any) -> str:
+        """Sanitize model-derived text immediately before native or fallback send."""
+        try:
+            import re
+
+            from gateway.run_turn_runner import _redact_progress_text
+
+            redacted = _redact_progress_text(text, final=True)
+            if not isinstance(redacted, str):
+                return "[REDACTED]"
+            # Native/fallback adapters are a non-wrappable boundary: do not
+            # preserve any userinfo identifier after the shared sanitizer masks
+            # its credential component.
+            return re.sub(r"(//)[^/\s?#@]+@", r"\1***@", redacted)
+        except Exception:
+            return "[REDACTED]"
+
     def _stream_is_message(self) -> bool:
         """Whether THIS chat's transport treats the stream as the message.
 
@@ -914,7 +931,9 @@ class GatewayStreamConsumer:
             if self._native_stream_opened:
                 # Finalize current stream with accumulated content.
                 # This converts the typing bubble into a stable message.
-                finalize_text = self._accumulated or self._boundary_placeholder
+                finalize_text = self._strict_egress_text(
+                    self._accumulated or self._boundary_placeholder
+                )
                 finalize_ok = False
                 try:
                     result = await self.adapter.send_stream_frame(

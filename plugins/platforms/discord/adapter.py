@@ -1185,6 +1185,11 @@ class DiscordAdapter(DynamicReactionMixin, BasePlatformAdapter):
         # can resolve them from a SessionSource (which lacks raw_message).
         # Populated in on_processing_start, cleaned up in on_processing_complete.
         self._session_raw_messages: Dict[str, Any] = {}
+        # Identity-scoped cache for immutable TurnRunner hook contexts.  The
+        # session-key cache above remains a compatibility fallback for direct
+        # adapter calls, but production hooks must never fall back to a newer
+        # message for an older token.
+        self._session_raw_messages_by_token: Dict[tuple[str, str], Any] = {}
         # Initialize the platform-agnostic dynamic reaction mixin.
         self._init_reaction_mixin()
 
@@ -3442,7 +3447,7 @@ class DiscordAdapter(DynamicReactionMixin, BasePlatformAdapter):
         return await self._remove_reaction(msg_ref, emoji)
 
     def _reaction_resolve_message(self, event):
-        """Extract the raw Discord message from the event or session cache."""
+        """Resolve a raw Discord message without crossing an identity boundary."""
         raw = getattr(event, "raw_message", None)
         if raw is not None:
             # If raw is present but lacks capability, treat as missing — do not
@@ -3453,6 +3458,9 @@ class DiscordAdapter(DynamicReactionMixin, BasePlatformAdapter):
             return None
         source = getattr(event, "source", event)
         key = self._session_key_from_source(source)
+        token = self._rxn_message_token(event)
+        if token is not None:
+            return self._session_raw_messages_by_token.get((key, token))
         return self._session_raw_messages.get(key)
 
     def _reaction_msg_key(self, event):
@@ -3461,17 +3469,22 @@ class DiscordAdapter(DynamicReactionMixin, BasePlatformAdapter):
         return self._session_key_from_source(source)
 
     async def on_processing_start(self, event: MessageEvent) -> None:
-        """Add persona emoji and cache the raw message for tool-call lookups."""
+        """Add persona emoji and cache the raw message under its identity token."""
         source = getattr(event, "source", event)
         key = self._session_key_from_source(source)
         raw = getattr(event, "raw_message", None)
+        token = self._rxn_message_token(event)
         confirmed = await self._rxn_on_processing_start(event)
         # Only cache raw after confirmed success; failed/disabled/exception
         # must leave no raw-cache authority for later tool/complete fallbacks.
         if confirmed and raw:
             self._session_raw_messages[key] = raw
+            if token is not None:
+                self._session_raw_messages_by_token[(key, token)] = raw
         else:
             self._session_raw_messages.pop(key, None)
+            if token is not None:
+                self._session_raw_messages_by_token.pop((key, token), None)
         await asyncio.to_thread(
             self._record_discord_processing_start,
             event,
@@ -3492,7 +3505,14 @@ class DiscordAdapter(DynamicReactionMixin, BasePlatformAdapter):
         await self._rxn_on_processing_complete(event, outcome)
         source = getattr(event, "source", event)
         key = self._session_key_from_source(source)
-        self._session_raw_messages.pop(key, None)
+        token = self._rxn_message_token(event)
+        if token is not None:
+            self._session_raw_messages_by_token.pop((key, token), None)
+        # Do not remove a successor's compatibility entry when an old
+        # completion arrives after the successor has already started.
+        raw = getattr(event, "raw_message", None)
+        if raw is not None and self._session_raw_messages.get(key) is raw:
+            self._session_raw_messages.pop(key, None)
 
     @staticmethod
     def _message_reference_from_ids(message_id, channel) -> "discord.MessageReference":
