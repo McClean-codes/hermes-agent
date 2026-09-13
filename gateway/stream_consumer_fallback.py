@@ -20,7 +20,7 @@ class StreamFallbackMixin:
     async def _send_new_chunk(self, text: str, reply_to_id: Optional[str], *,
                               final: bool = False) -> Optional[str]:
         """Send a new chunk threaded to ``reply_to_id``; returns the new message_id."""
-        text = self._clean_for_display(text)
+        text = self._strict_egress_text(self._clean_for_display(text))
         if not text.strip():
             return reply_to_id
         try:
@@ -204,6 +204,7 @@ class StreamFallbackMixin:
     async def _send_with_flood_retry(self, *, content: str, retry_log: str, reply_to=None):
         """adapter.send(final metadata) with ONE bounded flood retry; returns the last
         SendResult.  Exceptions propagate (callers decide whether a raise is "ambiguous")."""
+        content = self._strict_egress_text(content)
         kwargs = dict(chat_id=self.chat_id, content=content,
                       metadata=self._metadata_for_send(final=True))
         if reply_to is not None:
@@ -294,7 +295,7 @@ class StreamFallbackMixin:
         tail = self._accumulated
         if visible and tail.startswith(visible):
             tail = tail[len(visible):].lstrip()
-        tail = self._clean_for_display(tail)
+        tail = self._strict_egress_text(self._clean_for_display(tail))
         if not tail.strip():
             return
         try:
@@ -319,7 +320,7 @@ class StreamFallbackMixin:
 
     async def _send_commentary(self, text: str) -> bool:
         """Send a completed interim assistant commentary message."""
-        text = self._clean_for_display(text)
+        text = self._strict_egress_text(self._clean_for_display(text))
         if not text.strip():
             return False
         try:

@@ -252,3 +252,70 @@ def test_apiserver_wake_real_self_post_is_strictly_redacted(tmp_path, monkeypatc
     assert "opaque-password" not in posts[0]["text"]
     assert "opaque-user" not in posts[0]["text"]
 
+
+def _create_review_subscription(platform, chat_id, summary):
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="review handoff", assignee="worker", session_id="worker-session",
+        )
+        kbn.add_notify_sub(conn, task_id=tid, platform=platform, chat_id=chat_id)
+        kb.claim_task(conn, tid)
+        run_id = kb.get_task(conn, tid).current_run_id
+        assert kb.request_review(conn, tid, summary=summary, expected_run_id=run_id) is True
+        return tid
+    finally:
+        conn.close()
+
+
+def test_apiserver_review_requested_wake_effect_is_strict_when_primary_is_identity(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "apiserver-review-redact.db"))
+    kb.init_db()
+    raw_url = "https://opaque-user:opaque-password@example.test/?token=opaque-query-secret"
+    tid = _create_review_subscription("api_server", "origin-session", f"review {raw_url}")
+    posts = []
+
+    async def record_self_post(adapter, *, text, session_id):
+        posts.append({"text": text, "session_id": session_id})
+
+    import gateway.wake as wake_mod
+    monkeypatch.setattr(wake_mod, "_self_post_chat_completion", record_self_post)
+    monkeypatch.setattr("agent.redact.redact_sensitive_text", lambda text, **kwargs: text)
+    runner = _make_runner({Platform.API_SERVER: ApiServerLikeAdapter()})
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(posts) == 1
+    assert posts[0]["session_id"] == "origin-session"
+    assert tid in posts[0]["text"]
+    assert "opaque-query-secret" not in posts[0]["text"]
+    assert "opaque-password" not in posts[0]["text"]
+    assert "opaque-user" not in posts[0]["text"]
+
+
+def test_apiserver_review_requested_wake_fails_closed_when_primary_redactor_fails(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "apiserver-review-failure.db"))
+    kb.init_db()
+    raw_url = "https://opaque-user:opaque-password@example.test/?token=opaque-query-secret"
+    _create_review_subscription("api_server", "origin-session", f"review {raw_url}")
+    posts = []
+
+    async def record_self_post(adapter, *, text, session_id):
+        posts.append({"text": text, "session_id": session_id})
+
+    import gateway.wake as wake_mod
+    monkeypatch.setattr(wake_mod, "_self_post_chat_completion", record_self_post)
+    monkeypatch.setattr(
+        "agent.redact.redact_sensitive_text",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    runner = _make_runner({Platform.API_SERVER: ApiServerLikeAdapter()})
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert posts == [{"text": "[REDACTED]", "session_id": "origin-session"}]
+

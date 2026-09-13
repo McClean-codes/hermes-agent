@@ -1,6 +1,7 @@
 import asyncio
 import sqlite3
 from pathlib import Path
+from unittest.mock import patch
 
 
 from gateway.config import Platform
@@ -779,3 +780,46 @@ def test_completed_notifier_strict_redacts_title_handoff_and_wake(tmp_path, monk
     assert all("opaque-query-secret" not in text for text in texts)
     assert all("opaque-password" not in text for text in texts)
     assert all("opaque-user" not in text for text in texts)
+
+
+def test_review_requested_notifier_effects_redact_opaque_url_when_primary_is_identity(
+    tmp_path, monkeypatch,
+):
+    """Passive ping and wake effects sanitize review handoffs at the real boundary."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "strict-review.db"))
+    kb.init_db()
+    raw_url = "https://opaque-user:opaque-password@example.test/?token=opaque-query-secret"
+    tid = _review_handoff_task(summary=("x" * 150) + raw_url + " trailing")
+    adapter = RecordingAdapter()
+
+    with patch("agent.redact.redact_sensitive_text", side_effect=lambda text, **kwargs: text):
+        asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    assert len(adapter.handled) == 1
+    effects = [adapter.sent[0]["text"], adapter.handled[0].text]
+    assert tid in effects[0]
+    assert all("opaque-query-secret" not in text for text in effects)
+    assert all("opaque-password" not in text for text in effects)
+    assert all("opaque-user" not in text for text in effects)
+
+
+def test_review_requested_notifier_effects_fail_closed_when_primary_redactor_fails(
+    tmp_path, monkeypatch,
+):
+    """A failed primary redactor cannot leak the review ping or wake handoff."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "strict-review-failure.db"))
+    kb.init_db()
+    raw_url = "https://opaque-user:opaque-password@example.test/?token=opaque-query-secret"
+    _review_handoff_task(summary=f"review details {raw_url}")
+    adapter = RecordingAdapter()
+
+    monkeypatch.setattr(
+        "agent.redact.redact_sensitive_text",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert adapter.sent == [{"chat_id": "chat-1", "text": "[REDACTED]", "metadata": {}}]
+    assert len(adapter.handled) == 1
+    assert adapter.handled[0].text == "[REDACTED]"

@@ -23,6 +23,7 @@ from __future__ import annotations
 import queue
 import sys
 import types
+from types import SimpleNamespace
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -819,9 +820,11 @@ class TestImportantOutputDelivery:
         gateway._adapter_for_source = lambda source: adapter
         gateway._should_send_voice_reply = lambda *_a, **_kw: False
 
-        final_text = "Hello final reply"
-        sanitized = _sanitize_gateway_final_response(Platform.TELEGRAM, final_text)
-        assert sanitized == final_text
+        final_text = "answer https://opaque-user:opaque-password@example.test/?token=opaque-query-secret"
+        with patch("agent.redact.redact_sensitive_text", side_effect=lambda text, **kwargs: text):
+            sanitized = _sanitize_gateway_final_response(Platform.TELEGRAM, final_text)
+        assert sanitized != final_text
+        assert "opaque-query-secret" not in sanitized
         agent_result = {
             "final_response": sanitized,
             "messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": sanitized}],
@@ -849,15 +852,18 @@ class TestImportantOutputDelivery:
             )
 
         adapter.set_message_handler(gateway_handler)
-        with patch("gateway.delivery_ledger.ledger_enabled", return_value=False):
+        with patch("agent.redact.redact_sensitive_text", side_effect=lambda text, **kwargs: text), \
+             patch("gateway.delivery_ledger.ledger_enabled", return_value=False):
             await adapter._process_message_background(event, session_key)
 
         # The adapter's send implementation captured the actual outbound effect. The return value from
         # _hmwa_deliver_turn_response is deliberately not used as delivery evidence.
         assert adapter.sent == [{
-            "chat_id": "-1001", "content": "Hello final reply", "reply_to": "msg-final-1",
+            "chat_id": "-1001", "content": sanitized, "reply_to": "msg-final-1",
             "metadata": {"notify": True},
         }]
+        assert "opaque-password" not in adapter.sent[0]["content"]
+        assert "opaque-user" not in adapter.sent[0]["content"]
         assert pq.empty(), "progress must stay empty after final delivery"
         assert lq.empty(), "log must stay empty after final delivery"
         runner.progress_callback("tool.completed", "terminal", "", {})
@@ -1702,3 +1708,98 @@ def test_final_status_and_approval_boundaries_use_strict_egress():
         assert "opaque-query-secret" not in output
         assert "opaque-password" not in output
         assert "opaque-user" not in output
+
+
+def test_strict_gateway_egress_handles_unicode_split_keys_and_clipped_values():
+    """Production final/status egress catches raw and encoded Unicode key splits."""
+    import agent.redact as redact_module
+    from gateway.run import (
+        _egress_url_has_unmasked_credentials,
+        _prepare_gateway_status_message,
+        _sanitize_gateway_final_response,
+    )
+
+    cases = (
+        "https://example.test/?to" + chr(0x200B) + "ken=opaque-zero-width",
+        "https://example.test/?to" + chr(0x200D) + "ken=opaque-joiner",
+        "https://example.test/?si" + chr(0x200D) + "gnature=opaque-joiner2",
+        "https://example.test/?api" + chr(0xA0) + "key=opaque-nbsp",
+        "https://example.test/?to%E2%80%8Bken=opaque-encoded-zero-width",
+        "https://example.test/?si%E2%80%8Dgnature=opaque-encoded-joiner",
+        "https://example.test/?api%C2%A0key=opaque-encoded-nbsp",
+        "https://example.test/?to" + chr(0x200B) + "ken=opaque-clipped",
+    )
+
+    # Force the authoritative redactor to identity so this test proves the
+    # strict production egress pass, not pre-redaction in agent.redact.
+    with patch.object(redact_module, "redact_sensitive_text", side_effect=lambda text, **kwargs: text):
+        for raw in cases:
+            final = _sanitize_gateway_final_response("telegram", raw)
+            status = _prepare_gateway_status_message("telegram", "status", raw)
+            assert final != "[REDACTED]"
+            assert status is not None
+            for output in (final, status):
+                assert "opaque-" not in output
+                assert not _egress_url_has_unmasked_credentials(output)
+
+        benign = "https://example.test/?public=ok&next=still-ok"
+        assert _sanitize_gateway_final_response("telegram", benign) == benign
+        assert _prepare_gateway_status_message("telegram", "status", benign) == benign
+
+
+def test_final_status_and_approval_production_effect_ledgers_are_strict(monkeypatch):
+    """Final, status, and interactive approval callers sanitize adapter effects."""
+    import concurrent.futures
+
+    from gateway.config import Platform
+    from gateway.run_turn_runner import TurnRunner
+
+    raw = "https://opaque-user:opaque-password@example.test/?token=opaque-query-secret"
+
+    class EffectLedgerAdapter:
+        typed_command_prefix = "/"
+
+        def __init__(self):
+            self.statuses = []
+            self.approvals = []
+
+        async def send_or_update_status(self, chat_id, status_key, content, metadata=None):
+            self.statuses.append((chat_id, status_key, content, metadata))
+            return SimpleNamespace(success=True, message_id="status-1")
+
+        def pause_typing_for_chat(self, chat_id):
+            return None
+
+        async def send_exec_approval(self, **kwargs):
+            self.approvals.append(kwargs)
+            return SimpleNamespace(success=True, message_id="approval-1")
+
+    adapter = EffectLedgerAdapter()
+    ctx = _make_ctx(progress_mode="off", tool_progress_enabled=False)
+    ctx.source.platform = Platform.TELEGRAM
+    ctx._status_adapter = adapter
+    ctx._status_chat_id = "chat"
+    ctx._status_thread_metadata = {"thread_id": "thread"}
+    ctx.session_key = "session"
+    runner = TurnRunner(object(), ctx)  # type: ignore[arg-type]
+
+    def schedule(coro, *_args, **_kwargs):
+        future = concurrent.futures.Future()
+        try:
+            future.set_result(asyncio.run(coro))
+        except Exception as exc:
+            future.set_exception(exc)
+        return future
+
+    runner._schedule = schedule
+    with monkeypatch.context() as patcher:
+        patcher.setattr("agent.redact.redact_sensitive_text", lambda text, **kwargs: text)
+        runner._status_callback_sync("status", raw)
+        runner._approval_notify_sync({"command": raw, "description": f"why {raw}"})
+
+    assert len(adapter.statuses) == 1
+    assert len(adapter.approvals) == 1
+    effects = [adapter.statuses[0][2], adapter.approvals[0]["command"], adapter.approvals[0]["description"]]
+    assert all("opaque-query-secret" not in text for text in effects)
+    assert all("opaque-password" not in text for text in effects)
+    assert all("opaque-user" not in text for text in effects)

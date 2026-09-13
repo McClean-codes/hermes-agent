@@ -1595,3 +1595,107 @@ async def test_stream_transport_fails_closed_when_gateway_egress_helper_is_unava
 
     assert await consumer._send_or_edit(raw, finalize=True) is True
     assert adapter.calls == [("stream", "[REDACTED]", True)]
+
+
+class _FallbackEgressLedgerAdapter:
+    """Recording adapter that rejects instance wrapping like production adapters can."""
+
+    __slots__ = ("calls", "fail_send", "MAX_MESSAGE_LENGTH")
+
+    def __init__(self, *, fail_send=False):
+        self.calls = []
+        self.fail_send = fail_send
+        self.MAX_MESSAGE_LENGTH = 600
+
+    async def send_stream_frame(self, text, *, finalize=False, **kwargs):
+        self.calls.append(("stream", text, finalize))
+        return True
+
+    async def send_draft(self, *, chat_id, draft_id, content, metadata=None):
+        self.calls.append(("draft", content, False))
+        return SimpleNamespace(success=True, message_id=None)
+
+    async def send(self, *args, **kwargs):
+        content = kwargs.get("content") if "content" in kwargs else args[1]
+        self.calls.append(("send", content, kwargs.get("finalize", False)))
+        if self.fail_send:
+            return SimpleNamespace(success=False, error="permanent failure")
+        return SimpleNamespace(success=True, message_id=f"message-{len(self.calls)}")
+
+    async def edit_message(self, **kwargs):
+        self.calls.append(("edit", kwargs["content"], kwargs.get("finalize", False)))
+        return SimpleNamespace(success=True, message_id=kwargs["message_id"])
+
+    async def delete_message(self, *args, **kwargs):
+        self.calls.append(("delete", "", False))
+        return True
+
+    def truncate_message(self, text, limit):
+        return [text[:limit], text[limit:]]
+
+
+@pytest.mark.asyncio
+async def test_production_stream_fallback_ledger_covers_overflow_and_every_direct_send():
+    """Every fallback seam sanitizes before an adapter that cannot be wrapped sees bytes."""
+    raw_url = "https://opaque-user:opaque-password@example.test/?token=opaque-query-secret"
+    raw = raw_url + " " + ("x" * 650)
+    adapter = _FallbackEgressLedgerAdapter()
+
+    # Exercise the real constructor/run path: first-send overflow seals a head
+    # through _send_new_chunk, then sends the tail through _first_send.
+    consumer = GatewayStreamConsumer(adapter, "chat", StreamConsumerConfig(cursor=""))
+    consumer.on_delta(raw)
+    consumer.finish()
+    await consumer.run()
+
+    # Exercise every remaining direct-send fallback seam, including the
+    # non-flood error result path used by the final continuation retry.
+    fallback = GatewayStreamConsumer(adapter, "chat", StreamConsumerConfig(cursor=""))
+    await fallback._send_new_chunk(raw, None)
+    await fallback._send_with_flood_retry(content=raw, retry_log="retry %.1f")
+    fallback._accumulated = raw
+    fallback._message_id = "preview"
+    fallback._last_sent_text = ""
+    await fallback._flush_segment_tail_on_edit_failure()
+    await fallback._send_commentary(raw)
+    await fallback._send_fallback_final(raw)
+
+    error_adapter = _FallbackEgressLedgerAdapter(fail_send=True)
+    error_consumer = GatewayStreamConsumer(error_adapter, "chat", StreamConsumerConfig(cursor=""))
+    result = await error_consumer._send_with_flood_retry(content=raw, retry_log="retry %.1f")
+    assert result.success is False
+
+    sends = [content for kind, content, _finalize in (*adapter.calls, *error_adapter.calls)
+             if kind in {"send", "edit", "stream", "draft"} and content]
+    assert len([kind for kind, _content, _finalize in adapter.calls if kind == "send"]) >= 6
+    assert sends
+    assert all("opaque-query-secret" not in content for content in sends)
+    assert all("opaque-password" not in content for content in sends)
+    assert all("opaque-user" not in content for content in sends)
+
+
+@pytest.mark.asyncio
+async def test_production_stream_fallback_direct_seams_fail_closed_on_redactor_failure(monkeypatch):
+    """A primary-redactor failure yields only the fixed placeholder at fallback effects."""
+    import agent.redact as redact_module
+
+    adapter = _FallbackEgressLedgerAdapter()
+    consumer = GatewayStreamConsumer(adapter, "chat", StreamConsumerConfig(cursor=""))
+    raw = "https://user:opaque-password@example.test/?token=opaque-query-secret"
+    monkeypatch.setattr(
+        redact_module,
+        "redact_sensitive_text",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+
+    await consumer._send_new_chunk(raw, None)
+    await consumer._send_with_flood_retry(content=raw, retry_log="retry %.1f")
+    consumer._accumulated = raw
+    consumer._message_id = "preview"
+    consumer._last_sent_text = ""
+    await consumer._flush_segment_tail_on_edit_failure()
+    await consumer._send_commentary(raw)
+
+    sends = [content for kind, content, _finalize in adapter.calls if kind == "send"]
+    assert len(sends) == 4
+    assert sends == ["[REDACTED]"] * 4

@@ -23,6 +23,7 @@ import signal
 import threading
 import time
 import traceback
+import unicodedata
 from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
@@ -552,10 +553,11 @@ _EGRESS_SENSITIVE_URL_PARAM_NAMES = frozenset({
 })
 # The primary redactor intentionally leaves ordinary web URLs unchanged. These
 # egress-only passes preserve URL spelling while masking credential-bearing
-# query values and userinfo, including percent-encoded and control-split keys.
+# query values and userinfo, including percent-encoded, control-, and Unicode
+# format/separator-split keys.
 _EGRESS_URL_PARAM_RE = re.compile(r"([?&#;])([A-Za-z0-9_.~+%\-]+)=([^#&;\s\"'<>]*)")
 _EGRESS_SPLIT_URL_PARAM_RE = re.compile(
-    r"([?&#;])((?:[A-Za-z0-9_.~+%\-][\x00-\x20]?){1,96})=([^#&;\"'<>]*)"
+    r"([?&#;])((?:[A-Za-z0-9_.~+%\-]|[\x00-\x20\u0080-\U0010ffff]){1,192})=([^#&;\"'<>]*)"
 )
 _EGRESS_URL_USERINFO_RE = re.compile(
     r"(?P<prefix>(?:[A-Za-z][A-Za-z0-9+.-]*:)?//)(?P<userinfo>[^/\s?#@]+)@"
@@ -574,7 +576,10 @@ def _egress_url_param_name(value: str) -> str:
         decoded = next_value
     return "".join(
         ch for ch in decoded.casefold().replace("-", "_")
-        if not ord(ch) < 32 and ord(ch) not in {0x200b, 0x200c, 0x200d}
+        if not (
+            ord(ch) < 32
+            or unicodedata.category(ch) in {"Cf", "Zl", "Zp", "Zs"}
+        )
     )
 
 
