@@ -61,31 +61,17 @@ from .http_transport import (  # noqa: F401 — re-exported for monkeypatch targ
 
 logger = logging.getLogger(__name__)
 
-# _DEFAULT_PORT and _MAX_CONTEXT_PEERS are imported from a2a_persistence.
-# Bound orphan grace to the configured reply window while keeping a finite watchdog horizon.
+# Bound orphan grace and watchdog; client patience is capped separately.
 _MIN_ORPHAN_TIMEOUT, _MAX_ORPHAN_TIMEOUT, _WATCHDOG_INTERVAL = 300, 86400, 60
-_SSE_KEEPALIVE = 5  # seconds between SSE keepalive comments
-# Seconds past the client's advertised read timeout (sender.timeout) before
-# the server assumes the client gave up and marks the pending task
-# out_of_band_only. The MSG_PEEK probe catches clients that CLOSE; this is
-# the deterministic backstop for clients that stay connected but will
-# discard the reply (the reply was consumed although the server saw
-# "alive").
+_ORPHAN_TIMEOUT = _MIN_ORPHAN_TIMEOUT  # compatibility alias; runtime uses _orphan_timeout()
+_SSE_KEEPALIVE = 5
 _PATIENCE_MARGIN = 30
 
-# Short-window inbound dedupe: the same wire message
-# (contextId, messageId) must not be dispatched twice.
+# Dedupe identical inbound (contextId, messageId) deliveries.
 _INBOUND_DEDUPE_WINDOW = 60.0
 _INBOUND_DEDUPE_MAX = 1024
 
-# Module-level registry of live A2A adapters (weak refs so a dead gateway
-# never pins memory). The outbound client tools (plugins/platforms/a2a/tools.py)
-# use this to register the *local* context→peer mapping whenever an agent
-# makes an outbound A2A call from ANY platform origin (discord, telegram,
-# CLI/ACP, api_server). Without this, _context_peers only ever learns peers
-# from inbound A2A tasks, so a completion push for a context that was born on
-# another platform finds no peer: no A2A inbound ever touched its contextId,
-# so the push had nowhere to go).
+# Weak registry used by outbound tools to map local contexts to adapters.
 _ADAPTERS: "dict[int, weakref.ReferenceType[A2AAdapter]]" = {}
 _ADAPTERS_GUARD = threading.Lock()
 
@@ -1820,34 +1806,8 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
         else:
             logger.warning("A2A: ambiguous task authority for context %s: %d active tasks", chat_id, len(_active_candidates))
             return SendResult(success=False, message_id=message_id, error="ambiguous task authority for context")
-        # No waiter (e.g. a late chunk or out-of-band send) — push the message
-        # back to the peer that owns this context as a NEW task, reusing the
-        # same contextId so it lands in the caller's session (session
-        # continuity). Without this, task-notifier wake replies and late
-        # completions were silently dropped while reporting success.
-        #
-        # Loopback self-push guard: in localhost-only mode every inbound
-        # caller authenticates as "ip:<addr>" with no port, so the only
-        # resolvable target for a loopback identity is THIS gateway's own
-        # endpoint. Self-pushing is correct for the notifier's
-        # completion delivery — the sub's user_id is the loopback identity
-        # and the message must re-enter the owning session (the watcher marks
-        # that send with metadata["a2a_push"]=True). A session's own REPLY
-        # must never be re-queued into the same session: that produced an
-        # unbounded self-ping-pong once the loopback fallback became
-        # resolvable — every reply was pushed back,
-        # processed, and answered again forever. Unmarked sends to a
-        # loopback peer are replies with no external destination — that is
-        # a LOUD failure, not a silent success: a
-        # helper-sent message refined to "ip:127.0.0.1" and its long reply
-        # was dropped here with success=True and no
-        # audit. The notifier/engine must rewind instead of advancing past a
-        # lost event.
-        #
-        # Missing-peer guard: if no peer is registered for this context,
-        # the push has no destination and MUST fail explicitly — reporting
-        # success here would silently advance the Kanban cursor past a
-        # lost event (the reviewer's finding: no-peer false success).
+        # No waiter: deliver as a new task on the same context. Loopback
+        # replies and missing peers fail explicitly so callers can rewind.
         if not (metadata or {}).get("a2a_push"):
             with self._context_peers_lock:_loop_peer=self._context_peers.get(chat_id,"")
             if _loop_peer and _loopback_fallback_url(_loop_peer,self.host,self.port):
