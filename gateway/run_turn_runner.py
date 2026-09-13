@@ -34,6 +34,187 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
 
+def _redact_progress_text(text: str | None) -> str:
+    """Fail-closed secret redaction for progress/preview/status text before chat publication.
+
+    Delegates to the authoritative ``agent.redact.redact_sensitive_text`` with
+    ``force=True`` (same boundary as logs/tool-output), so progress previews
+    including terminal full blocks, verbose args, URLs/paths, plugin/MCP previews,
+    Codex/native-card content and live-status phrases never carry raw credentials
+    even when ``security.redact_secrets`` is off. Falls back to the gateway's
+    ``_redact_gateway_user_facing_secrets`` on import failure; never weakens
+    to a local marker filter.
+    """
+    if text is None:
+        return ""
+    s = str(text)
+    if not s:
+        return s
+    try:
+        from agent.redact import redact_sensitive_text
+
+        return redact_sensitive_text(s, force=True)
+    except Exception:
+        try:
+            from gateway.run import _redact_gateway_user_facing_secrets
+
+            return _redact_gateway_user_facing_secrets(s)
+        except Exception:
+            logger.debug("progress redaction unavailable", exc_info=True)
+            return "[REDACTED]"
+
+# ---- progress filter helpers (per-tool + category) ---------------------------
+# Category aliases supported in display.tool_progress_filter keys. Normalized to lower case.
+# "skills" covers skill_manage/skill_view etc; "mcp" covers all MCP-discovered tools;
+# "plugins" covers tools registered by hermes_plugins. Unknown categories are stored but
+# never match, failing safe (no effect). Individual tool names take precedence over
+# categories.
+
+_CATEGORY_ALIASES: dict[str, str] = {
+    "skill": "skills",
+    "skills": "skills",
+    "mcp": "mcp",
+    "mcp_tools": "mcp",
+    "mcp-tools": "mcp",
+    "mcp_tool": "mcp",
+    "plugin": "plugins",
+    "plugins": "plugins",
+}
+
+# Static set of skill-related tool names for quick category matching when registry
+# is not yet populated. The registry path (toolset == "skills") is preferred when
+# available; this fallback is an explicit, reviewed allowlist without prefix overmatching.
+# "memory" is NOT part of skills and must remain excluded from the skills category.
+_SKILL_TOOL_NAMES = frozenset({
+    "skill_manage", "skill_view", "skill_ledger", "skill_evaluator", "skill_usage",
+    "skills_tool", "skills_hub", "skill_manager_tool",
+})
+
+def _normalize_filter_key(key: str) -> str:
+    k = key.strip().lower()
+    return _CATEGORY_ALIASES.get(k, k)
+
+def _get_tool_categories(tool_name: str) -> list[str]:
+    """Return category keys (canonical) for a tool name, for filter matching.
+
+    Categories are "skills", "mcp", "plugins" when authoritative registry /
+    current-scope metadata can distinguish them. Uses the tool registry when
+    available; falls back to the explicit skill allowlist without prefix
+    overmatching. MCP provenance is registry-toolset only and fails closed when
+    the active registry cannot establish MCP ownership (no process-global
+    cross-profile fallback). Never raises; empty list means no category.
+    """
+    if not tool_name or not isinstance(tool_name, str):
+        return []
+    name_lower = tool_name.strip().lower()
+    cats: list[str] = []
+    # Skills: authoritative registry check first, then explicit allowlist without prefix
+    try:
+        from tools.registry import registry as _reg
+        toolset_for_skill = None
+        try:
+            toolset_for_skill = _reg.get_toolset_for_tool(tool_name)
+            if toolset_for_skill is None:
+                toolset_for_skill = _reg.get_toolset_for_tool(name_lower)
+        except Exception:
+            toolset_for_skill = None
+        if toolset_for_skill == "skills":
+            cats.append("skills")
+        elif name_lower in _SKILL_TOOL_NAMES:
+            # Fallback allowlist when registry not yet populated or tool not registered
+            # via registry (e.g., early turn before tool discovery). No prefix matching.
+            cats.append("skills")
+    except Exception:
+        # Registry unavailable: use allowlist only
+        if name_lower in _SKILL_TOOL_NAMES:
+            if "skills" not in cats:
+                cats.append("skills")
+    # Registry-backed checks for MCP and plugins (current scope, never global fallback)
+    try:
+        from tools.registry import registry as _reg
+        toolset = None
+        try:
+            toolset = _reg.get_toolset_for_tool(tool_name)
+        except Exception:
+            try:
+                toolset = _reg.get_toolset_for_tool(name_lower)
+            except Exception:
+                toolset = None
+        if toolset and isinstance(toolset, str) and toolset.startswith("mcp-"):
+            if "mcp" not in cats:
+                cats.append("mcp")
+        # Plugin ownership: authoritative registry check (scope-aware)
+        try:
+            entry = None
+            try:
+                entry = _reg.get_entry(tool_name)
+                if entry is None:
+                    entry = _reg.get_entry(name_lower)
+            except Exception:
+                entry = None
+            if entry is not None:
+                # Prefer _plugin_owner_of (scope-aware) over raw module prefix
+                try:
+                    owner = _reg._plugin_owner_of(entry.handler) if hasattr(_reg, "_plugin_owner_of") else None
+                    if owner and "plugins" not in cats:
+                        cats.append("plugins")
+                except Exception:
+                    pass
+                # Toolset containing "plugin" also indicates plugin (e.g., toolset "plugin" or "my-plugin")
+                # But only when registry establishes it; not via arbitrary module prefix alone.
+                try:
+                    ts = toolset or _reg.get_toolset_for_tool(entry.name) if hasattr(entry, "name") else toolset
+                    if ts and isinstance(ts, str) and "plugin" in ts.lower():
+                        if "plugins" not in cats:
+                            cats.append("plugins")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    except Exception:
+        pass
+    # No MCP process-global fallback: fail closed if registry cannot establish MCP ownership.
+    # Deduplicate preserving order
+    seen = set()
+    uniq = []
+    for c in cats:
+        if c not in seen:
+            seen.add(c)
+            uniq.append(c)
+    return uniq
+
+def _resolve_effective_mode(tool_name: str, global_mode: str, filter_dict: dict | None) -> str:
+    """Resolve per-tool effective progress mode, honoring filter overrides.
+
+    Precedence: exact tool name (case-insensitive) wins over category, then global.
+    Categories checked: skills/mcp/plugins (canonical). Returns global_mode if filter
+    empty or no match. Filter keys are canonicalized so platform alias precedence
+    (skill->skills etc.) is deterministic before this check.
+    """
+    if not filter_dict:
+        return global_mode
+    # Canonicalize filter keys defensively so raw alias dicts still resolve correctly
+    canonical_map: dict[str, str] = {}
+    for k, v in filter_dict.items():
+        if not isinstance(k, str):
+            continue
+        ck = _normalize_filter_key(k.strip().lower())
+        # Last-wins for canonicalized duplicates (e.g., "skill" and "skills")
+        canonical_map[ck] = v  # type: ignore[assignment]
+    # Also keep original lower map for exact-tool lookup that may be alias? But tool names
+    # are lowercased and not categories, so canonicalization of exact tool names that happen
+    # to match alias would incorrectly map them. For exact tool match we must use raw lower.
+    raw_lower_map = {str(k).strip().lower(): v for k, v in filter_dict.items() if isinstance(k, str)}
+    name_lower = tool_name.strip().lower() if isinstance(tool_name, str) else ""
+    if name_lower and name_lower in raw_lower_map:
+        return raw_lower_map[name_lower]
+    # Category check: tool may belong to multiple, first match wins (skills, mcp, plugins)
+    for cat in _get_tool_categories(tool_name):
+        if cat in canonical_map:
+            return canonical_map[cat]
+    return global_mode
+
+
 
 class _ExecApprovalDeclined(RuntimeError):
     """The connector refused the approval card's destination.
@@ -51,6 +232,9 @@ class TurnRunner:
     def __init__(self, runner: "GatewayRunner", ctx: TurnContext) -> None:
         self._runner = runner
         self._ctx = ctx
+        # Track native task-card call IDs hidden by the filter so a later
+        # completion for the same ID cannot resurrect a hidden card.
+        self._hidden_native_call_ids: set[str] = set()
 
     # ── shared thread→loop plumbing ─────────────────────────────────────────────────────────
 
@@ -102,13 +286,41 @@ class TurnRunner:
         if event_type == "subagent.complete":
             self._progress_subagent_notice(preview, kwargs)
             return
-        self._progress_live_status(event_type, tool_name, args)
-        # "log" mode: append tool.started lines to the log queue, silent in chat. Handled before
-        # the progress_queue guard because log mode runs without a chat progress queue.
-        if ctx.log_queue is not None and event_type == "tool.started" and tool_name and tool_name != "_thinking":
-            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            preview_str = f' "{preview}"' if preview else ""
-            ctx.log_queue.put(f"{ts}  {tool_name}:{preview_str}".rstrip())
+        # Resolve effective per-tool mode before any routing so "log" and "off" are honored
+        # for both the chat progress rail and the optional live-status rail.
+        _tool_for_effective = tool_name if isinstance(tool_name, str) else ""
+        try:
+            _effective_mode = _resolve_effective_mode(_tool_for_effective, ctx.progress_mode, getattr(ctx, "tool_progress_filter", None))
+        except Exception:
+            _effective_mode = ctx.progress_mode
+        # Effective "log" goes only to the log sink, never the chat progress queue.
+        # This preserves the global-log contract: global log remains chat-silent for
+        # unoverridden tools, and a per-tool log override does not become chat-visible.
+        if _effective_mode == "log" and event_type == "tool.started" and tool_name and tool_name != "_thinking":
+            if ctx.log_queue is not None:
+                try:
+                    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    preview_str = f' "{preview}"' if preview else ""
+                    ctx.log_queue.put(f"{ts}  {tool_name}:{preview_str}".rstrip())
+                except Exception:
+                    logger.debug("log queue put failed", exc_info=True)
+            return
+        # Effective "off" suppresses chat progress (and live-status preview) for this tool.
+        if _effective_mode == "off" and event_type == "tool.started" and tool_name and tool_name != "_thinking":
+            # Also suppress live-status preview for hidden tools before returning
+            return
+        # Live status rail: independent acknowledgement path, but must not expose a tool
+        # preview that the filter explicitly denied. Gate started previews by effective mode;
+        # completion clears are safe but also gated to keep the rail consistent with the filter.
+        # "_thinking" is never part of the filter categories and is handled inside _progress_live_status.
+        if event_type == "tool.started" and _effective_mode not in ("off", "log"):
+            self._progress_live_status(event_type, tool_name, args)
+        elif event_type == "tool.completed" and _effective_mode not in ("off", "log"):
+            self._progress_live_status(event_type, tool_name, args)
+        elif event_type not in {"tool.started", "tool.completed"}:
+            # For non-tool lifecycle events (e.g., _thinking) keep the original independent rail
+            # but still respect its own adapter/mode guards inside _progress_live_status.
+            self._progress_live_status(event_type, tool_name, args)
         if not ctx.progress_queue or not ctx._run_still_current():
             return
         if event_type == "tool.completed" and not ctx.long_tool_hint_fired[0]:
@@ -141,11 +353,18 @@ class TurnRunner:
             or self._agent_interrupted()
         ):
             return
-        # "new" mode: only report when tool changes
-        if ctx.progress_mode == "new" and tool_name == ctx.last_tool[0]:
+        # Per-tool/category filter: reuse the already-resolved effective mode. Malformed/absent
+        # filter already fell back to global via _resolve_effective_mode above.
+        if _effective_mode == "off":
+            return
+        if _effective_mode == "log":
+            # Already handled at the top (routed to log queue only); never emit to chat progress
+            return
+        # "new" mode: only report when tool changes (per effective mode, not global)
+        if _effective_mode == "new" and tool_name == ctx.last_tool[0]:
             return
         ctx.last_tool[0] = tool_name
-        msg = self._progress_build_message(tool_name, preview, args)
+        msg = self._progress_build_message(tool_name, preview, args, _effective_mode=_effective_mode)
         if msg is not None:
             self._progress_emit(msg)
 
@@ -174,7 +393,9 @@ class TurnRunner:
         try:
             if event_type == "tool.started" and tool_name and ctx._run_still_current():
                 from agent.display import build_status_phrase
-                adapter.set_status_text(ctx.source.chat_id, build_status_phrase(tool_name, args if ctx._live_status_mode == "full" else None))
+                _phrase = build_status_phrase(tool_name, args if ctx._live_status_mode == "full" else None)
+                _phrase = _redact_progress_text(_phrase)
+                adapter.set_status_text(ctx.source.chat_id, _phrase)
             elif event_type == "tool.completed":
                 # Between tools the model is genuinely "thinking" again — revert to the static default.
                 adapter.set_status_text(ctx.source.chat_id, None)
@@ -217,18 +438,21 @@ class TurnRunner:
             and isinstance(args.get("command"), str) and args["command"].strip()
         ):
             return None, None
-        cmd_full = args["command"].rstrip()
+        raw_full = args["command"].rstrip()
+        cmd_full = _redact_progress_text(raw_full)
         header = "" if self._ctx.last_was_terminal_block[0] else f"{emoji} {tool_name}\n"
         cap = self._preview_cap()
         lines = cmd_full.splitlines()
+        # Derive short from the redacted full so truncation never re-exposes raw secrets
         cmd_short = lines[0] if lines else cmd_full
         if len(cmd_short) > cap:
             cmd_short = cmd_short[:cap - 3] + "..."
         elif len(lines) > 1:
             cmd_short += " ..."
+        # Header is not secret-derived; command bodies are already redacted
         return f"{header}```\n{cmd_full}\n```", f"{header}```\n{cmd_short}\n```"
 
-    def _progress_build_message(self, tool_name, preview, args) -> Optional[str]:
+    def _progress_build_message(self, tool_name, preview, args, _effective_mode: str | None = None) -> Optional[str]:
         """Render the progress line. Verbose mode queues directly (no dedup) and returns None."""
         ctx = self._ctx
         from agent.display import get_tool_emoji
@@ -238,7 +462,12 @@ class TurnRunner:
         except Exception:
             adapter = None
         code_full, code_short = self._progress_terminal_blocks(adapter, tool_name, args, emoji)
-        verbose = ctx.progress_mode == "verbose"
+        if _effective_mode is None:
+            try:
+                _effective_mode = _resolve_effective_mode(tool_name, ctx.progress_mode, getattr(ctx, "tool_progress_filter", None))
+            except Exception:
+                _effective_mode = ctx.progress_mode
+        verbose = _effective_mode == "verbose"
         code = code_full if verbose else code_short
         ctx.last_was_terminal_block[0] = code is not None
         if verbose:
@@ -246,28 +475,39 @@ class TurnRunner:
                 from agent.display import get_tool_preview_max_len
                 pl = get_tool_preview_max_len()
                 args_str = json.dumps(args, ensure_ascii=False, default=str)
+                args_str = _redact_progress_text(args_str)
                 # tool_preview_length 0 (default) = no truncation in verbose mode; the user asked
                 # for full detail and platform message-length limits handle the rest.
                 if pl > 0 and len(args_str) > pl:
                     args_str = args_str[:pl - 3] + "..."
                 code = f"{emoji} {tool_name}({list(args.keys())})\n{args_str}"
+                code = _redact_progress_text(code)
             elif code is None:
-                code = f"{emoji} {tool_name}: \"{preview}\"" if preview else f"{emoji} {tool_name}..."
+                # Preview-derived fallback must be redacted before publication
+                _pv = _redact_progress_text(preview) if preview else preview
+                code = f"{emoji} {tool_name}: \"{_pv}\"" if _pv else f"{emoji} {tool_name}..."
+                code = _redact_progress_text(code)
+            else:
+                # Terminal blocks are already redacted, but still pass through boundary for safety
+                code = _redact_progress_text(code)
             ctx.progress_queue.put(code)
             return None
         if code is not None:
-            return code
+            return _redact_progress_text(code)
         if not preview:
-            return f"{emoji} {tool_name}..."
+            return _redact_progress_text(f"{emoji} {tool_name}...")
         from agent.display import get_tool_verb, prepare_tool_preview, tool_verb_connector, verb_drops_preview
         prepared = prepare_tool_preview(tool_name, args, fallback=preview, max_len=self._preview_cap())
-        preview = adapter.format_tool_preview(prepared) if adapter is not None else prepared.text
+        preview_text = adapter.format_tool_preview(prepared) if adapter is not None else prepared.text
+        preview_text = _redact_progress_text(preview_text)
         # Friendly labels: human-phrased line for built-in tools ("🔍 Searching the web for ...")
         # by prefixing the verb onto the computed preview, so the command/url/query is kept.
         verb = get_tool_verb(tool_name)
         if not verb:
-            return f"{emoji} {tool_name}: \"{preview}\""
-        return f"{emoji} {verb}" if verb_drops_preview(tool_name) else f"{emoji} {verb}{tool_verb_connector(tool_name)}{preview}"
+            return _redact_progress_text(f"{emoji} {tool_name}: \"{preview_text}\"")
+        if verb_drops_preview(tool_name):
+            return _redact_progress_text(f"{emoji} {verb}")
+        return _redact_progress_text(f"{emoji} {verb}{tool_verb_connector(tool_name)}{preview_text}")
 
     def _progress_emit(self, msg: str) -> None:
         """Dedup consecutive identical lines (execute_code boilerplate), then route to the native
@@ -725,16 +965,78 @@ class TurnRunner:
         """Queue an ID-correlated native progress start from the agent thread."""
         if not self._native_card_gate():
             return
+        # Apply the same per-tool/category filter as the ordinary progress rail;
+        # hidden starts must be remembered so a later completion cannot resurrect.
+        # Slack native is opt-in and should still show progress when global is off and no filter
+        # explicitly denies the tool (otherwise Slack's always-off default would leave the feature dead).
+        try:
+            _filter = getattr(self._ctx, "tool_progress_filter", None)
+            if not _filter and self._ctx.progress_mode == "off" and self._ctx._native_slack_task_cards:
+                _eff = "all"
+            else:
+                _eff = _resolve_effective_mode(str(tool_name or ""), self._ctx.progress_mode, _filter)
+        except Exception:
+            _eff = self._ctx.progress_mode
+            try:
+                if not getattr(self._ctx, "tool_progress_filter", None) and self._ctx.progress_mode == "off" and self._ctx._native_slack_task_cards:
+                    _eff = "all"
+            except Exception:
+                pass
+        if _eff in ("off", "log"):
+            cid = str(call_id or "")
+            if cid:
+                self._hidden_native_call_ids.add(cid)
+                # Mirror to context set when available for session/context persistence
+                try:
+                    if hasattr(self._ctx, "_hidden_native_call_ids") and hasattr(self._ctx._hidden_native_call_ids, "add"):
+                        self._ctx._hidden_native_call_ids.add(cid)
+                except Exception:
+                    pass
+            return
         from agent.display import build_tool_preview
         name = str(tool_name or "tool")
+        _preview_raw = build_tool_preview(name, args or {}, max_len=64) or ""
+        _preview = _redact_progress_text(_preview_raw)
         self._ctx.progress_queue.put({
             "type": "tool.started", "tool_call_id": str(call_id or ""), "tool_name": name,
-            "preview": build_tool_preview(name, args or {}, max_len=64) or "",
+            "preview": _preview,
         })
 
     def native_tool_complete_callback(self, call_id, tool_name, args, result):
         """Queue the matching native completion using the real tool-call ID."""
         if not self._native_card_gate():
+            return
+        cid = str(call_id or "")
+        # Suppress completion for a call that was hidden at start time
+        if cid and cid in self._hidden_native_call_ids:
+            return
+        try:
+            if hasattr(self._ctx, "_hidden_native_call_ids") and cid and cid in self._ctx._hidden_native_call_ids:
+                return
+        except Exception:
+            pass
+        # Completion-only events (no prior start) must also be gated by effective mode
+        try:
+            _filter = getattr(self._ctx, "tool_progress_filter", None)
+            if not _filter and self._ctx.progress_mode == "off" and self._ctx._native_slack_task_cards:
+                _eff = "all"
+            else:
+                _eff = _resolve_effective_mode(str(tool_name or ""), self._ctx.progress_mode, _filter)
+        except Exception:
+            _eff = self._ctx.progress_mode
+            try:
+                if not getattr(self._ctx, "tool_progress_filter", None) and self._ctx.progress_mode == "off" and self._ctx._native_slack_task_cards:
+                    _eff = "all"
+            except Exception:
+                pass
+        if _eff in ("off", "log"):
+            if cid:
+                self._hidden_native_call_ids.add(cid)
+                try:
+                    if hasattr(self._ctx, "_hidden_native_call_ids") and hasattr(self._ctx._hidden_native_call_ids, "add"):
+                        self._ctx._hidden_native_call_ids.add(cid)
+                except Exception:
+                    pass
             return
         from agent.display import _detect_tool_failure
         name = str(tool_name or "tool")
