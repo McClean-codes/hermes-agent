@@ -350,10 +350,12 @@ async def test_reaction_via_progress_callback_even_when_progress_queue_disabled(
         "reaction_cooldown": 0,
     }
     hook_calls = []
+    hook_contexts = []
 
     class HookAdapter(DiscordAdapter):
         async def on_tool_call_start(self, event, tool_name):
             hook_calls.append(tool_name)
+            hook_contexts.append(event)
             return await super().on_tool_call_start(event, tool_name)
 
     ad = HookAdapter(config)
@@ -370,93 +372,48 @@ async def test_reaction_via_progress_callback_even_when_progress_queue_disabled(
     evt = _make_event("100", raw, source=src)
     await ad.on_processing_start(evt)
     assert ("add", "🤖") in raw.ledger()
-    hook_calls.clear()
-    raw._ledger.clear()
-    raw._effective = {"🤖"}
-    # Re-wire the adapter's active state to keep persona (since we cleared ledger but not internal)
-    # Reset internal tracking to reflect persona still active for this source
-    # The adapter's _rxn_active still holds persona for that session key; keep it.
-
-    # Build a TurnContext with progress_queue=None (tool_progress off) but with status adapter set
+    # The start lifecycle itself creates the real persona effect.  Do not
+    # reset the ledger or internal effective set before exercising the runner.
+    # Build a TurnContext with progress_queue=None (tool_progress off) but with
+    # the status adapter set.
     ctx = TurnContext(
-        source=src,
-        progress_queue=None,  # disabled
-        tool_progress_enabled=False,
-        log_queue=None,
-        _status_adapter=ad,
-        _run_still_current=lambda: True,
-        _live_status_adapter=None,
-        _thinking_enabled=False,
-    )
-    # TurnRunner needs runner and ctx; create minimal runner mock
-    mock_runner = SimpleNamespace()
-    tr = TurnRunner(mock_runner, ctx)
-    # Ensure _loop_for_step is set on ctx (required for _schedule)
-    ctx._loop_for_step = asyncio.get_running_loop()
-    # Need to mock safe_schedule_threadsafe to execute immediately for test determinism
-    # TurnRunner._schedule uses gateway.run.safe_schedule_threadsafe which schedules on loop.
-    # We'll patch that to run the coro directly in the loop.
-    with patch.object(
-        TurnRunner,
-        "_schedule",
-        side_effect=lambda coro, msg, loop=None: asyncio.create_task(coro),
-    ):
-        tr.progress_callback(
-            "tool.started", tool_name="read_file", preview="x", args={}
-        )
-        await asyncio.sleep(0.05)
-
-    # Even though progress_queue was None, the hook should have been scheduled and executed
-    # Verify that raw received a tool emoji swap (add before remove)
-    # Since we mocked schedule to await directly, the ledger should show add 📄 before remove 🤖
-    # However we need deterministic emoji: patch get_tool_emoji
-    # Re-run with deterministic emoji and fresh state to check ledger
-    raw2 = LedgerMessage()
-    evt2 = _make_event("101", raw2, source=src)
-    ad2 = HookAdapter(config)
-    ad2._client = SimpleNamespace(
-        tree=FakeTree(),
-        get_channel=lambda _id: None,
-        fetch_channel=AsyncMock(),
-        user=SimpleNamespace(id=99999, name="HermesBot"),
-    )
-    # ad2 uses production cooldown 0 via extra
-    await ad2.on_processing_start(evt2)
-    assert ("add", "🤖") in raw2.ledger()
-    raw2._ledger.clear()
-    # new ctx with ad2
-    ctx2 = TurnContext(
         source=src,
         progress_queue=None,
         tool_progress_enabled=False,
         log_queue=None,
-        _status_adapter=ad2,
+        _status_adapter=ad,
+        run_generation=1,
+        inbound_message_id="100",
         _run_still_current=lambda: True,
         _live_status_adapter=None,
         _thinking_enabled=False,
     )
-    ctx2._loop_for_step = asyncio.get_running_loop()
-    tr2 = TurnRunner(mock_runner, ctx2)
-    emoji_map = {"read_file": "📄"}
+    mock_runner = SimpleNamespace()
+    tr = TurnRunner(mock_runner, ctx)
+    ctx._loop_for_step = asyncio.get_running_loop()
 
-    def fake_emoji(name, default="⚙️"):
-        return emoji_map.get(name, default)
-
-    with patch("agent.display.get_tool_emoji", side_effect=fake_emoji):
+    with patch("agent.display.get_tool_emoji", return_value="📄"):
         with patch.object(
             TurnRunner,
             "_schedule",
             side_effect=lambda coro, msg, loop=None: asyncio.create_task(coro),
         ):
-            tr2.progress_callback(
+            tr.progress_callback(
                 "tool.started", tool_name="read_file", preview="x", args={}
             )
             await asyncio.sleep(0.05)
-    # After the call, raw2 should have swapped to 📄 even though progress was off
-    assert ("add", "📄") in raw2.ledger()
-    assert raw2.ledger()[0] == ("add", "📄")
-    assert raw2.ledger()[1] == ("remove", "🤖")
-    assert raw2.effective() == {"📄"}
+
+    assert hook_calls == ["read_file"]
+    assert len(hook_contexts) == 1
+    assert hook_contexts[0].run_generation == 1
+    assert hook_contexts[0].message_id == "100"
+    assert hook_contexts[0].message_token == "100"
+    assert raw.ledger() == [
+        ("add", "🤖"),
+        ("add", "📄"),
+        ("remove", "🤖"),
+    ]
+    assert raw.effective() == {"📄"}
 
 
 # ---------------------------------------------------------------------------
@@ -1957,158 +1914,85 @@ async def test_rxn_stale_next_turn_pending_retains_and_eventually_drained():
 
 
 @pytest.mark.asyncio
-async def test_rxn_durable_ack_not_false_when_disabled_or_primitive_fails(monkeypatch):
-    """Disabled, missing cap, False and exception starts must not record emoji_ack=True."""
-    source = _make_source(chat_id="123")
+async def test_rxn_durable_ack_matches_real_effect_and_sqlite_readback(tmp_path):
+    """The durable acknowledgement records the result of the real reaction primitive."""
+    import sqlite3
 
-    # Helper to capture ack via patching _record_discord_processing_start
-    def _capture_ack_for(adapter, event):
-        captured = {}
-        orig = adapter._record_discord_processing_start
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
-        def wrapper(evt, *, emoji_ack):
-            captured["ack"] = emoji_ack
-            return orig(evt, emoji_ack=emoji_ack)
+    source = _make_source(chat_id="ack-channel")
 
-        # Use monkeypatch to avoid recursion? We'll patch via patch.object
-        return captured, wrapper
+    async def run_case(name, raw, effect_patch=None):
+        home = tmp_path / name
+        home.mkdir()
+        token = set_hermes_home_override(home)
+        try:
+            cfg = PlatformConfig(
+                enabled=True,
+                token="***",
+                extra={
+                    "missed_message_backfill": {"enabled": True},
+                    "persona_emoji": "🤖",
+                    "reaction_cooldown": 0,
+                },
+            )
+            ad = DiscordAdapter(cfg)
+            ad._client = SimpleNamespace(
+                tree=FakeTree(),
+                get_channel=lambda _id: None,
+                fetch_channel=AsyncMock(),
+                user=SimpleNamespace(id=99999, name="HermesBot"),
+            )
+            event = _make_event(str(getattr(raw, "id")), raw, source)
+            if effect_patch is None:
+                await ad.on_processing_start(event)
+            else:
+                with effect_patch(ad):
+                    await ad.on_processing_start(event)
+            with sqlite3.connect(
+                home / "gateway" / "discord_message_recovery.db"
+            ) as conn:
+                row = conn.execute(
+                    "SELECT emoji_ack FROM discord_messages WHERE message_id=?",
+                    (str(raw.id),),
+                ).fetchone()
+            assert row is not None, f"no durable row for {name}"
+            return int(row[0]), raw
+        finally:
+            reset_hermes_home_override(token)
 
-    # 1. Disabled via extra reactions=False
-    cfg = PlatformConfig(
-        enabled=True,
-        token="***",
-        extra={"reactions": False, "persona_emoji": "🤖", "reaction_cooldown": 0},
-    )
-    ad = DiscordAdapter(cfg)
-    ad._client = SimpleNamespace(
-        tree=FakeTree(),
-        get_channel=lambda _id: None,
-        fetch_channel=AsyncMock(),
-        user=SimpleNamespace(id=99999, name="HermesBot"),
-    )
-    # Ensure backfill enabled to allow recording path to run, but we will capture via patch
-    # _missed_message_backfill_enabled reads config; patch it to True for test
-    with patch.object(ad, "_missed_message_backfill_enabled", return_value=True):
-        with patch.object(ad, "_record_discord_processing_start") as mock_record:
-            with patch.object(ad, "_record_discord_message_seen"):
-                raw = LedgerMessage(msg_id=100)
-                evt = _make_event("100", raw, source)
-                await ad.on_processing_start(evt)
-                # Should have been called with emoji_ack=False because reactions disabled
-                assert mock_record.called, "record should be called even when disabled"
-                ack = (
-                    mock_record.call_args.kwargs.get("emoji_ack")
-                    if mock_record.call_args.kwargs
-                    else mock_record.call_args[1].get("emoji_ack")
-                    if len(mock_record.call_args) > 1
-                    else None
-                )
-                # Extract from args: second arg is emoji_ack via kw
-                if ack is None and mock_record.call_args.args:
-                    # positional? but our code uses kw
-                    pass
-                # More robust: check call
-                called_ack = (
-                    mock_record.call_args[1]["emoji_ack"]
-                    if len(mock_record.call_args) > 1
-                    else mock_record.call_args.kwargs["emoji_ack"]
-                )
-                assert called_ack is False, (
-                    f"disabled should record ack False, got {called_ack}"
-                )
-                assert raw.ledger() == [], "disabled should not add reaction"
+    def failing_add_patch(adapter):
+        return patch.object(adapter, "_reaction_add", new=AsyncMock(return_value=False))
 
-    # 2. Primitive returns False
-    cfg2 = PlatformConfig(
-        enabled=True, token="***", extra={"persona_emoji": "🤖", "reaction_cooldown": 0}
-    )
-    ad2 = DiscordAdapter(cfg2)
-    ad2._client = SimpleNamespace(
-        tree=FakeTree(),
-        get_channel=lambda _id: None,
-        fetch_channel=AsyncMock(),
-        user=SimpleNamespace(id=99999, name="HermesBot"),
-    )
-    # Make _add_reaction return False
-    with patch.object(ad2, "_add_reaction", new=AsyncMock(return_value=False)):
-        with patch.object(ad2, "_missed_message_backfill_enabled", return_value=True):
-            with patch.object(ad2, "_record_discord_processing_start") as mock_record2:
-                with patch.object(ad2, "_record_discord_message_seen"):
-                    raw2 = LedgerMessage(msg_id=101)
-                    evt2 = _make_event("101", raw2, source)
-                    await ad2.on_processing_start(evt2)
-                    called_ack2 = (
-                        mock_record2.call_args[1]["emoji_ack"]
-                        if len(mock_record2.call_args) > 1
-                        else mock_record2.call_args.kwargs["emoji_ack"]
-                    )
-                    assert called_ack2 is False, (
-                        f"primitive False should record ack False, got {called_ack2}"
-                    )
-                    # Ledger should be empty because add failed at adapter level (we mocked _add_reaction, so Ledger not used)
-                    # But ensure no active tracking
-                    assert ad2._rxn_active.get(ad2._reaction_msg_key(evt2)) is None
+    def raising_add_patch(adapter):
+        return patch.object(
+            adapter, "_reaction_add", new=AsyncMock(side_effect=RuntimeError("boom"))
+        )
 
-    # 3. Exception during add
-    cfg3 = PlatformConfig(
-        enabled=True, token="***", extra={"persona_emoji": "🤖", "reaction_cooldown": 0}
+    ack, raw = await run_case(
+        "disabled",
+        LedgerMessage(100),
+        lambda ad: patch.object(ad, "_reactions_enabled", return_value=False),
     )
-    ad3 = DiscordAdapter(cfg3)
-    ad3._client = SimpleNamespace(
-        tree=FakeTree(),
-        get_channel=lambda _id: None,
-        fetch_channel=AsyncMock(),
-        user=SimpleNamespace(id=99999, name="HermesBot"),
-    )
-    with patch.object(
-        ad3, "_add_reaction", new=AsyncMock(side_effect=Exception("boom"))
-    ):
-        with patch.object(ad3, "_missed_message_backfill_enabled", return_value=True):
-            with patch.object(ad3, "_record_discord_processing_start") as mock_record3:
-                with patch.object(ad3, "_record_discord_message_seen"):
-                    raw3 = LedgerMessage(msg_id=102)
-                    evt3 = _make_event("102", raw3, source)
-                    await ad3.on_processing_start(evt3)
-                    called_ack3 = (
-                        mock_record3.call_args[1]["emoji_ack"]
-                        if len(mock_record3.call_args) > 1
-                        else mock_record3.call_args.kwargs["emoji_ack"]
-                    )
-                    assert called_ack3 is False, (
-                        f"exception should record ack False, got {called_ack3}"
-                    )
+    assert ack == 0
+    assert raw.ledger() == []
 
-    # 4. Missing capability (no add_reaction)
-    cfg4 = PlatformConfig(
-        enabled=True, token="***", extra={"persona_emoji": "🤖", "reaction_cooldown": 0}
+    ack, raw = await run_case("missing-capability", SimpleNamespace(id=101))
+    assert ack == 0
+
+    ack, raw = await run_case("primitive-false", LedgerMessage(102), failing_add_patch)
+    assert ack == 0
+    assert raw.ledger() == []
+
+    ack, raw = await run_case(
+        "primitive-exception", LedgerMessage(103), raising_add_patch
     )
-    ad4 = DiscordAdapter(cfg4)
-    ad4._client = SimpleNamespace(
-        tree=FakeTree(),
-        get_channel=lambda _id: None,
-        fetch_channel=AsyncMock(),
-        user=SimpleNamespace(id=99999, name="HermesBot"),
-    )
-    raw4 = SimpleNamespace(id=103)  # no add_reaction attribute
-    evt4 = MessageEvent(
-        text="hello",
-        message_type=MessageType.TEXT,
-        source=source,
-        raw_message=raw4,
-        message_id="103",
-    )
-    with patch.object(ad4, "_missed_message_backfill_enabled", return_value=True):
-        with patch.object(ad4, "_record_discord_processing_start") as mock_record4:
-            with patch.object(ad4, "_record_discord_message_seen"):
-                await ad4.on_processing_start(evt4)
-                called_ack4 = (
-                    mock_record4.call_args[1]["emoji_ack"]
-                    if len(mock_record4.call_args) > 1
-                    else mock_record4.call_args.kwargs["emoji_ack"]
-                )
-                assert called_ack4 is False, (
-                    f"missing capability should record ack False, got {called_ack4}"
-                )
+    assert ack == 0
+    assert raw.ledger() == []
+
+    ack, raw = await run_case("success", LedgerMessage(104))
+    assert ack == 1
+    assert raw.effective() == {"🤖"}
 
 
 # ---------------------------------------------------------------------------
@@ -2248,5 +2132,274 @@ async def test_rxn_config_malformed_fail_closed_via_real_loader(tmp_path, monkey
         reset_hermes_home_override(token)
         monkeypatch.delenv("DISCORD_REACTIONS", raising=False)
 
-    # Also test malformed reactions string via direct extra already done, and via YAML extra.reactions?
     # Ensure no _rxn_* mutation after construction is needed; we already proved via production adapter.
+
+
+def test_root_discord_extra_values_keep_explicit_precedence(tmp_path, monkeypatch):
+    """A legacy root block must not overwrite its explicit ``extra`` values."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from gateway.config import load_gateway_config
+
+    home = tmp_path / "root_extra_precedence"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "discord:\n"
+        "  enabled: true\n"
+        '  persona_emoji: "top-persona"\n'
+        "  dynamic_reactions: true\n"
+        "  reaction_cooldown: 9\n"
+        "  extra:\n"
+        '    persona_emoji: "extra-persona"\n'
+        "    dynamic_reactions: false\n"
+        "    reaction_cooldown: 0.25\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("DISCORD_REACTIONS", raising=False)
+    token = set_hermes_home_override(home)
+    try:
+        config = load_gateway_config()
+        discord_config = config.platforms.get(Platform.DISCORD)
+        assert discord_config is not None
+        assert discord_config.extra["persona_emoji"] == "extra-persona"
+        assert discord_config.extra["dynamic_reactions"] is False
+        assert discord_config.extra["reaction_cooldown"] == 0.25
+
+        adapter = DiscordAdapter(discord_config)
+        assert adapter._rxn_persona_emoji == "extra-persona"
+        assert adapter._rxn_dynamic is False
+        assert adapter._rxn_cooldown == 0.25
+    finally:
+        reset_hermes_home_override(token)
+
+
+@pytest.mark.asyncio
+async def test_late_predecessor_callback_is_fenced_before_effect(tmp_path):
+    """A successor turn cancels a delayed predecessor callback before its add commits."""
+    from gateway.platforms.reaction_mixin import ReactionHookContext
+
+    ad = _make_adapter({
+        "persona_emoji": "🤖",
+        "dynamic_reactions": True,
+        "reaction_cooldown": 0,
+    })
+    source = _make_source(chat_id="late-callback")
+    msg1 = LedgerMessage(msg_id=501)
+    msg2 = LedgerMessage(msg_id=502)
+    event1 = _make_event("501", msg1, source)
+    event2 = _make_event("502", msg2, source)
+    await ad.on_processing_start(event1)
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+    original_add = ad._reaction_add
+
+    async def delayed_add(msg_ref, emoji):
+        if msg_ref is msg1 and emoji == "🔧":
+            started.set()
+            await release.wait()
+        return await original_add(msg_ref, emoji)
+
+    old_context = ReactionHookContext(
+        source=source,
+        run_generation=1,
+        message_id="501",
+        message_token="501",
+    )
+    with patch("agent.display.get_tool_emoji", return_value="🔧"):
+        with patch.object(ad, "_reaction_add", side_effect=delayed_add):
+            old_task = asyncio.create_task(
+                ad.on_tool_call_start(old_context, "old_tool")
+            )
+            await started.wait()
+            successor_task = asyncio.create_task(ad.on_processing_start(event2))
+            await asyncio.sleep(0)
+            release.set()
+            await asyncio.gather(old_task, successor_task)
+
+    assert ("add", "🔧") not in msg1.ledger()
+    assert msg2.ledger() == [("add", "🤖")]
+    assert msg2.effective() == {"🤖"}
+    assert ad._rxn_generation[ad._reaction_msg_key(event2)] == 2
+
+
+@pytest.mark.asyncio
+async def test_completed_generation_rejects_late_tool_hook():
+    """Completion closes the generation so a late event cannot resurrect a tool reaction."""
+    from gateway.platforms.reaction_mixin import ReactionHookContext
+
+    ad = _make_adapter({
+        "persona_emoji": "🤖",
+        "dynamic_reactions": True,
+        "reaction_cooldown": 0,
+    })
+    source = _make_source(chat_id="completed-generation")
+    raw = LedgerMessage(msg_id=550)
+    event = _make_event("550", raw, source)
+    await ad.on_processing_start(event)
+    await ad.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+    before = raw.ledger()
+    late = ReactionHookContext(
+        source=source,
+        run_generation=1,
+        message_id="550",
+        message_token="550",
+    )
+    with patch("agent.display.get_tool_emoji", return_value="🔧"):
+        await ad.on_tool_call_start(late, "late_tool")
+    assert raw.ledger() == before
+    assert raw.effective() == {"🤖"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["false", "exception"])
+async def test_failed_final_add_is_cleanup_reachable_on_successor(failure):
+    """A failed final add keeps predecessor effects reachable until the next turn drains them."""
+    ad = _make_adapter({
+        "persona_emoji": "🤖",
+        "dynamic_reactions": True,
+        "reaction_cooldown": 0,
+    })
+    source = _make_source(chat_id=f"final-{failure}")
+    msg1 = LedgerMessage(msg_id=601)
+    event1 = _make_event("601", msg1, source)
+    await ad.on_processing_start(event1)
+    with patch("agent.display.get_tool_emoji", return_value="📄"):
+        await ad.on_tool_call_start(source, "read_file")
+
+    original_add = ad._reaction_add
+
+    async def failed_final_add(msg_ref, emoji):
+        if emoji == "🤖":
+            if failure == "exception":
+                raise RuntimeError("final add failed")
+            return False
+        return await original_add(msg_ref, emoji)
+
+    with patch.object(ad, "_reaction_add", side_effect=failed_final_add):
+        await ad.on_processing_complete(event1, ProcessingOutcome.SUCCESS)
+    assert msg1.effective() == {"📄"}
+
+    msg2 = LedgerMessage(msg_id=602)
+    event2 = _make_event("602", msg2, source)
+    await ad.on_processing_start(event2)
+    assert msg1.effective() == set()
+    assert msg2.ledger() == [("add", "🤖")]
+    assert msg2.effective() == {"🤖"}
+    assert ("remove", "📄") in msg1.ledger()
+    assert ("remove", "🤖") in msg1.ledger()
+
+
+@pytest.mark.asyncio
+async def test_interrupted_progress_callback_schedules_no_reaction_hook():
+    """The interruption gate runs before scheduling and leaves the effect ledger unchanged."""
+    from gateway.run_turn_runner import TurnRunner
+    from gateway.turn_context import TurnContext
+
+    ad = _make_adapter({
+        "persona_emoji": "🤖",
+        "dynamic_reactions": True,
+        "reaction_cooldown": 0,
+    })
+    source = _make_source(chat_id="interrupted")
+    raw = LedgerMessage(msg_id=701)
+    event = _make_event("701", raw, source)
+    await ad.on_processing_start(event)
+    agent = SimpleNamespace(is_interrupted=True)
+    ctx = TurnContext(
+        source=source,
+        run_generation=1,
+        inbound_message_id="701",
+        progress_queue=None,
+        tool_progress_enabled=False,
+        _status_adapter=ad,
+        agent_holder=[agent],
+        _run_still_current=lambda: True,
+    )
+    runner = TurnRunner(SimpleNamespace(), ctx)
+    ctx._loop_for_step = asyncio.get_running_loop()
+    with patch.object(TurnRunner, "_schedule") as schedule:
+        runner.progress_callback("tool.started", tool_name="read_file", args={})
+        await asyncio.sleep(0)
+    schedule.assert_not_called()
+    assert raw.ledger() == [("add", "🤖")]
+    assert raw.effective() == {"🤖"}
+
+
+@pytest.mark.asyncio
+async def test_malformed_persona_and_bool_cooldown_fail_closed_with_effect_ledger(
+    tmp_path,
+):
+    """Real YAML values never stringify into a reaction or turn ``False`` into zero cooldown."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from gateway.config import load_gateway_config
+
+    cases = {
+        "bool": "true",
+        "number": "7",
+        "mapping": "{name: tool}",
+        "list": "[tool]",
+    }
+    for name, persona_yaml in cases.items():
+        home = tmp_path / name
+        home.mkdir()
+        (home / "config.yaml").write_text(
+            "platforms:\n"
+            "  discord:\n"
+            "    enabled: true\n"
+            f"    persona_emoji: {persona_yaml}\n"
+            "    dynamic_reactions: true\n"
+            "    reaction_cooldown: false\n"
+            "    reactions: true\n",
+            encoding="utf-8",
+        )
+        token = set_hermes_home_override(home)
+        try:
+            config = load_gateway_config()
+            discord_config = config.platforms.get(Platform.DISCORD)
+            adapter = DiscordAdapter(discord_config)
+            adapter._client = SimpleNamespace(
+                tree=FakeTree(),
+                get_channel=lambda _id: None,
+                fetch_channel=AsyncMock(),
+                user=SimpleNamespace(id=99999, name="HermesBot"),
+            )
+            assert adapter._rxn_persona_emoji == "👀"
+            assert adapter._rxn_cooldown == 1.0
+            raw = LedgerMessage(msg_id=800 + len(name))
+            event = _make_event(str(raw.id), raw, _make_source(chat_id=name))
+            await adapter.on_processing_start(event)
+            assert raw.ledger() == [("add", "👀")]
+            assert raw.effective() == {"👀"}
+        finally:
+            reset_hermes_home_override(token)
+
+    # A malformed platform value falls back to a valid global scalar, while a
+    # malformed global scalar falls back to the safe default.
+    for name, global_yaml, expected in [
+        ("global-valid", '"🌟"', "🌟"),
+        ("global-invalid", "[bad]", "👀"),
+    ]:
+        home = tmp_path / name
+        home.mkdir()
+        (home / "config.yaml").write_text(
+            f"persona_emoji: {global_yaml}\n"
+            "platforms:\n"
+            "  discord:\n"
+            "    enabled: true\n"
+            "    persona_emoji: {bad: true}\n"
+            "    reactions: true\n",
+            encoding="utf-8",
+        )
+        token = set_hermes_home_override(home)
+        try:
+            config = load_gateway_config()
+            adapter = DiscordAdapter(config.platforms.get(Platform.DISCORD))
+            adapter._client = SimpleNamespace(
+                tree=FakeTree(),
+                get_channel=lambda _id: None,
+                fetch_channel=AsyncMock(),
+                user=SimpleNamespace(id=99999, name="HermesBot"),
+            )
+            assert adapter._rxn_persona_emoji == expected
+        finally:
+            reset_hermes_home_override(token)

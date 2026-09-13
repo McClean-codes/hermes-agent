@@ -1,60 +1,49 @@
 """Platform-agnostic dynamic tool reactions mixin.
 
-Provides the full lifecycle state machine for emoji reactions during message
-processing:
-
-    on_processing_start  → add persona emoji
-    on_tool_call_start   → swap to tool-specific emoji (with cooldown)
-    on_processing_complete → swap to final emoji (persona / ❌)
-
-Platforms opt in by:
-1. Inheriting ``DynamicReactionMixin`` (before ``BasePlatformAdapter`` in MRO)
-2. Implementing the three primitives:
-   - ``_reaction_add(msg_ref, emoji) -> bool``
-   - ``_reaction_remove(msg_ref, emoji) -> bool``
-   - ``_reaction_msg_key(event) -> Optional[Hashable]``
-
-For replace-all platforms (Telegram), override ``_reaction_replace_mode = True``
-and implement ``_reaction_set(msg_ref, emoji) -> bool`` instead of add/remove.
-
-The mixin resolves ``dynamic_reactions``, ``persona_emoji``, and
-``reaction_cooldown`` from config once at init.  Platforms that don't call
-``_init_reaction_mixin()`` get zero behavior — all hooks short-circuit.
-
-Rate-limit note (Discord):
-    Discord's reaction add/remove route is rate-limited at approximately
-    1 reaction per 0.25s per channel per the current Discord API docs
-    (``PUT /channels/{channel.id}/messages/{message.id}/reactions/{emoji}/@me``).
-    The adapter contract at ``plugins/platforms/discord/adapter.py`` uses
-    ``message.add_reaction`` / ``message.remove_reaction`` with no client-side
-    throttle.
-    The 1.0s cooldown used by this mixin is a local heuristic hysteresis
-    (4× the documented 0.25s bucket) intended to reduce 429 risk and reflow
-    jitter — it is not a provider rate-limit guarantee and must not be
-    documented as ensuring compliance. Transient 4xx/5xx/429 failures from the
-    underlying ``_reaction_add``/``_remove`` (which return False) do not
-    corrupt the tracked ``_rxn_active`` state when handled correctly.
+The mixin owns the reaction lifecycle for adapters that opt in with
+``_init_reaction_mixin()``.  Every lifecycle operation is fenced by a per-key
+turn generation and message token, and all remote effects are serialized on a
+per-key lock.  A delayed callback can therefore never commit state for a
+successor turn.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import functools
 import logging
 import math
 import time
-from typing import Any, Dict, Hashable, Optional
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, Hashable, Optional
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_PERSONA_EMOJI = "👀"
+_DEFAULT_TOOL_EMOJI = "⚙️"
+_MAX_PERSONA_TEXT = 64
+
+
+@dataclass(frozen=True)
+class ReactionHookContext:
+    """Immutable identity carried from one ``TurnContext`` tool callback.
+
+    ``source`` remains the routing object expected by existing adapters.  The
+    identity fields are snapshots: they must not be reconstructed from the
+    adapter's current per-session cache because that cache may already point at
+    a successor message.
+    """
+
+    source: Any
+    run_generation: Optional[int] = None
+    message_id: Optional[str] = None
+    message_token: Optional[str] = None
+    is_current: Optional[Callable[[], bool]] = None
+
 
 def _rxn_normalize_bool(value: Any, default: bool = False) -> bool:
-    """Fail-closed boolean coercion: strings like "false"/"0"/"no"/"off" are False.
-
-    Prevents quoted-false truthiness where ``bool("false")`` is True.
-    Unrecognized strings return ``default`` (fail-closed).
-    Only documented scalar forms (bool and string tokens) are accepted;
-    unsupported types (numbers, lists, dicts, etc.) fail closed to ``default``.
-    """
+    """Normalize documented boolean scalars and fail closed for other types."""
     if isinstance(value, bool):
         return value
     if isinstance(value, str):
@@ -64,142 +53,129 @@ def _rxn_normalize_bool(value: Any, default: bool = False) -> bool:
         if token in ("0", "false", "no", "off", ""):
             return False
         return default
-    if value is None:
-        return default
-    # Unsupported types (int, list, dict, etc.) fail closed
     return default
 
 
 def _rxn_normalize_cooldown(value: Any, default: float = 1.0) -> float:
-    """Fail-closed cooldown: finite non-negative float, else ``default``.
+    """Return a finite non-negative numeric cooldown, else ``default``.
 
-    Rejects NaN, infinities, negatives (which would disable hysteresis).
-    String values are parsed with float(); 0 disables cooldown intentionally
-    (used by tests), negative/NaN fall back to default.
+    Booleans are deliberately rejected even though Python treats them as
+    integers: ``False`` must not silently disable hysteresis.
     """
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return default
     try:
-        f = float(value) if not isinstance(value, bool) else float(int(value))
+        result = float(value)
     except (TypeError, ValueError, OverflowError):
         return default
-    if not math.isfinite(f) or f < 0:
-        return default
-    return f
+    return result if math.isfinite(result) and result >= 0 else default
+
+
+def _rxn_persona_candidate(value: Any) -> Optional[str]:
+    """Accept only bounded, non-empty text suitable for a reaction payload."""
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if not value or len(value) > _MAX_PERSONA_TEXT:
+        return None
+    if any(ord(char) < 32 or ord(char) == 127 for char in value):
+        return None
+    return value
+
+
+def _rxn_track_callback(method):
+    """Track lifecycle tasks so a successor can fence a delayed predecessor."""
+
+    @functools.wraps(method)
+    async def wrapped(self, event, *args, **kwargs):
+        task = asyncio.current_task()
+        key = None
+        if task is not None:
+            with contextlib.suppress(Exception):
+                key = self._reaction_msg_key(event)
+            if key is not None:
+                self._rxn_callback_tasks.setdefault(key, set()).add(task)
+        try:
+            return await method(self, event, *args, **kwargs)
+        except asyncio.CancelledError:
+            if task is not None and task in self._rxn_fenced_tasks:
+                return None
+            raise
+        finally:
+            if key is not None:
+                callbacks = self._rxn_callback_tasks.get(key)
+                if callbacks:
+                    callbacks.discard(task)
+                    if not callbacks:
+                        self._rxn_callback_tasks.pop(key, None)
+                self._rxn_fenced_tasks.discard(task)
+
+    return wrapped
 
 
 class DynamicReactionMixin:
-    """Shared dynamic tool-reaction logic for any messaging platform.
+    """Shared dynamic reaction state machine for messaging adapters."""
 
-    Call ``_init_reaction_mixin()`` at the end of your adapter's ``__init__``
-    to activate.  Without that call every hook is a no-op.
-    """
-
-    # Subclass overrides ──────────────────────────────────────────────────
-
-    # Set True for platforms where setting a reaction replaces all existing
-    # reactions (e.g. Telegram).  When True, the mixin calls
-    # ``_reaction_set`` instead of ``_reaction_add`` + ``_reaction_remove``.
     _reaction_replace_mode: bool = False
 
-    # ── Primitives (subclass MUST implement) ─────────────────────────────
-
     async def _reaction_add(self, msg_ref: Any, emoji: str) -> bool:
-        """Add *emoji* to the message identified by *msg_ref*.
-
-        *msg_ref* is whatever ``_reaction_resolve_message`` returns — a raw
-        Discord message object, a ``(chat_id, message_id)`` tuple, etc.
-        """
         return False
 
     async def _reaction_remove(self, msg_ref: Any, emoji: str) -> bool:
-        """Remove *emoji* from the message identified by *msg_ref*."""
         return False
 
     async def _reaction_set(self, msg_ref: Any, emoji: str) -> bool:
-        """Replace all reactions on the message with *emoji*.
-
-        Only used when ``_reaction_replace_mode`` is True.
-        """
         return False
 
     def _reaction_resolve_message(self, event: Any) -> Any:
-        """Extract a platform-native message reference from *event*.
-
-        Return ``None`` if the event doesn't carry enough info to react.
-        The returned object is passed verbatim to ``_reaction_add`` /
-        ``_reaction_remove`` / ``_reaction_set``.
-        """
         return None
 
     def _reaction_msg_key(self, event: Any) -> Optional[Hashable]:
-        """Return a hashable key that uniquely identifies the message.
-
-        Used for tracking active reactions and cooldown timestamps.
-        Return ``None`` to skip reaction handling for this event.
-        """
         return None
 
     def _reaction_translate_emoji(self, emoji: str) -> Optional[str]:
-        """Translate a Unicode emoji to the platform's native format.
-
-        Return ``None`` if the emoji is not supported on this platform
-        (the mixin will fall back to the default tool emoji ``⚙️``).
-
-        Default implementation returns the emoji unchanged (Unicode passthrough).
-        """
         return emoji
 
-    # ── Init ─────────────────────────────────────────────────────────────
-
     def _init_reaction_mixin(self) -> None:
-        """Initialize mixin state.  Call from adapter ``__init__``."""
-        # Per-message tracking: msg_key → currently displayed emoji
+        """Initialize all reaction state before lifecycle hooks can run."""
         self._rxn_active: Dict[Hashable, str] = {}
-        # Per-message tracking: msg_key → resolved message reference
         self._rxn_msg_refs: Dict[Hashable, Any] = {}
-        # Cooldown: msg_key → monotonic timestamp of last swap
         self._rxn_last_swap: Dict[Hashable, float] = {}
-        # Per-message lock to serialize reaction swaps (prevents stacking)
         self._rxn_locks: Dict[Hashable, asyncio.Lock] = {}
-        # Stale emojis that failed to be removed; remain cleanup-reachable
+        self._rxn_lock_users: Dict[Hashable, int] = {}
+        self._rxn_callback_tasks: Dict[Hashable, set[asyncio.Task]] = {}
+        self._rxn_fenced_tasks: set[asyncio.Task] = set()
         self._rxn_stale: Dict[Hashable, set[str]] = {}
-        # Pending stale for previous same-key messages: key → list[(msg_ref, set[emoji])]
         self._rxn_pending: Dict[Hashable, list[tuple[Any, set[str]]]] = {}
-        # Per-key turn generation for late-callback rejection
+        self._rxn_completion_pending: Dict[Hashable, set[str]] = {}
         self._rxn_generation: Dict[Hashable, int] = {}
-
-        # Resolve config once
-        self._rxn_persona_emoji: str = self._rxn_resolve_persona_emoji()
-        self._rxn_dynamic: bool = self._rxn_resolve_dynamic_reactions()
-        self._rxn_cooldown: float = self._rxn_resolve_cooldown()
-        self._rxn_initialized: bool = True
-
-    # ── Config resolution ────────────────────────────────────────────────
+        self._rxn_tokens: Dict[Hashable, Optional[str]] = {}
+        self._rxn_external_generations: Dict[Hashable, Optional[int]] = {}
+        self._rxn_closed: Dict[Hashable, int] = {}
+        self._rxn_initialized = False
+        self._rxn_persona_emoji = self._rxn_resolve_persona_emoji()
+        self._rxn_dynamic = self._rxn_resolve_dynamic_reactions()
+        self._rxn_cooldown = self._rxn_resolve_cooldown()
+        self._rxn_initialized = True
 
     def _rxn_resolve_persona_emoji(self) -> str:
-        """Resolve persona emoji from platform config → global config → default."""
+        """Resolve platform text, then global text, then the safe default."""
         extra = getattr(getattr(self, "config", None), "extra", {}) or {}
-        if emoji := extra.get("persona_emoji"):
-            # extra may contain empty string; treat falsy as not set
-            if isinstance(emoji, str) and emoji.strip():
-                return emoji.strip()
-            if emoji:
-                return str(emoji)
+        candidate = _rxn_persona_candidate(extra.get("persona_emoji"))
+        if candidate is not None:
+            return candidate
         try:
             from hermes_cli.config import load_config
 
-            cfg = load_config()
-            # global persona_emoji may be empty string
-            raw = cfg.get("persona_emoji") if isinstance(cfg, dict) else None
-            if isinstance(raw, str) and raw.strip():
-                return raw.strip()
-            if raw:
-                return str(raw)
-            return "👀"
+            config = load_config()
+            candidate = _rxn_persona_candidate(
+                config.get("persona_emoji") if isinstance(config, dict) else None
+            )
+            return candidate or _DEFAULT_PERSONA_EMOJI
         except Exception:
-            return "👀"
+            return _DEFAULT_PERSONA_EMOJI
 
     def _rxn_resolve_dynamic_reactions(self) -> bool:
-        """Resolve dynamic_reactions flag from platform → global → False."""
         if not self._rxn_reactions_enabled():
             return False
         extra = getattr(getattr(self, "config", None), "extra", {}) or {}
@@ -208,469 +184,582 @@ class DynamicReactionMixin:
         try:
             from hermes_cli.config import load_config
 
+            value = load_config()
             return _rxn_normalize_bool(
-                load_config().get("dynamic_reactions", False), default=False
+                value.get("dynamic_reactions", False)
+                if isinstance(value, dict)
+                else False,
+                default=False,
             )
         except Exception:
             return False
 
     def _rxn_resolve_cooldown(self) -> float:
-        """Resolve reaction_cooldown from platform config → default 1.0s."""
         extra = getattr(getattr(self, "config", None), "extra", {}) or {}
-        raw = extra.get("reaction_cooldown", 1.0)
-        return _rxn_normalize_cooldown(raw, default=1.0)
+        return _rxn_normalize_cooldown(extra.get("reaction_cooldown", 1.0))
 
     def _rxn_reactions_enabled(self) -> bool:
-        """Check if reactions are enabled at all.
-
-        Delegates to the adapter's own ``_reactions_enabled()`` if it exists
-        as a callable, or reads it as a bool attribute.  Otherwise returns True.
-        Only documented scalar forms (bool/string tokens) are accepted; unsupported
-        types and malformed strings fail closed to disabled.
-        """
+        """Read an adapter gate using only documented scalar representations."""
         attr = getattr(self, "_reactions_enabled", None)
-        # If the subclass defines _reactions_enabled as a method, call it.
-        # Need to avoid infinite recursion: the mixin itself doesn't define it, so
-        # getattr will find the adapter's method.
         if callable(attr):
             try:
                 result = attr()
-                if isinstance(result, bool):
-                    return result
-                if isinstance(result, str):
-                    token = result.strip().lower()
-                    if token in ("false", "0", "no", "off"):
-                        return False
-                    if token in ("true", "1", "yes", "on"):
-                        return True
-                    if token == "":
-                        return True
-                    return False
-                if result is None:
-                    return True
-                return False
             except Exception:
                 return False
-        if attr is not None:
-            if isinstance(attr, bool):
-                return attr
-            if isinstance(attr, str):
-                token = attr.strip().lower()
-                if token in ("false", "0", "no", "off"):
-                    return False
-                if token in ("true", "1", "yes", "on"):
-                    return True
-                if token == "":
-                    return True
-                return False
-            if attr is None:
-                return True
-            return False
-        return True
+        else:
+            result = attr
+        if result is None:
+            return True
+        return _rxn_normalize_bool(result, default=False)
 
-    # ── Lifecycle hooks ──────────────────────────────────────────────────
+    @staticmethod
+    def _rxn_source(event: Any) -> Any:
+        return getattr(event, "source", event)
+
+    @staticmethod
+    def _rxn_message_token(event: Any) -> Optional[str]:
+        for name in ("message_token", "message_id"):
+            value = getattr(event, name, None)
+            if value is not None and str(value):
+                return str(value)
+        raw = getattr(event, "raw_message", None)
+        raw_id = getattr(raw, "id", None)
+        if raw_id is not None and str(raw_id):
+            return str(raw_id)
+        source = getattr(event, "source", None)
+        source_id = getattr(source, "message_id", None)
+        if source_id is not None and str(source_id):
+            return str(source_id)
+        return None
+
+    @staticmethod
+    def _rxn_external_generation(event: Any) -> Optional[int]:
+        value = getattr(event, "run_generation", None)
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    @staticmethod
+    def _rxn_hook_is_current(event: Any) -> bool:
+        check = getattr(event, "is_current", None)
+        if not callable(check):
+            return True
+        try:
+            return bool(check())
+        except Exception:
+            return False
 
     def _rxn_lock(self, key: Hashable) -> asyncio.Lock:
-        """Get or create a per-message lock to serialize reaction swaps."""
-        if key not in self._rxn_locks:
-            self._rxn_locks[key] = asyncio.Lock()
-        return self._rxn_locks[key]
+        lock = self._rxn_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._rxn_locks[key] = lock
+        return lock
 
-    async def _rxn_on_processing_start(self, event: Any) -> bool:
-        """Add persona emoji when processing begins. Returns True if remote add succeeded."""
-        if not getattr(self, "_rxn_initialized", False):
-            return False
-        if not self._rxn_reactions_enabled():
-            return False
-
-        msg_ref = self._reaction_resolve_message(event)
-        if msg_ref is None:
-            return False
-        key = self._reaction_msg_key(event)
-        if key is None:
-            return False
-
-        # --- Stale reachability: drain previous same-key message before overwriting cache ---
-        # Retain failed cleanup per message/turn until remote remove succeeds.
-        old_msg_ref = self._rxn_msg_refs.get(key)
-        if old_msg_ref is not None and old_msg_ref is not msg_ref:
-            old_stale = (
-                set(self._rxn_stale.get(key, set()))
-                if key in self._rxn_stale
-                else set()
-            )
-            # Only drain stale emojis from the old message; active is the final state and should remain.
-            # Tool-swap stales are tracked in _rxn_stale, so this covers the probe's orphaned reaction.
-            to_clean_old: set[str] = set(old_stale)
-            if to_clean_old:
-                failed_old: set[str] = set()
-                for emoji in list(to_clean_old):
-                    if self._reaction_replace_mode:
-                        continue
-                    try:
-                        ok_rm = await self._reaction_remove(old_msg_ref, emoji)
-                        ok_rm = bool(ok_rm)
-                    except Exception as e:
-                        logger.debug("stale drain remove failed (%s): %s", emoji, e)
-                        ok_rm = False
-                    if not ok_rm:
-                        failed_old.add(emoji)
-                if failed_old:
-                    pending = self._rxn_pending.setdefault(key, [])
-                    merged = False
-                    for idx, (pending_ref, pending_set) in enumerate(pending):
-                        if pending_ref is old_msg_ref:
-                            pending_set.update(failed_old)
-                            merged = True
-                            break
-                    if not merged:
-                        pending.append((old_msg_ref, failed_old))
-            # Clear current stale tracking for old message (moved to pending or cleaned); keep active for now
-            # Active for old message is its final persona/tool state; new turn will overwrite it below.
-            self._rxn_stale.pop(key, None)
-            self._rxn_active.pop(key, None)
-            # Bump generation for new turn
-            self._rxn_generation[key] = self._rxn_generation.get(key, 0) + 1
-        elif old_msg_ref is None:
-            # First turn for this key
-            if key not in self._rxn_generation:
-                self._rxn_generation[key] = 1
-            else:
-                self._rxn_generation[key] = self._rxn_generation.get(key, 0) + 1
-        else:
-            # Same msg_ref object reused (unlikely but safe) — still bump generation for idempotence
-            # but do not drain; keep stale handling below
-            self._rxn_generation[key] = self._rxn_generation.get(key, 0) + 1
-
-        emoji = self._rxn_persona_emoji
-        translated = self._reaction_translate_emoji(emoji)
-        if translated is None:
-            translated = "👀"
-
-        ok = False
+    @contextlib.asynccontextmanager
+    async def _rxn_locked(self, key: Hashable):
+        """Hold the lifecycle lock without dropping it under a queued waiter."""
+        lock = self._rxn_lock(key)
+        self._rxn_lock_users[key] = self._rxn_lock_users.get(key, 0) + 1
+        acquired = False
         try:
-            if self._reaction_replace_mode:
-                ok = await self._reaction_set(msg_ref, translated)
-                ok = bool(ok)
+            await lock.acquire()
+            acquired = True
+            yield
+        finally:
+            if acquired:
+                lock.release()
+            users = self._rxn_lock_users.get(key, 1) - 1
+            if users:
+                self._rxn_lock_users[key] = users
             else:
-                ok = await self._reaction_add(msg_ref, translated)
-                ok = bool(ok)
-        except Exception as e:
-            logger.debug("reaction start add failed (%s): %s", translated, e)
-            ok = False
+                self._rxn_lock_users.pop(key, None)
+                if key in self._rxn_closed:
+                    self._rxn_locks.pop(key, None)
 
-        if ok:
-            self._rxn_active[key] = translated
-            self._rxn_msg_refs[key] = msg_ref
-            # Successful start clears any prior stale for the NEW message only; pending retains old
-            self._rxn_stale.pop(key, None)
-            return True
-        else:
-            # Cache the msg_ref even on failure so later tool swaps can retry
-            # without requiring raw_message on the SessionSource event.
-            self._rxn_msg_refs[key] = msg_ref
-            # Do NOT mark active; a later no-tool completion will correctly retry.
+    def _rxn_reserve_generation(
+        self, key: Hashable, token: Optional[str], external_generation: Optional[int]
+    ) -> int:
+        """Fence older callbacks before waiting on the lifecycle lock.
+
+        Reservation is intentionally synchronous: a successor arriving while a
+        predecessor is in an awaited Discord call invalidates that predecessor
+        before it can commit state when the call returns.
+        """
+        generation = self._rxn_generation.get(key, 0) + 1
+        self._rxn_generation[key] = generation
+        self._rxn_tokens[key] = token
+        self._rxn_external_generations[key] = external_generation
+        self._rxn_closed.pop(key, None)
+        current_task = asyncio.current_task()
+        for callback_task in tuple(self._rxn_callback_tasks.get(key, ())):
+            if callback_task is not current_task and not callback_task.done():
+                self._rxn_fenced_tasks.add(callback_task)
+                callback_task.cancel()
+        return generation
+
+    def _rxn_identity_current(
+        self,
+        key: Hashable,
+        generation: int,
+        token: Optional[str],
+        msg_ref: Any = None,
+        *,
+        allow_closed: bool = False,
+    ) -> bool:
+        if self._rxn_generation.get(key) != generation:
             return False
+        current_token = self._rxn_tokens.get(key)
+        if token is not None and current_token != token:
+            return False
+        current_ref = self._rxn_msg_refs.get(key)
+        if (
+            msg_ref is not None
+            and current_ref is not None
+            and current_ref is not msg_ref
+        ):
+            return False
+        return allow_closed or self._rxn_closed.get(key) != generation
 
+    def _rxn_external_generation_matches(
+        self, key: Hashable, external_generation: Optional[int]
+    ) -> bool:
+        current = self._rxn_external_generations.get(key)
+        return (
+            external_generation is None
+            or current is None
+            or current == external_generation
+        )
+
+    def _rxn_close_generation(self, key: Hashable, generation: int) -> None:
+        self._rxn_closed[key] = generation
+
+    def _rxn_enqueue_pending(
+        self, key: Hashable, msg_ref: Any, emojis: set[str]
+    ) -> None:
+        emojis = {emoji for emoji in emojis if emoji}
+        if msg_ref is None or not emojis:
+            return
+        pending = self._rxn_pending.setdefault(key, [])
+        for pending_ref, pending_emojis in pending:
+            if pending_ref is msg_ref:
+                pending_emojis.update(emojis)
+                return
+        pending.append((msg_ref, emojis))
+
+    async def _rxn_drain_pending(
+        self,
+        key: Hashable,
+        generation: int,
+        token: Optional[str],
+        *,
+        event: Any = None,
+        allow_closed: bool = False,
+    ) -> bool:
+        """Retry old-message cleanup, retaining every failed/unattempted item."""
+        pending = self._rxn_pending.get(key)
+        if not pending or self._reaction_replace_mode:
+            return True
+        remaining: list[tuple[Any, set[str]]] = []
+        for msg_ref, emojis in list(pending):
+            failed: set[str] = set()
+            for index, emoji in enumerate(list(emojis)):
+                if not self._rxn_identity_current(
+                    key, generation, token, allow_closed=allow_closed
+                ) or (event is not None and not self._rxn_hook_is_current(event)):
+                    failed.update(list(emojis)[index:])
+                    remaining.append((msg_ref, failed))
+                    self._rxn_pending[key] = remaining
+                    return False
+                try:
+                    ok = bool(await self._reaction_remove(msg_ref, emoji))
+                except Exception as exc:
+                    logger.debug("pending reaction cleanup failed (%s): %s", emoji, exc)
+                    ok = False
+                if not self._rxn_identity_current(
+                    key, generation, token, allow_closed=allow_closed
+                ) or (event is not None and not self._rxn_hook_is_current(event)):
+                    if not ok:
+                        failed.add(emoji)
+                    failed.update(list(emojis)[index + 1 :])
+                    remaining.append((msg_ref, failed))
+                    self._rxn_pending[key] = remaining
+                    return False
+                if not ok:
+                    failed.add(emoji)
+            if failed:
+                remaining.append((msg_ref, failed))
+        if remaining:
+            self._rxn_pending[key] = remaining
+            return False
+        self._rxn_pending.pop(key, None)
+        return True
+
+    def _rxn_translate(self, emoji: str, fallback: str) -> str:
+        translated = self._reaction_translate_emoji(emoji)
+        return translated or self._reaction_translate_emoji(fallback) or fallback
+
+    @_rxn_track_callback
+    async def _rxn_on_processing_start(self, event: Any) -> bool:
+        if (
+            not getattr(self, "_rxn_initialized", False)
+            or not self._rxn_reactions_enabled()
+        ):
+            return False
+        if not self._rxn_hook_is_current(event):
+            return False
+        key = self._reaction_msg_key(event)
+        msg_ref = self._reaction_resolve_message(event)
+        if key is None or msg_ref is None:
+            return False
+        token = self._rxn_message_token(event)
+        external_generation = self._rxn_external_generation(event)
+
+        old_ref = self._rxn_msg_refs.get(key)
+        old_token = self._rxn_tokens.get(key)
+        old_generation = self._rxn_generation.get(key)
+        old_closed = (
+            old_generation is not None and self._rxn_closed.get(key) == old_generation
+        )
+        old_active = self._rxn_active.get(key)
+        old_stale = set(self._rxn_stale.get(key, set()))
+        old_completion_pending = set(self._rxn_completion_pending.get(key, set()))
+        generation = self._rxn_reserve_generation(key, token, external_generation)
+
+        async with self._rxn_locked(key):
+            if self._rxn_generation.get(key) != generation:
+                return False
+            replacing = old_ref is not None and (
+                old_ref is not msg_ref or old_token != token
+            )
+            if replacing:
+                cleanup = old_stale | old_completion_pending
+                if not old_closed and old_active:
+                    cleanup.add(old_active)
+                if cleanup:
+                    self._rxn_enqueue_pending(key, old_ref, cleanup)
+                self._rxn_active.pop(key, None)
+                self._rxn_msg_refs.pop(key, None)
+                self._rxn_stale.pop(key, None)
+                self._rxn_completion_pending.pop(key, None)
+                self._rxn_last_swap.pop(key, None)
+            elif old_ref is None:
+                self._rxn_active.pop(key, None)
+                self._rxn_stale.pop(key, None)
+                self._rxn_completion_pending.pop(key, None)
+                self._rxn_last_swap.pop(key, None)
+
+            self._rxn_msg_refs[key] = msg_ref
+            if not await self._rxn_drain_pending(key, generation, token, event=event):
+                if not self._rxn_identity_current(key, generation, token, msg_ref):
+                    return False
+            if not self._rxn_identity_current(
+                key, generation, token, msg_ref
+            ) or not self._rxn_hook_is_current(event):
+                return False
+
+            persona = self._rxn_translate(
+                self._rxn_persona_emoji, _DEFAULT_PERSONA_EMOJI
+            )
+            try:
+                if self._reaction_replace_mode:
+                    ok = bool(await self._reaction_set(msg_ref, persona))
+                else:
+                    ok = bool(await self._reaction_add(msg_ref, persona))
+            except Exception as exc:
+                logger.debug("reaction start failed (%s): %s", persona, exc)
+                ok = False
+            if not self._rxn_identity_current(
+                key, generation, token, msg_ref
+            ) or not self._rxn_hook_is_current(event):
+                if ok and not self._reaction_replace_mode:
+                    with contextlib.suppress(Exception):
+                        await self._reaction_remove(msg_ref, persona)
+                return False
+            if ok:
+                self._rxn_active[key] = persona
+                self._rxn_stale.pop(key, None)
+            return ok
+
+    @_rxn_track_callback
     async def _rxn_on_tool_call_start(self, event: Any, tool_name: str) -> None:
-        """Swap reaction to tool-specific emoji (with cooldown)."""
-        if not getattr(self, "_rxn_initialized", False):
+        if not getattr(self, "_rxn_initialized", False) or not self._rxn_dynamic:
             return
-        if not self._rxn_dynamic:
+        if not self._rxn_hook_is_current(event):
             return
-
         key = self._reaction_msg_key(event)
         if key is None:
             return
-
-        # Generation check: capture at entry, reject late callbacks after new start
-        gen_at_entry = self._rxn_generation.get(key)
-        if gen_at_entry is None:
-            # No processing start yet for this key; ignore
+        token = self._rxn_message_token(event)
+        external_generation = self._rxn_external_generation(event)
+        generation = self._rxn_generation.get(key)
+        if generation is None or self._rxn_closed.get(key) == generation:
+            return
+        if token is not None and self._rxn_tokens.get(key) != token:
+            return
+        if not self._rxn_external_generation_matches(key, external_generation):
             return
 
-        async with self._rxn_lock(key):
-            # Reject late callback if generation advanced while waiting for lock
-            if self._rxn_generation.get(key) != gen_at_entry:
+        async with self._rxn_locked(key):
+            if (
+                not self._rxn_identity_current(key, generation, token)
+                or not self._rxn_external_generation_matches(key, external_generation)
+                or not self._rxn_hook_is_current(event)
+            ):
                 return
             msg_ref = self._rxn_msg_refs.get(key)
             if msg_ref is None:
-                # Try resolving from event directly (fallback)
-                msg_ref = self._reaction_resolve_message(event)
-                if msg_ref is None:
-                    return
-                self._rxn_msg_refs[key] = msg_ref
-
-            # Cooldown check — conservative 1.0s buffer over Discord's 0.25s limit (heuristic)
-            now = time.monotonic()
-            last = self._rxn_last_swap.get(key, 0.0)
-            if now - last < self._rxn_cooldown:
                 return
-
+            now = time.monotonic()
+            if now - self._rxn_last_swap.get(key, 0.0) < self._rxn_cooldown:
+                return
             from agent.display import get_tool_emoji
 
-            raw_emoji = get_tool_emoji(tool_name, default="⚙️")
-            tool_emoji = self._reaction_translate_emoji(raw_emoji)
-            if tool_emoji is None:
-                tool_emoji = self._reaction_translate_emoji("⚙️") or "⚙️"
-
+            tool_emoji = self._rxn_translate(
+                get_tool_emoji(tool_name, default=_DEFAULT_TOOL_EMOJI),
+                _DEFAULT_TOOL_EMOJI,
+            )
             current = self._rxn_active.get(key)
             if current == tool_emoji:
-                return  # Already showing this emoji
-
+                return
             try:
                 if self._reaction_replace_mode:
-                    ok = await self._reaction_set(msg_ref, tool_emoji)
+                    ok = bool(await self._reaction_set(msg_ref, tool_emoji))
                     if not ok:
                         return
-                    # success
+                    if not self._rxn_identity_current(
+                        key, generation, token, msg_ref
+                    ) or not self._rxn_hook_is_current(event):
+                        return
                     self._rxn_active[key] = tool_emoji
                     self._rxn_last_swap[key] = now
-                    self._rxn_stale.pop(key, None)
                     return
-                else:
-                    # Add new FIRST, then remove old — prevents zero-reaction
-                    # reflow jitter on Discord (message shifts when reactions disappear)
-                    ok = await self._reaction_add(msg_ref, tool_emoji)
-                    if not ok:
+
+                ok = bool(await self._reaction_add(msg_ref, tool_emoji))
+                if not ok:
+                    return
+                if not self._rxn_identity_current(
+                    key, generation, token, msg_ref
+                ) or not self._rxn_hook_is_current(event):
+                    with contextlib.suppress(Exception):
+                        await self._reaction_remove(msg_ref, tool_emoji)
+                    return
+                if current and current != tool_emoji:
+                    try:
+                        removed = bool(await self._reaction_remove(msg_ref, current))
+                    except Exception as exc:
+                        logger.debug(
+                            "reaction swap remove failed (%s): %s", current, exc
+                        )
+                        removed = False
+                    if not self._rxn_identity_current(
+                        key, generation, token, msg_ref
+                    ) or not self._rxn_hook_is_current(event):
                         return
-                    if current and current != tool_emoji:
-                        try:
-                            ok_rm = await self._reaction_remove(msg_ref, current)
-                            ok_rm = bool(ok_rm)
-                        except Exception as e:
-                            logger.debug(
-                                "reaction swap remove failed (%s): %s", current, e
-                            )
-                            ok_rm = False
-                        if not ok_rm:
-                            # Preserve old as stale for final cleanup
-                            stale_set = self._rxn_stale.setdefault(key, set())
-                            stale_set.add(current)
-                        else:
-                            # Remove succeeded: clear from stale if present
-                            if key in self._rxn_stale:
-                                self._rxn_stale[key].discard(current)
-                                if not self._rxn_stale[key]:
-                                    self._rxn_stale.pop(key, None)
-            except Exception as e:
+                    if not removed:
+                        self._rxn_stale.setdefault(key, set()).add(current)
+                    else:
+                        stale = self._rxn_stale.get(key)
+                        if stale:
+                            stale.discard(current)
+                            if not stale:
+                                self._rxn_stale.pop(key, None)
+                if not self._rxn_identity_current(
+                    key, generation, token, msg_ref
+                ) or not self._rxn_hook_is_current(event):
+                    return
+                self._rxn_active[key] = tool_emoji
+                self._rxn_last_swap[key] = now
+            except Exception as exc:
                 logger.debug(
-                    "reaction swap failed (%s -> %s): %s", current, tool_emoji, e
+                    "reaction swap failed (%s -> %s): %s", current, tool_emoji, exc
                 )
-                # Do not corrupt active tracking on transient failure; keep previous
-                return
 
-            self._rxn_active[key] = tool_emoji
-            self._rxn_last_swap[key] = now
-
+    @_rxn_track_callback
     async def _rxn_on_processing_complete(self, event: Any, outcome: Any) -> None:
-        """Replace active reaction with final emoji."""
-        if not getattr(self, "_rxn_initialized", False):
+        if (
+            not getattr(self, "_rxn_initialized", False)
+            or not self._rxn_reactions_enabled()
+        ):
             return
-        if not self._rxn_reactions_enabled():
-            return
-
         key = self._reaction_msg_key(event)
         if key is None:
             return
+        token = self._rxn_message_token(event)
+        external_generation = self._rxn_external_generation(event)
+        generation = self._rxn_generation.get(key)
+        if generation is None:
+            return
+        if token is not None and self._rxn_tokens.get(key) != token:
+            return
+        if not self._rxn_external_generation_matches(key, external_generation):
+            return
 
-        # Use try/finally to guarantee lock cleanup even on early return due to API False
-        lock = self._rxn_lock(key)
-        try:
-            async with lock:
-                msg_ref = self._rxn_msg_refs.get(key)
-                if msg_ref is None:
-                    try:
-                        msg_ref = self._reaction_resolve_message(event)
-                    except Exception:
-                        msg_ref = None
-                if msg_ref is None:
-                    # No message to act on; clean tracking
-                    self._rxn_active.pop(key, None)
-                    self._rxn_msg_refs.pop(key, None)
-                    self._rxn_last_swap.pop(key, None)
-                    self._rxn_stale.pop(key, None)
-                    # Also attempt to drain pending for this key (old messages)
-                    pending = self._rxn_pending.get(key)
-                    if pending:
-                        # Try to clean pending even without current msg_ref? keep for next try
-                        pass
+        async with self._rxn_locked(key):
+            if not self._rxn_identity_current(
+                key, generation, token, allow_closed=True
+            ):
+                return
+            if not self._rxn_external_generation_matches(key, external_generation):
+                return
+            msg_ref = self._rxn_msg_refs.get(key)
+            if msg_ref is None:
+                resolved = self._reaction_resolve_message(event)
+                if resolved is None:
                     return
+                msg_ref = resolved
+                self._rxn_msg_refs[key] = msg_ref
+            event_ref = getattr(event, "raw_message", None)
+            if event_ref is not None and event_ref is not msg_ref:
+                return
+            if not await self._rxn_drain_pending(
+                key, generation, token, event=event, allow_closed=True
+            ):
+                # A failed old-message cleanup must not prevent current finalization.
+                pass
 
-                # --- Drain pending stale from previous same-key turns before handling current ---
-                pending_list = self._rxn_pending.get(key, [])
-                if pending_list:
-                    new_pending: list[tuple[Any, set[str]]] = []
-                    for pending_msg_ref, pending_emojis in list(pending_list):
-                        failed_pending: set[str] = set()
-                        for emoji in list(pending_emojis):
-                            if self._reaction_replace_mode:
-                                continue
-                            try:
-                                ok_rm = await self._reaction_remove(
-                                    pending_msg_ref, emoji
-                                )
-                                ok_rm = bool(ok_rm)
-                            except Exception as e:
-                                logger.debug(
-                                    "pending cleanup remove failed (%s): %s", emoji, e
-                                )
-                                ok_rm = False
-                            if not ok_rm:
-                                failed_pending.add(emoji)
-                        if failed_pending:
-                            new_pending.append((pending_msg_ref, failed_pending))
-                    if new_pending:
-                        self._rxn_pending[key] = new_pending
-                    else:
-                        self._rxn_pending.pop(key, None)
+            current = self._rxn_active.get(key)
+            stale = set(self._rxn_stale.get(key, set()))
+            from gateway.platforms.base import ProcessingOutcome
 
-                # Peek current and stale without popping yet; only pop after success
-                current = self._rxn_active.get(key)
-                stale = (
-                    set(self._rxn_stale.get(key, set()))
-                    if hasattr(self, "_rxn_stale")
-                    else set()
-                )
-
-                # Import here to avoid circular imports at module level
-                from gateway.platforms.base import ProcessingOutcome
-
-                if outcome == ProcessingOutcome.CANCELLED:
-                    # Just clean up, don't change the reaction to persona
-                    to_remove: set[str] = set()
-                    if current:
-                        to_remove.add(current)
-                    to_remove.update(stale)
-                    # For replace mode, cancel does not set replacement; just attempt removes
-                    failed: set[str] = set()
-                    for emoji in list(to_remove):
-                        if self._reaction_replace_mode:
-                            # replace_mode has no per-emoji remove; skip (already no set)
-                            continue
-                        try:
-                            ok_rm = await self._reaction_remove(msg_ref, emoji)
-                            ok_rm = bool(ok_rm)
-                        except Exception as e:
-                            logger.debug(
-                                "cancel cleanup remove failed (%s): %s", emoji, e
-                            )
-                            ok_rm = False
-                        if not ok_rm:
-                            failed.add(emoji)
-                    if failed:
-                        # Preserve failures for later cleanup; keep msg_ref/active
-                        self._rxn_stale[key] = failed
-                        # Keep current if it failed? current is in failed set, so keep active
-                        if current and current in failed:
-                            pass  # keep _rxn_active
-                        else:
-                            # current succeeded removed, so clear active
-                            if current and current not in failed:
-                                self._rxn_active.pop(key, None)
-                        # Keep msg_ref for retry, but lock will be released via finally
-                        # Keep last_swap?
-                        return
-                    # All removals succeeded: clean all
-                    self._rxn_active.pop(key, None)
-                    self._rxn_msg_refs.pop(key, None)
-                    self._rxn_last_swap.pop(key, None)
-                    self._rxn_stale.pop(key, None)
-                    return
-
-                if outcome == ProcessingOutcome.SUCCESS:
-                    final = self._rxn_persona_emoji
-                else:
-                    final = "❌"
-
-                translated = self._reaction_translate_emoji(final)
-                if translated is None:
-                    translated = self._reaction_translate_emoji("❌") or "❌"
-
-                try:
+            if outcome == ProcessingOutcome.CANCELLED:
+                to_remove = set(stale)
+                if current:
+                    to_remove.add(current)
+                failed: set[str] = set()
+                for emoji in to_remove:
                     if self._reaction_replace_mode:
-                        try:
-                            ok = await self._reaction_set(msg_ref, translated)
-                            ok = bool(ok)
-                        except Exception as e:
-                            logger.debug(
-                                "reaction complete set failed (%s -> %s): %s",
-                                current,
-                                translated,
-                                e,
-                            )
-                            ok = False
-                        if not ok:
-                            # Preserve current/stale for later retry; do not pop
-                            return
-                        # success
-                        self._rxn_active.pop(key, None)
-                        self._rxn_msg_refs.pop(key, None)
-                        self._rxn_last_swap.pop(key, None)
-                        self._rxn_stale.pop(key, None)
+                        continue
+                    if not self._rxn_identity_current(
+                        key, generation, token, msg_ref, allow_closed=True
+                    ) or not self._rxn_hook_is_current(event):
                         return
-                    else:
-                        need_add = translated != current
-                        # If no active (start failed) we still need to add
-                        if need_add:
-                            try:
-                                ok = await self._reaction_add(msg_ref, translated)
-                                ok = bool(ok)
-                            except Exception as e:
-                                logger.debug(
-                                    "reaction complete add failed (%s -> %s): %s",
-                                    current,
-                                    translated,
-                                    e,
-                                )
-                                ok = False
-                            if not ok:
-                                # Preserve current/stale/msg_ref for later recovery
-                                return
-                            # Add succeeded; current will be considered replaced
-                        # Build set of emojis to remove (current + stale, excluding translated)
-                        to_remove2: set[str] = set()
-                        if current and current != translated:
-                            to_remove2.add(current)
-                        for em in list(stale):
-                            if em != translated:
-                                to_remove2.add(em)
-                        failed2: set[str] = set()
-                        for emoji in list(to_remove2):
-                            try:
-                                ok_rm = await self._reaction_remove(msg_ref, emoji)
-                                ok_rm = bool(ok_rm)
-                            except Exception as e:
-                                logger.debug(
-                                    "reaction complete remove failed (%s): %s", emoji, e
-                                )
-                                ok_rm = False
-                            if not ok_rm:
-                                failed2.add(emoji)
-                        if failed2:
-                            # Some removes failed; keep them stale for later, but final emoji is now active
-                            # Update active to translated (since add succeeded)
-                            self._rxn_active[key] = translated
-                            # Keep msg_ref for retry
-                            self._rxn_stale[key] = failed2
-                            # Keep last_swap? Not needed after final, but preserve
-                            return
-                        # All succeeded: clean
-                        self._rxn_active.pop(key, None)
-                        self._rxn_msg_refs.pop(key, None)
-                        self._rxn_last_swap.pop(key, None)
-                        self._rxn_stale.pop(key, None)
+                    try:
+                        removed = bool(await self._reaction_remove(msg_ref, emoji))
+                    except Exception as exc:
+                        logger.debug("cancel cleanup failed (%s): %s", emoji, exc)
+                        removed = False
+                    if not self._rxn_identity_current(
+                        key, generation, token, msg_ref, allow_closed=True
+                    ) or not self._rxn_hook_is_current(event):
                         return
-                except Exception as e:
-                    logger.debug(
-                        "reaction complete swap failed (%s -> %s): %s",
-                        current,
-                        translated,
-                        e,
-                    )
-                    # Preserve state for retry
+                    if not removed:
+                        failed.add(emoji)
+                if failed:
+                    self._rxn_stale[key] = failed
+                    if current and current not in failed:
+                        self._rxn_active.pop(key, None)
+                    self._rxn_close_generation(key, generation)
                     return
-        finally:
-            # Unconditional lock cleanup: pop the per-key lock dict entry
-            # This runs even if we returned early inside the lock due to API False
-            self._rxn_locks.pop(key, None)
+                self._rxn_active.pop(key, None)
+                self._rxn_stale.pop(key, None)
+                self._rxn_completion_pending.pop(key, None)
+                self._rxn_msg_refs.pop(key, None)
+                self._rxn_last_swap.pop(key, None)
+                self._rxn_close_generation(key, generation)
+                return
+
+            final_raw = (
+                self._rxn_persona_emoji
+                if outcome == ProcessingOutcome.SUCCESS
+                else "❌"
+            )
+            final = self._rxn_translate(
+                final_raw,
+                _DEFAULT_PERSONA_EMOJI
+                if outcome == ProcessingOutcome.SUCCESS
+                else "❌",
+            )
+            need_add = current != final
+            if self._reaction_replace_mode:
+                try:
+                    ok = bool(await self._reaction_set(msg_ref, final))
+                except Exception as exc:
+                    logger.debug("reaction completion set failed (%s): %s", final, exc)
+                    ok = False
+                if not self._rxn_identity_current(
+                    key, generation, token, msg_ref, allow_closed=True
+                ) or not self._rxn_hook_is_current(event):
+                    return
+                if not ok:
+                    self._rxn_completion_pending[key] = (
+                        set(stale) | ({current} if current else set()) | {final}
+                    )
+                    if current:
+                        self._rxn_active[key] = current
+                    self._rxn_close_generation(key, generation)
+                    return
+                self._rxn_active.pop(key, None)
+                self._rxn_stale.pop(key, None)
+                self._rxn_completion_pending.pop(key, None)
+                self._rxn_msg_refs.pop(key, None)
+                self._rxn_last_swap.pop(key, None)
+                self._rxn_close_generation(key, generation)
+                return
+
+            if need_add:
+                if not self._rxn_identity_current(
+                    key, generation, token, msg_ref, allow_closed=True
+                ) or not self._rxn_hook_is_current(event):
+                    return
+                try:
+                    added = bool(await self._reaction_add(msg_ref, final))
+                except Exception as exc:
+                    logger.debug(
+                        "reaction completion add failed (%s -> %s): %s",
+                        current,
+                        final,
+                        exc,
+                    )
+                    added = False
+                if not self._rxn_identity_current(
+                    key, generation, token, msg_ref, allow_closed=True
+                ) or not self._rxn_hook_is_current(event):
+                    if added:
+                        with contextlib.suppress(Exception):
+                            await self._reaction_remove(msg_ref, final)
+                    return
+                if not added:
+                    candidates = stale | ({current} if current else set()) | {final}
+                    self._rxn_completion_pending[key] = candidates
+                    self._rxn_close_generation(key, generation)
+                    return
+
+            to_remove = {emoji for emoji in stale if emoji != final}
+            if current and current != final:
+                to_remove.add(current)
+            failed: set[str] = set()
+            for emoji in to_remove:
+                if not self._rxn_identity_current(
+                    key, generation, token, msg_ref, allow_closed=True
+                ) or not self._rxn_hook_is_current(event):
+                    return
+                try:
+                    removed = bool(await self._reaction_remove(msg_ref, emoji))
+                except Exception as exc:
+                    logger.debug(
+                        "reaction completion remove failed (%s): %s", emoji, exc
+                    )
+                    removed = False
+                if not self._rxn_identity_current(
+                    key, generation, token, msg_ref, allow_closed=True
+                ) or not self._rxn_hook_is_current(event):
+                    return
+                if not removed:
+                    failed.add(emoji)
+
+            if failed:
+                self._rxn_active[key] = final
+                self._rxn_stale[key] = failed
+                self._rxn_completion_pending.pop(key, None)
+                self._rxn_close_generation(key, generation)
+                return
+            self._rxn_active.pop(key, None)
+            self._rxn_stale.pop(key, None)
+            self._rxn_completion_pending.pop(key, None)
+            self._rxn_msg_refs.pop(key, None)
+            self._rxn_last_swap.pop(key, None)
+            self._rxn_close_generation(key, generation)

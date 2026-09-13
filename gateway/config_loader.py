@@ -168,7 +168,7 @@ def platform_section(yaml_cfg: dict, name: str, gateway_platforms: Any) -> tuple
     section = yaml_cfg.get(name)
     toplevel = isinstance(section, dict)
     if not toplevel:
-        nested = (src[name] for src in (gateway_platforms, yaml_cfg.get("platforms")) if isinstance(src, dict) and isinstance(src.get(name), dict))
+        nested = (src[name] for src in (yaml_cfg.get("platforms"), gateway_platforms) if isinstance(src, dict) and isinstance(src.get(name), dict))
         section = next(nested, section)
     return section, toplevel
 
@@ -210,16 +210,23 @@ _SHARED_KEYS: tuple = (
 )
 
 def _bridged_keys(plat: Platform, platform_cfg: dict, gw_data: dict, *, root_block: bool = False) -> dict:
-    """Shared-key bridge; a ROOT-level ``<platform>:`` block (which ``merge_platform_sections``
-    never copies into ``platforms_data``) also gets its adapter keys promoted into ``extra``, with
-    the same typed-key exclusion and explicit-``extra`` precedence as ``PlatformConfig.from_dict``."""
-    bridged: dict = {}
+    """Bridge adapter settings while preserving explicit ``extra`` precedence.
+
+    ``PlatformConfig.from_dict`` treats an explicit ``extra`` value as the
+    authoritative value when a platform setting is specified in both places.
+    Keep that contract for root-level legacy blocks and nested platform blocks.
+    """
+    explicit_extra = _coerce_dict(platform_cfg.get("extra", {}))
+    bridged: dict = dict(explicit_extra)
     if root_block:
         typed = PlatformConfig._TYPED_KEYS | {"channel_overrides"}
-        bridged.update({k: v for k, v in platform_cfg.items() if k not in typed})
-        bridged.update(_coerce_dict(platform_cfg.get("extra", {})))
+        for key, value in platform_cfg.items():
+            if key not in typed and key not in bridged:
+                bridged[key] = value
     for key, only, transform in _SHARED_KEYS:
         if key not in platform_cfg or (only is not None and plat not in only):
+            continue
+        if key in bridged:
             continue
         if transform == "dm":
             bridged[key] = _dm_behavior_choice(platform_cfg[key], gw_data.get("unauthorized_dm_behavior", "pair"))

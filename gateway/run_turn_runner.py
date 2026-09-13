@@ -24,6 +24,7 @@ from agent.replay_cleanup import strip_stale_dangerous_confirmations
 from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter
+from gateway.platforms.reaction_mixin import ReactionHookContext
 from gateway.turn_context import TurnContext
 from hermes_cli.config import cfg_get
 from utils import is_truthy_value
@@ -69,6 +70,40 @@ class TurnRunner:
         except Exception:
             return False
 
+    def _reaction_hook_context(self) -> ReactionHookContext:
+        """Snapshot the turn identity before scheduling a platform hook."""
+        ctx = self._ctx
+        source = ctx.source
+        message_token = getattr(ctx, "inbound_message_id", None) or getattr(ctx, "event_message_id", None)
+        if message_token is None:
+            message_token = getattr(source, "message_id", None)
+
+        def _is_current() -> bool:
+            try:
+                still_current = ctx._run_still_current
+                return bool(not self._agent_interrupted() and (not callable(still_current) or still_current()))
+            except Exception:
+                return False
+
+        return ReactionHookContext(
+            source=source,
+            run_generation=ctx.run_generation,
+            message_id=str(message_token) if message_token is not None else None,
+            message_token=str(message_token) if message_token is not None else None,
+            is_current=_is_current,
+        )
+
+    async def _run_reaction_hook(self, adapter: Any, tool_name: str) -> None:
+        """Run a scheduled reaction hook only while this turn remains live."""
+        if self._agent_interrupted():
+            return
+        check = self._ctx._run_still_current
+        if callable(check) and not check():
+            return
+        await adapter._run_processing_hook(
+            "on_tool_call_start", self._reaction_hook_context(), tool_name
+        )
+
     def _stream_consumer(self):
         holder = self._ctx.stream_consumer_holder
         return holder[0] if holder else None
@@ -109,15 +144,19 @@ class TurnRunner:
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             preview_str = f' "{preview}"' if preview else ""
             ctx.log_queue.put(f"{ts}  {tool_name}:{preview_str}".rstrip())
-        # Fire on_tool_call_start hook for dynamic reaction swapping.
-        # Runs before the progress_queue guard so reactions work even when
-        # tool progress messages are off.
-        if event_type == "tool.started" and tool_name and getattr(ctx, "_status_adapter", None) and ctx._run_still_current():
+        # Fire on_tool_call_start hook for dynamic reaction swapping.  It uses
+        # the same interruption gate as visible progress and carries an
+        # immutable turn/message token instead of re-resolving a current cache.
+        if (
+            event_type == "tool.started"
+            and tool_name
+            and getattr(ctx, "_status_adapter", None)
+            and ctx._run_still_current()
+            and not self._agent_interrupted()
+        ):
             try:
                 self._schedule(
-                    ctx._status_adapter._run_processing_hook(
-                        "on_tool_call_start", ctx.source, tool_name
-                    ),
+                    self._run_reaction_hook(ctx._status_adapter, tool_name),
                     "on_tool_call_start scheduling error",
                 )
             except Exception:
