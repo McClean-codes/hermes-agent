@@ -24,6 +24,7 @@ from agent.replay_cleanup import canonicalize_replay_history
 from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter
+from gateway.platforms.reaction_mixin import ReactionHookContext
 from gateway.turn_context import TurnContext
 from hermes_cli.config import cfg_get
 from utils import is_truthy_value
@@ -33,6 +34,187 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
+
+def _redact_progress_text(text: str | None) -> str:
+    """Strict fail-closed sanitizer for progress, preview, and status text."""
+    from gateway.run import _strict_gateway_egress_text
+
+    try:
+        return _strict_gateway_egress_text("" if text is None else text)
+    except Exception:
+        logger.debug("progress egress redaction unavailable", exc_info=True)
+        return "[REDACTED]"
+
+
+def _sanitize_progress_value(value: Any) -> Any:
+    """Sanitize display-only callback data before formatters can clip it."""
+    if isinstance(value, str):
+        return _redact_progress_text(value)
+    if isinstance(value, dict):
+        return {_sanitize_progress_value(key): _sanitize_progress_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_progress_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_sanitize_progress_value(item) for item in value)
+    return value
+
+# ---- progress filter helpers (per-tool + category) ---------------------------
+# Category aliases supported in display.tool_progress_filter keys. Normalized to lower case.
+# "skills" covers skill_manage/skill_view etc; "mcp" covers all MCP-discovered tools;
+# "plugins" covers tools registered by hermes_plugins. Unknown categories are stored but
+# never match, failing safe (no effect). Individual tool names take precedence over
+# categories.
+
+_CATEGORY_ALIASES: dict[str, str] = {
+    "skill": "skills",
+    "skills": "skills",
+    "mcp": "mcp",
+    "mcp_tools": "mcp",
+    "mcp-tools": "mcp",
+    "mcp_tool": "mcp",
+    "plugin": "plugins",
+    "plugins": "plugins",
+}
+
+# Static set of skill-related tool names for quick category matching when registry
+# is not yet populated. The registry path (toolset == "skills") is preferred when
+# available; this fallback is an explicit, reviewed allowlist without prefix overmatching.
+# "memory" is NOT part of skills and must remain excluded from the skills category.
+_SKILL_TOOL_NAMES = frozenset({
+    "skill_manage", "skill_view", "skill_ledger", "skill_evaluator", "skill_usage",
+    "skills_tool", "skills_hub", "skill_manager_tool",
+})
+
+def _normalize_filter_key(key: str) -> str:
+    k = key.strip().lower()
+    return _CATEGORY_ALIASES.get(k, k)
+
+def _get_tool_categories(tool_name: str) -> list[str]:
+    """Return category keys (canonical) for a tool name, for filter matching.
+
+    Categories are "skills", "mcp", "plugins" when authoritative registry /
+    current-scope metadata can distinguish them. Uses the tool registry when
+    available; falls back to the explicit skill allowlist without prefix
+    overmatching. MCP provenance is registry-toolset only and fails closed when
+    the active registry cannot establish MCP ownership (no process-global
+    cross-profile fallback). Never raises; empty list means no category.
+    """
+    if not tool_name or not isinstance(tool_name, str):
+        return []
+    name_lower = tool_name.strip().lower()
+    cats: list[str] = []
+    # Skills: authoritative registry check first, then explicit allowlist without prefix
+    try:
+        from tools.registry import registry as _reg
+        toolset_for_skill = None
+        try:
+            toolset_for_skill = _reg.get_toolset_for_tool(tool_name)
+            if toolset_for_skill is None:
+                toolset_for_skill = _reg.get_toolset_for_tool(name_lower)
+        except Exception:
+            toolset_for_skill = None
+        if toolset_for_skill == "skills":
+            cats.append("skills")
+        elif name_lower in _SKILL_TOOL_NAMES:
+            # Fallback allowlist when registry not yet populated or tool not registered
+            # via registry (e.g., early turn before tool discovery). No prefix matching.
+            cats.append("skills")
+    except Exception:
+        # Registry unavailable: use allowlist only
+        if name_lower in _SKILL_TOOL_NAMES:
+            if "skills" not in cats:
+                cats.append("skills")
+    # Registry-backed checks for MCP and plugins (current scope, never global fallback)
+    try:
+        from tools.registry import registry as _reg
+        toolset = None
+        try:
+            toolset = _reg.get_toolset_for_tool(tool_name)
+        except Exception:
+            try:
+                toolset = _reg.get_toolset_for_tool(name_lower)
+            except Exception:
+                toolset = None
+        if toolset and isinstance(toolset, str) and toolset.startswith("mcp-"):
+            if "mcp" not in cats:
+                cats.append("mcp")
+        # Plugin ownership: authoritative registry check (scope-aware)
+        try:
+            entry = None
+            try:
+                entry = _reg.get_entry(tool_name)
+                if entry is None:
+                    entry = _reg.get_entry(name_lower)
+            except Exception:
+                entry = None
+            if entry is not None:
+                # Prefer _plugin_owner_of (scope-aware) over raw module prefix
+                try:
+                    owner = _reg._plugin_owner_of(entry.handler) if hasattr(_reg, "_plugin_owner_of") else None
+                    if owner and "plugins" not in cats:
+                        cats.append("plugins")
+                except Exception:
+                    pass
+                # Toolset containing "plugin" also indicates plugin (e.g., toolset "plugin" or "my-plugin")
+                # But only when registry establishes it; not via arbitrary module prefix alone.
+                try:
+                    ts = toolset or _reg.get_toolset_for_tool(entry.name) if hasattr(entry, "name") else toolset
+                    if ts and isinstance(ts, str) and "plugin" in ts.lower():
+                        if "plugins" not in cats:
+                            cats.append("plugins")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    except Exception:
+        pass
+    # No MCP process-global fallback: fail closed if registry cannot establish MCP ownership.
+    # Deduplicate preserving order
+    seen = set()
+    uniq = []
+    for c in cats:
+        if c not in seen:
+            seen.add(c)
+            uniq.append(c)
+    return uniq
+
+def _resolve_effective_mode(tool_name: str, global_mode: str, filter_dict: dict | None) -> str:
+    """Resolve per-tool effective progress mode, honoring filter overrides.
+
+    Precedence: exact tool name (case-insensitive) wins over category, then global.
+    Categories checked: skills/mcp/plugins (canonical). Returns global_mode if filter
+    empty or no match. Filter keys are canonicalized so platform alias precedence
+    (skill->skills etc.) is deterministic before this check.
+    """
+    if not filter_dict:
+        return global_mode
+    # Canonicalize filter keys defensively so raw alias dicts still resolve correctly
+    canonical_map: dict[str, str] = {}
+    for k, v in filter_dict.items():
+        if not isinstance(k, str):
+            continue
+        ck = _normalize_filter_key(k.strip().lower())
+        # Last-wins for canonicalized duplicates (e.g., "skill" and "skills")
+        canonical_map[ck] = v  # type: ignore[assignment]
+    # Also keep original lower map for exact-tool lookup that may be alias? But tool names
+    # are lowercased and not categories, so canonicalization of exact tool names that happen
+    # to match alias would incorrectly map them. For exact tool match we must use raw lower.
+    raw_lower_map = {str(k).strip().lower(): v for k, v in filter_dict.items() if isinstance(k, str)}
+    name_lower = tool_name.strip().lower() if isinstance(tool_name, str) else ""
+    if name_lower and name_lower in raw_lower_map:
+        return raw_lower_map[name_lower]
+    # Category check: tool may belong to multiple, first match wins (skills, mcp, plugins)
+    for cat in _get_tool_categories(tool_name):
+        if cat in canonical_map:
+            return canonical_map[cat]
+    return global_mode
+
+
+def _resolve_native_task_card_mode(tool_name: str, global_mode: str, filter_dict: dict | None, native: bool) -> str:
+    """Resolve native-card display using its opt-in ``all`` baseline."""
+    if native and global_mode == "off":
+        return _resolve_effective_mode(tool_name, "all", filter_dict)
+    return _resolve_effective_mode(tool_name, global_mode, filter_dict)
 
 
 def _renders_exec_approval_buttons(adapter_cls: type) -> bool:
@@ -61,6 +243,9 @@ class TurnRunner:
     def __init__(self, runner: "GatewayRunner", ctx: TurnContext) -> None:
         self._runner = runner
         self._ctx = ctx
+        # Track native task-card call IDs hidden by the filter so a later
+        # completion for the same ID cannot resurrect a hidden card.
+        self._hidden_native_call_ids: set[str] = set()
 
     # ── shared thread→loop plumbing ─────────────────────────────────────────────────────────
 
@@ -78,6 +263,40 @@ class TurnRunner:
             return bool(agent is not None and getattr(agent, "is_interrupted", False))
         except Exception:
             return False
+
+    def _reaction_hook_context(self) -> ReactionHookContext:
+        """Snapshot the turn identity before scheduling a platform hook."""
+        ctx = self._ctx
+        source = ctx.source
+        message_token = getattr(ctx, "inbound_message_id", None) or getattr(ctx, "event_message_id", None)
+        if message_token is None:
+            message_token = getattr(source, "message_id", None)
+
+        def _is_current() -> bool:
+            try:
+                still_current = ctx._run_still_current
+                return bool(not self._agent_interrupted() and (not callable(still_current) or still_current()))
+            except Exception:
+                return False
+
+        return ReactionHookContext(
+            source=source,
+            run_generation=ctx.run_generation,
+            message_id=str(message_token) if message_token is not None else None,
+            message_token=str(message_token) if message_token is not None else None,
+            is_current=_is_current,
+        )
+
+    async def _run_reaction_hook(self, adapter: Any, tool_name: str) -> None:
+        """Run a scheduled reaction hook only while this turn remains live."""
+        if self._agent_interrupted():
+            return
+        check = self._ctx._run_still_current
+        if callable(check) and not check():
+            return
+        await adapter._run_processing_hook(
+            "on_tool_call_start", self._reaction_hook_context(), tool_name
+        )
 
     def _stream_consumer(self):
         holder = self._ctx.stream_consumer_holder
@@ -112,13 +331,66 @@ class TurnRunner:
         if event_type == "subagent.complete":
             self._progress_subagent_notice(preview, kwargs)
             return
-        self._progress_live_status(event_type, tool_name, args)
-        # "log" mode: append tool.started lines to the log queue, silent in chat. Handled before
-        # the progress_queue guard because log mode runs without a chat progress queue.
-        if ctx.log_queue is not None and event_type == "tool.started" and tool_name and tool_name != "_thinking":
-            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            preview_str = f' "{preview}"' if preview else ""
-            ctx.log_queue.put(f"{ts}  {tool_name}:{preview_str}".rstrip())
+        # Resolve effective per-tool mode before any routing so "log" and "off" are honored
+        # for both the chat progress rail and the optional live-status rail.
+        _tool_for_effective = tool_name if isinstance(tool_name, str) else ""
+        try:
+            _effective_mode = _resolve_effective_mode(
+                _tool_for_effective,
+                ctx.progress_mode,
+                getattr(ctx, "tool_progress_filter", None),
+            )
+        except Exception:
+            _effective_mode = ctx.progress_mode
+
+        def _schedule_reaction_start() -> None:
+            # Reactions are a separate persona effect and must remain independent
+            # of whether the progress rail is visible or log-only.
+            if (
+                event_type == "tool.started"
+                and tool_name
+                and getattr(ctx, "_status_adapter", None)
+                and ctx._run_still_current()
+                and not self._agent_interrupted()
+            ):
+                try:
+                    self._schedule(
+                        self._run_reaction_hook(ctx._status_adapter, tool_name),
+                        "on_tool_call_start scheduling error",
+                    )
+                except Exception:
+                    pass
+
+        # Effective "log" goes only to the log sink, never the chat progress queue
+        # or live-status rail. Redact before the log effect as well.
+        if _effective_mode == "log" and event_type == "tool.started" and tool_name and tool_name != "_thinking":
+            if ctx.log_queue is not None:
+                try:
+                    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    preview_str = f' "{_redact_progress_text(preview)}"' if preview else ""
+                    ctx.log_queue.put(_redact_progress_text(f"{ts}  {tool_name}:{preview_str}".rstrip()))
+                except Exception:
+                    logger.debug("log queue put failed", exc_info=True)
+            _schedule_reaction_start()
+            return
+
+        # Effective "off" suppresses chat progress and live-status previews for
+        # this tool while retaining persona reaction hooks.
+        if _effective_mode == "off" and event_type == "tool.started" and tool_name and tool_name != "_thinking":
+            _schedule_reaction_start()
+            return
+
+        # Live status is independent from the chat queue, but filtered tool
+        # starts/completions must not publish a hidden preview.
+        if event_type == "tool.started" and _effective_mode not in ("off", "log"):
+            self._progress_live_status(event_type, tool_name, args)
+            _schedule_reaction_start()
+        elif event_type == "tool.completed" and _effective_mode not in ("off", "log"):
+            self._progress_live_status(event_type, tool_name, args)
+        elif event_type not in {"tool.started", "tool.completed"}:
+            # Non-tool lifecycle events (for example _thinking) retain the
+            # original live-status guards inside _progress_live_status.
+            self._progress_live_status(event_type, tool_name, args)
         if not ctx.progress_queue or not ctx._run_still_current():
             return
         if event_type == "tool.completed" and not ctx.long_tool_hint_fired[0]:
@@ -129,7 +401,7 @@ class TurnRunner:
         if event_type == "_thinking" or tool_name == "_thinking":
             thinking_text = (preview if tool_name == "_thinking" else tool_name) if ctx._thinking_enabled else None
             if thinking_text:
-                ctx.progress_queue.put(f"💬 {thinking_text}")
+                ctx.progress_queue.put(_redact_progress_text(f"💬 {thinking_text}"))
             return
         # Native task cards consume the ID-bearing tool_start/tool_complete callbacks instead;
         # name-correlated text events would duplicate cards and mispair concurrent same-tool calls.
@@ -151,11 +423,18 @@ class TurnRunner:
             or self._agent_interrupted()
         ):
             return
-        # "new" mode: only report when tool changes
-        if ctx.progress_mode == "new" and tool_name == ctx.last_tool[0]:
+        # Per-tool/category filter: reuse the already-resolved effective mode. Malformed/absent
+        # filter already fell back to global via _resolve_effective_mode above.
+        if _effective_mode == "off":
+            return
+        if _effective_mode == "log":
+            # Already handled at the top (routed to log queue only); never emit to chat progress
+            return
+        # "new" mode: only report when tool changes (per effective mode, not global)
+        if _effective_mode == "new" and tool_name == ctx.last_tool[0]:
             return
         ctx.last_tool[0] = tool_name
-        msg = self._progress_build_message(tool_name, preview, args)
+        msg = self._progress_build_message(tool_name, preview, args, _effective_mode=_effective_mode)
         if msg is not None:
             self._progress_emit(msg)
 
@@ -167,9 +446,12 @@ class TurnRunner:
             from tools.delegate_tool import SUBAGENT_FAILURE_STATUSES, format_subagent_failure_line
             if status in SUBAGENT_FAILURE_STATUSES and ctx._run_still_current():
                 line = format_subagent_failure_line(
-                    kwargs.get("goal"), status, error=kwargs.get("summary") or preview,
+                    _redact_progress_text(kwargs.get("goal") or ""),
+                    _redact_progress_text(status),
+                    error=_redact_progress_text(kwargs.get("summary") or preview or ""),
                     duration_seconds=kwargs.get("duration_seconds"),
                 )
+                line = _redact_progress_text(line)
                 self._schedule(self._runner._deliver_platform_notice(ctx.source, line), "subagent failure notice scheduling error")
         except Exception:
             logger.debug("subagent failure notice failed", exc_info=True)
@@ -184,7 +466,13 @@ class TurnRunner:
         try:
             if event_type == "tool.started" and tool_name and ctx._run_still_current():
                 from agent.display import build_status_phrase
-                adapter.set_status_text(ctx.source.chat_id, build_status_phrase(tool_name, args if ctx._live_status_mode == "full" else None))
+                display_args = _sanitize_progress_value(args)
+                display_tool_name = _redact_progress_text(tool_name)
+                _phrase = build_status_phrase(
+                    display_tool_name, display_args if ctx._live_status_mode == "full" else None,
+                )
+                _phrase = _redact_progress_text(_phrase)
+                adapter.set_status_text(ctx.source.chat_id, _phrase)
             elif event_type == "tool.completed":
                 # Between tools the model is genuinely "thinking" again — revert to the static default.
                 adapter.set_status_text(ctx.source.chat_id, None)
@@ -203,7 +491,7 @@ class TurnRunner:
                 gate_on = is_truthy_value(cfg_get(cfg, "display", "tool_progress_command"), default=False)
                 if gate_on and not is_seen(cfg, TOOL_PROGRESS_FLAG):
                     ctx.long_tool_hint_fired[0] = True
-                    ctx.progress_queue.put(tool_progress_hint_gateway())
+                    ctx.progress_queue.put(_redact_progress_text(tool_progress_hint_gateway()))
                     mark_seen(_hermes_home / "config.yaml", TOOL_PROGRESS_FLAG)
         except Exception as err:
             logger.debug("tool-progress onboarding hint failed: %s", err)
@@ -227,62 +515,92 @@ class TurnRunner:
             and isinstance(args.get("command"), str) and args["command"].strip()
         ):
             return None, None
-        cmd_full = args["command"].rstrip()
+        raw_full = args["command"].rstrip()
+        cmd_full = _redact_progress_text(raw_full)
         header = "" if self._ctx.last_was_terminal_block[0] else f"{emoji} {tool_name}\n"
         cap = self._preview_cap()
         lines = cmd_full.splitlines()
+        # Derive short from the redacted full so truncation never re-exposes raw secrets
         cmd_short = lines[0] if lines else cmd_full
         if len(cmd_short) > cap:
             cmd_short = cmd_short[:cap - 3] + "..."
         elif len(lines) > 1:
             cmd_short += " ..."
+        # Header is not secret-derived; command bodies are already redacted
         return f"{header}```\n{cmd_full}\n```", f"{header}```\n{cmd_short}\n```"
 
-    def _progress_build_message(self, tool_name, preview, args) -> Optional[str]:
+    def _progress_build_message(self, tool_name, preview, args, _effective_mode: str | None = None) -> Optional[str]:
         """Render the progress line. Verbose mode queues directly (no dedup) and returns None."""
         ctx = self._ctx
         from agent.display import get_tool_emoji
-        emoji = get_tool_emoji(tool_name, default="⚙️")
+        display_tool_name = _redact_progress_text(tool_name or "")
+        emoji = get_tool_emoji(display_tool_name, default="⚙️")
+        # Formatters and preview builders clip callback data; sanitize the
+        # complete display-only value before that boundary, then sanitize their
+        # rendered output below as a defense in depth.
+        preview = _redact_progress_text(preview) if preview else preview
+        display_args = _sanitize_progress_value(args)
         try:
             adapter = self._runner._adapter_for_source(ctx.source)
         except Exception:
             adapter = None
-        code_full, code_short = self._progress_terminal_blocks(adapter, tool_name, args, emoji)
-        verbose = ctx.progress_mode == "verbose"
+        code_full, code_short = self._progress_terminal_blocks(adapter, display_tool_name, display_args, emoji)
+        if _effective_mode is None:
+            try:
+                _effective_mode = _resolve_effective_mode(tool_name, ctx.progress_mode, getattr(ctx, "tool_progress_filter", None))
+            except Exception:
+                _effective_mode = ctx.progress_mode
+        verbose = _effective_mode == "verbose"
         code = code_full if verbose else code_short
         ctx.last_was_terminal_block[0] = code is not None
         if verbose:
-            if code is None and args:
+            if code is None and display_args:
                 from agent.display import get_tool_preview_max_len
                 pl = get_tool_preview_max_len()
-                args_str = json.dumps(args, ensure_ascii=False, default=str)
+                args_str = json.dumps(display_args, ensure_ascii=False, default=str)
+                args_str = _redact_progress_text(args_str)
                 # tool_preview_length 0 (default) = no truncation in verbose mode; the user asked
                 # for full detail and platform message-length limits handle the rest.
                 if pl > 0 and len(args_str) > pl:
                     args_str = args_str[:pl - 3] + "..."
-                code = f"{emoji} {tool_name}({list(args.keys())})\n{args_str}"
+                code = f"{emoji} {display_tool_name}({list(display_args.keys())})\n{args_str}"
+                code = _redact_progress_text(code)
             elif code is None:
-                code = f"{emoji} {tool_name}: \"{preview}\"" if preview else f"{emoji} {tool_name}..."
+                # Preview-derived fallback must be redacted before publication
+                _pv = _redact_progress_text(preview) if preview else preview
+                code = f"{emoji} {display_tool_name}: \"{_pv}\"" if _pv else f"{emoji} {display_tool_name}..."
+                code = _redact_progress_text(code)
+            else:
+                # Terminal blocks are already redacted, but still pass through boundary for safety
+                code = _redact_progress_text(code)
             ctx.progress_queue.put(code)
             return None
         if code is not None:
-            return code
+            return _redact_progress_text(code)
         if not preview:
-            return f"{emoji} {tool_name}..."
+            return _redact_progress_text(f"{emoji} {display_tool_name}...")
         from agent.display import get_tool_verb, prepare_tool_preview, tool_verb_connector, verb_drops_preview
-        prepared = prepare_tool_preview(tool_name, args, fallback=preview, max_len=self._preview_cap())
-        preview = adapter.format_tool_preview(prepared) if adapter is not None else prepared.text
+        prepared = prepare_tool_preview(
+            display_tool_name, display_args, fallback=preview, max_len=self._preview_cap(),
+        )
+        preview_text = adapter.format_tool_preview(prepared) if adapter is not None else prepared.text
+        preview_text = _redact_progress_text(preview_text)
         # Friendly labels: human-phrased line for built-in tools ("🔍 Searching the web for ...")
         # by prefixing the verb onto the computed preview, so the command/url/query is kept.
-        verb = get_tool_verb(tool_name)
+        verb = get_tool_verb(display_tool_name)
         if not verb:
-            return f"{emoji} {tool_name}: \"{preview}\""
-        return f"{emoji} {verb}" if verb_drops_preview(tool_name) else f"{emoji} {verb}{tool_verb_connector(tool_name)}{preview}"
+            return _redact_progress_text(f"{emoji} {display_tool_name}: \"{preview_text}\"")
+        if verb_drops_preview(display_tool_name):
+            return _redact_progress_text(f"{emoji} {verb}")
+        return _redact_progress_text(
+            f"{emoji} {verb}{tool_verb_connector(display_tool_name)}{preview_text}"
+        )
 
     def _progress_emit(self, msg: str) -> None:
         """Dedup consecutive identical lines (execute_code boilerplate), then route to the native
         stream bubble when the consumer accepts tool progress, else the progress queue."""
         ctx = self._ctx
+        msg = _redact_progress_text(msg)
         sc = self._stream_consumer()
         native = sc is not None and getattr(sc, "accepts_tool_progress", False)
         if msg == ctx.last_progress_msg[0]:
@@ -317,8 +635,10 @@ class TurnRunner:
 
         @staticmethod
         def _compact(value: Any, limit: int = 120) -> str:
-            text = re.sub(r"\s+", " ", str(value or "")).strip()
-            return text if len(text) <= limit else text[: limit - 3].rstrip() + "..."
+            text = _redact_progress_text(re.sub(r"\s+", " ", str(value or "")).strip())
+            if len(text) > limit:
+                text = text[: limit - 3].rstrip() + "..."
+            return _redact_progress_text(text)
 
         def visible_tasks(self) -> List[Dict[str, str]]:
             return [self.tasks[task_id] for task_id in self.task_order[-8:]]
@@ -326,7 +646,7 @@ class TurnRunner:
         def fallback_text(self) -> str:
             labels = {"in_progress": "running", "complete": "complete", "error": "error"}
             lines = [f"- {t['title']} - {labels.get(t['status'], t['status'])}" for t in self.visible_tasks()]
-            return "Hermes is working\n" + "\n".join(lines)
+            return _redact_progress_text("Hermes is working\n" + "\n".join(lines))
 
         def _upsert(self, call_id: str, title: str) -> Dict[str, str]:
             if call_id not in self.tasks:
@@ -355,7 +675,7 @@ class TurnRunner:
 
     async def _task_card_send_or_edit_fallback(self, st) -> None:
         ctx = self._ctx
-        text = st.fallback_text()
+        text = _redact_progress_text(st.fallback_text())
         from gateway.relay.egress import declined_send
 
         if getattr(st, "egress_declined", False):
@@ -391,9 +711,18 @@ class TurnRunner:
             # later publication would re-deliver the same task text there.
             return
         if not st.native_failed:
+            safe_tasks = [
+                {
+                    "id": _redact_progress_text(task.get("id")),
+                    "title": _redact_progress_text(task.get("title")),
+                    "status": _redact_progress_text(task.get("status")),
+                }
+                for task in st.visible_tasks()
+            ]
             result = await st.adapter.send_native_task_card_progress(
-                chat_id=ctx.source.chat_id, tasks=st.visible_tasks(), title="Hermes is working",
-                reply_to=ctx._progress_reply_to, metadata=ctx._progress_metadata, fallback_text=st.fallback_text(),
+                chat_id=ctx.source.chat_id, tasks=safe_tasks, title="Hermes is working",
+                reply_to=ctx._progress_reply_to, metadata=ctx._progress_metadata,
+                fallback_text=_redact_progress_text(st.fallback_text()),
             )
             if getattr(result, "success", False):
                 return
@@ -508,6 +837,7 @@ class TurnRunner:
 
     async def _edit_progress_message(self, st, message_id: str, content: str):
         ctx = self._ctx
+        content = _redact_progress_text(content)
         kwargs = {"chat_id": ctx.source.chat_id, "message_id": message_id, "content": content}
         if getattr(st.adapter, "REQUIRES_EDIT_FINALIZE", False):
             kwargs["finalize"] = True
@@ -533,6 +863,7 @@ class TurnRunner:
 
     async def _send_progress_text(self, st, text: str):
         ctx = self._ctx
+        text = _redact_progress_text(text)
         result = await st.adapter.send(
             chat_id=ctx.source.chat_id, content=text, reply_to=ctx._progress_reply_to, metadata=ctx._progress_metadata,
         )
@@ -735,16 +1066,69 @@ class TurnRunner:
         """Queue an ID-correlated native progress start from the agent thread."""
         if not self._native_card_gate():
             return
+        # Apply the same per-tool/category filter as the ordinary progress rail;
+        # hidden starts must be remembered so a later completion cannot resurrect.
+        # Slack native is opt-in and should still show progress when global is off and no filter
+        # explicitly denies the tool (otherwise Slack's always-off default would leave the feature dead).
+        try:
+            _filter = getattr(self._ctx, "tool_progress_filter", None)
+            _eff = _resolve_native_task_card_mode(
+                str(tool_name or ""), self._ctx.progress_mode, _filter,
+                self._ctx._native_slack_task_cards,
+            )
+        except Exception:
+            _eff = self._ctx.progress_mode
+        if _eff in ("off", "log"):
+            cid = str(call_id or "")
+            if cid:
+                self._hidden_native_call_ids.add(cid)
+                # Mirror to context set when available for session/context persistence
+                try:
+                    if hasattr(self._ctx, "_hidden_native_call_ids") and hasattr(self._ctx._hidden_native_call_ids, "add"):
+                        self._ctx._hidden_native_call_ids.add(cid)
+                except Exception:
+                    pass
+            return
         from agent.display import build_tool_preview
-        name = str(tool_name or "tool")
+        name = _redact_progress_text(str(tool_name or "tool"))
+        safe_args = _sanitize_progress_value(args or {})
+        _preview_raw = build_tool_preview(name, safe_args, max_len=64) or ""
+        _preview = _redact_progress_text(_preview_raw)
         self._ctx.progress_queue.put({
             "type": "tool.started", "tool_call_id": str(call_id or ""), "tool_name": name,
-            "preview": build_tool_preview(name, args or {}, max_len=64) or "",
+            "preview": _preview,
         })
 
     def native_tool_complete_callback(self, call_id, tool_name, args, result):
         """Queue the matching native completion using the real tool-call ID."""
         if not self._native_card_gate():
+            return
+        cid = str(call_id or "")
+        # Suppress completion for a call that was hidden at start time
+        if cid and cid in self._hidden_native_call_ids:
+            return
+        try:
+            if hasattr(self._ctx, "_hidden_native_call_ids") and cid and cid in self._ctx._hidden_native_call_ids:
+                return
+        except Exception:
+            pass
+        # Completion-only events (no prior start) must also be gated by effective mode
+        try:
+            _filter = getattr(self._ctx, "tool_progress_filter", None)
+            _eff = _resolve_native_task_card_mode(
+                str(tool_name or ""), self._ctx.progress_mode, _filter,
+                self._ctx._native_slack_task_cards,
+            )
+        except Exception:
+            _eff = self._ctx.progress_mode
+        if _eff in ("off", "log"):
+            if cid:
+                self._hidden_native_call_ids.add(cid)
+                try:
+                    if hasattr(self._ctx, "_hidden_native_call_ids") and hasattr(self._ctx._hidden_native_call_ids, "add"):
+                        self._ctx._hidden_native_call_ids.add(cid)
+                except Exception:
+                    pass
             return
         from agent.display import _detect_tool_failure
         name = str(tool_name or "tool")
@@ -791,6 +1175,7 @@ class TurnRunner:
 
     def _send_status_text(self, text: str, metadata, log_message: str) -> None:
         ctx = self._ctx
+        text = _redact_progress_text(text)
         self._schedule(ctx._status_adapter.send(ctx._status_chat_id, text, metadata=metadata), log_message)
 
     def _attach_session_title_callback(self, agent, ctx) -> None:
@@ -1305,7 +1690,13 @@ class TurnRunner:
     def _approval_notify_sync(self, approval_data: dict) -> None:
         """Send the approval request from the agent thread: the adapter's interactive button
         approvals (``send_exec_approval``) when available, else plain text with ``/approve`` steps."""
-        from gateway.run import _approval_send_outcome, _format_exec_approval_fallback, _interim_metadata, _redact_approval_command
+        from gateway.run import (
+            _approval_send_outcome,
+            _format_exec_approval_fallback,
+            _interim_metadata,
+            _redact_approval_command,
+            _strict_gateway_egress_text,
+        )
         ctx = self._ctx
         adapter = ctx._status_adapter
         # Slack's assistant_threads_setStatus disables the compose box, so the user can't type
@@ -1316,7 +1707,7 @@ class TurnRunner:
         # Redact credentials before display: Tirith's findings are already redacted, but the raw
         # command string still leaks secrets. Both the button and plain-text paths use this value.
         cmd = _redact_approval_command(approval_data.get("command", ""))
-        desc = approval_data.get("description", "dangerous command")
+        desc = _strict_gateway_egress_text(approval_data.get("description", "dangerous command"))
         flags = {k: approval_data.get(k, d) for k, d in (("allow_permanent", True), ("allow_session", True), ("smart_denied", False))}
         # Check the *class*, not the instance — MagicMock auto-creates attributes in tests.
         if _renders_exec_approval_buttons(type(adapter)):
@@ -1714,7 +2105,10 @@ class TurnRunner:
         every rebind. session_key propagates via contextvars (_set_session_env / set_current_session_key)
         — never os.environ["HERMES_SESSION_KEY"], which would misroute approvals across sessions.
         """
-        from gateway.run import _current_max_iterations, _normalize_empty_agent_response, _sanitize_gateway_final_response
+        from gateway.run import (
+            _current_max_iterations, _normalize_empty_agent_response,
+            _sanitize_gateway_final_response, _strict_gateway_egress_text,
+        )
         ctx = self._ctx
         runner = self._runner
         # Platform.LOCAL ("local") maps to the "cli" hint key the agent understands.
@@ -1791,7 +2185,7 @@ class TurnRunner:
             final_response = _normalize_empty_agent_response(result, final_response or "", history_len=len(agent_history))
             final_response = _sanitize_gateway_final_response(ctx.source.platform, final_response)
             if not final_response:
-                final_response = f"⚠️ {result['error']}" if result.get("error") else ""
+                final_response = _strict_gateway_egress_text(f"⚠️ {result['error']}") if result.get("error") else ""
             # NOTE: deliberately omits agent_persisted/last_reasoning/response_* — the caller
             # defaults agent_persisted differently when the key is absent.
             return {"final_response": final_response, **common}
