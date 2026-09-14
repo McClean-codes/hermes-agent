@@ -46,6 +46,41 @@ _SECRET_VALUE_SUFFIXES = (
 )
 
 _CAMEL_CASE_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+_REDACTED_ERROR_METADATA = "[REDACTED]"
+
+# ``last_error_reason`` is provider-controlled text. Keep only the small set of
+# machine-readable values used by the pool's classifiers; arbitrary provider
+# codes can contain URLs, bearer values, or opaque credentials. Messages are
+# never durable because they are diagnostic prose and routinely echo requests.
+_SAFE_ERROR_REASONS = frozenset({
+    "auth", "auth_permanent", "billing", "rate_limit", "upstream_rate_limit",
+    "overloaded", "server_error", "timeout", "ssl_cert_verification",
+    "context_overflow", "payload_too_large", "image_too_large", "image_corrupt",
+    "model_not_found", "provider_policy_blocked", "content_policy_blocked",
+    "format_error", "invalid_encrypted_content", "thinking_signature",
+    "long_context_tier", "oauth_long_context_beta_forbidden",
+    "llama_cpp_grammar_pattern", "reasoning_mandatory", "unknown",
+    "rate_limit_exceeded", "usage_limit", "usage_limit_reached", "quota_exhausted",
+    "device_code_exhausted", "invalid_request_error", "token_expired",
+    "token_invalidated", "token_revoked", "invalid_token", "invalid_grant",
+    "unauthorized_client", "refresh_token_reused", "credential_persist_failed",
+    "credential_pool_refresh_failure",
+})
+
+
+def _sanitize_error_metadata(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Replace untrusted persisted error text with bounded safe metadata."""
+    result = dict(payload)
+    message = result.get("last_error_message")
+    if message not in (None, ""):
+        result["last_error_message"] = _REDACTED_ERROR_METADATA
+
+    reason = result.get("last_error_reason")
+    if reason in (None, ""):
+        return result
+    if not isinstance(reason, str) or reason not in _SAFE_ERROR_REASONS:
+        result["last_error_reason"] = _REDACTED_ERROR_METADATA
+    return result
 
 
 def _normalize_key(key: Any) -> str:
@@ -102,11 +137,11 @@ def sanitize_borrowed_credential_payload(
 ) -> Dict[str, Any]:
     """Return a disk-safe credential-pool payload.
 
-    Owned sources pass through unchanged.  Borrowed sources keep labels,
-    source refs, status/cooldown metadata, counters and a fingerprint, but
-    every raw secret value field is removed.
+    Error metadata is classification-safe for every source. Owned sources keep
+    their supported credential fields; borrowed sources additionally keep only
+    metadata, source refs, status/cooldown data, counters and a fingerprint.
     """
-    result = dict(payload)
+    result = _sanitize_error_metadata(dict(payload))
     if not is_borrowed_credential_source(result.get("source"), provider_id):
         return result
     fingerprint = _credential_secret_fingerprint(result)

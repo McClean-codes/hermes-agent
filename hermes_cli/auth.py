@@ -917,7 +917,9 @@ def _merge_disk_cooldown_state(
             until = _exhausted_until(PooledCredential.from_dict(provider_id, disk_entry))
             if until is None or until <= time.time():
                 return entry
-        return {**entry, **{f: disk_entry.get(f) for f in _POOL_STATUS_FIELDS}}
+        return sanitize_borrowed_credential_payload(
+            {**entry, **{f: disk_entry.get(f) for f in _POOL_STATUS_FIELDS}}, provider_id,
+        )
     except Exception:  # pragma: no cover - best-effort merge
         return entry
 
@@ -1547,7 +1549,7 @@ def _last_auth_error_marker(
 ) -> Dict[str, Any]:
     """The ``last_auth_error`` record persisted when dead OAuth material is quarantined."""
     return {
-        "provider": provider, "message": str(error), "reason": reason, "relogin_required": True,
+        "provider": provider, "message": "[REDACTED]", "reason": reason, "relogin_required": True,
         "code": error.code if default_code is None else (error.code or default_code),
         "at": datetime.now(timezone.utc).isoformat()}
 

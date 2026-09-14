@@ -726,8 +726,8 @@ def _write_through_provider_state_to_global_root(
         return
     try:
         auth_mod._persist_provider_state_to_store(provider_id, state, global_path, set_active=False)
-    except Exception as exc:  # pragma: no cover - best effort
-        logger.debug("%s pool refresh: write-through to global root failed: %s", provider_id, exc)
+    except Exception:  # pragma: no cover - best effort
+        logger.debug("%s pool refresh: write-through to global root failed", provider_id)
 
 
 def _singleton_target_for_entry(pool: "CredentialPool", entry: "PooledCredential") -> Optional[Path]:
@@ -786,20 +786,34 @@ def _update_root_pool_rows(
             store["credential_pool"] = pool
         existing = pool.get(provider)
         existing_list = existing if isinstance(existing, list) else []
-        incoming_by_id = {p.get("id"): p for p in payloads if isinstance(p, dict) and p.get("id")}
+        sanitized_payloads = [
+            sanitize_borrowed_credential_payload(payload, provider)
+            if isinstance(payload, dict) else payload
+            for payload in payloads
+        ]
+        incoming_by_id = {
+            p.get("id"): p for p in sanitized_payloads
+            if isinstance(p, dict) and p.get("id")
+        }
         cleared = {cid for cid in (status_cleared_ids or ()) if cid}
         merged: List[Dict[str, Any]] = []
         changed = False
         for disk_entry in existing_list:
-            did = disk_entry.get("id") if isinstance(disk_entry, dict) else None
+            safe_disk_entry = (
+                sanitize_borrowed_credential_payload(disk_entry, provider)
+                if isinstance(disk_entry, dict) else disk_entry
+            )
+            did = safe_disk_entry.get("id") if isinstance(safe_disk_entry, dict) else None
             incoming = incoming_by_id.get(did) if did else None
             if incoming is None:
-                merged.append(disk_entry)
+                merged.append(safe_disk_entry)
+                changed |= safe_disk_entry != disk_entry
                 continue
             # A deliberately cleared entry has no disk cooldown worth keeping.
             updated = auth_mod._merge_disk_cooldown_state(
-                incoming, None if did in cleared else disk_entry, provider,
+                incoming, None if did in cleared else safe_disk_entry, provider,
             )
+            updated = sanitize_borrowed_credential_payload(updated, provider)
             if updated != disk_entry:
                 changed = True
             merged.append(updated)
@@ -833,14 +847,14 @@ def persist_pool_entries(
                     provider, payloads, global_path,
                     status_cleared_ids=status_cleared_ids,
                 )
-            except Exception as exc:
+            except Exception:
                 # Fail closed on the FORK, not on the save: never fall back to
                 # writing a local copy (that IS the bug). The in-memory pool
                 # still holds the rotated pair for this process.
                 logger.warning(
-                    "%s pool: write-through of borrowed root grant failed (%s); "
+                    "%s pool: write-through of borrowed root grant failed; "
                     "not materializing a profile-local copy",
-                    provider, exc,
+                    provider,
                 )
             return
     write_credential_pool(
@@ -1137,8 +1151,8 @@ class CredentialPool(CredentialPoolAdminMixin):
                     expires_at_ms=creds.get("expiresAt", 0) or entry.expires_at_ms,
                     **_CLEAR_STATUS,
                 )
-        except Exception as exc:
-            logger.debug("Failed to sync from credentials file: %s", exc)
+        except Exception:
+            logger.debug("Failed to sync from credentials file")
         return entry
 
     def _sync_entry_from_pool_store(self, entry: PooledCredential) -> PooledCredential:
@@ -1178,10 +1192,10 @@ class CredentialPool(CredentialPoolAdminMixin):
                 )
                 self._replace_entry(entry, stored)
                 return stored
-        except Exception as exc:
+        except Exception:
             logger.debug(
-                "Failed to sync %s OAuth entry from credential pool: %s",
-                "Anthropic" if is_anthropic else "xAI", exc,
+                "Failed to sync %s OAuth entry from credential pool",
+                "Anthropic" if is_anthropic else "xAI",
             )
         return entry
 
@@ -1244,8 +1258,8 @@ class CredentialPool(CredentialPoolAdminMixin):
                 if state.get("last_refresh"):
                     field_updates["last_refresh"] = state["last_refresh"]
                 return self._adopt(entry, **field_updates)
-        except Exception as exc:
-            logger.debug("Failed to sync %s entry from auth.json: %s", display, exc)
+        except Exception:
+            logger.debug("Failed to sync %s entry from auth.json", display)
         return entry
 
     def _sync_nous_entry_from_auth_store(self, entry: PooledCredential) -> PooledCredential:
@@ -1279,8 +1293,8 @@ class CredentialPool(CredentialPoolAdminMixin):
                 {k: state[k] for k in _NOUS_EXTRA_STATE_KEYS if state.get(k) is not None}
             )
             return self._adopt(entry, extra=extra_updates, **field_updates)
-        except Exception as exc:
-            logger.debug("Failed to sync Nous entry from auth.json: %s", exc)
+        except Exception:
+            logger.debug("Failed to sync Nous entry from auth.json")
         return entry
 
     def _sync_device_code_entry_to_auth_store(self, entry: PooledCredential) -> None:
@@ -1323,8 +1337,8 @@ class CredentialPool(CredentialPoolAdminMixin):
                 else:
                     _store_provider_state(auth_store, self.provider, state, set_active=False)
                     _save_auth_store(auth_store)
-        except Exception as exc:
-            logger.debug("Failed to sync %s pool entry back to auth store: %s", self.provider, exc)
+        except Exception:
+            logger.debug("Failed to sync %s pool entry back to auth store", self.provider)
 
     def _apply_entry_to_singleton_state(self, entry: PooledCredential, state: Dict[str, Any]) -> bool:
         """Copy *entry*'s tokens into the provider's auth.json ``state`` in place."""
@@ -1425,10 +1439,10 @@ class CredentialPool(CredentialPoolAdminMixin):
         so it surfaces as an explicit re-auth requirement.
         """
         logger.error(
-            "Anthropic %s refresh rotated the single-use token but could not commit it "
-            "to %s (%s) — failing closed and quarantining the credential; "
+            "Credential refresh rotated the single-use token but could not commit it "
+            "to %s — failing closed and quarantining credential %s; "
             "re-authenticate to recover",
-            entry.source, store, exc,
+            store, entry.id[:8],
         )
         try:
             from agent.anthropic_credentials import (
@@ -1447,13 +1461,13 @@ class CredentialPool(CredentialPoolAdminMixin):
                 source_path=spent_rotation_source_path(entry.source),
             )
         except Exception:  # pragma: no cover - never block the quarantine
-            logger.debug("Failed to record consumed rotation fingerprints", exc_info=True)
+            logger.debug("Failed to record consumed rotation fingerprints")
         self._mark_exhausted(
             entry,
             None,
             {
                 "reason": CREDENTIAL_PERSIST_FAILED_REASON,
-                "message": f"rotated credential was not durably written to {store}: {exc}",
+                "message": "rotated credential was not durably written",
             },
         )
         return None
@@ -1565,7 +1579,7 @@ class CredentialPool(CredentialPoolAdminMixin):
         except _RefreshDone as done:
             return done.result
         except Exception as exc:
-            logger.debug("Credential refresh failed for %s/%s: %s", self.provider, entry.id, exc)
+            logger.debug("Credential refresh failed for %s/%s", self.provider, entry.id)
             return self._recover_failed_refresh(entry, exc)
 
         updated = replace(updated, **_MARK_OK)
@@ -1611,8 +1625,8 @@ class CredentialPool(CredentialPoolAdminMixin):
                         )
                     except _RefreshDone as done:
                         return done.result
-                    except Exception as retry_exc:
-                        logger.debug("Retry refresh also failed: %s", retry_exc)
+                    except Exception:
+                        logger.debug("Retry refresh also failed")
                 elif not self._entry_needs_refresh(synced):
                     logger.debug("Credentials file has valid token, using without refresh")
                     return synced
@@ -1680,15 +1694,15 @@ class CredentialPool(CredentialPoolAdminMixin):
                         state["last_auth_error"] = {
                             "provider": self.provider,
                             "code": getattr(exc, "code", "unknown"),
-                            "message": str(exc),
+                            "message": "[REDACTED]",
                             "reason": "credential_pool_refresh_failure",
                             "relogin_required": True,
                             "at": datetime.now(timezone.utc).isoformat(),
                         }
                         _save_provider_state(auth_store, self.provider, state)
                         _save_auth_store(auth_store)
-        except Exception as clear_exc:
-            logger.debug("Failed to clear terminal %s OAuth state: %s", display, clear_exc)
+        except Exception:
+            logger.debug("Failed to clear terminal %s OAuth state", display)
 
     def _clear_terminal_nous_state(self, entry: PooledCredential, exc: Exception) -> None:
         try:
@@ -1708,8 +1722,8 @@ class CredentialPool(CredentialPoolAdminMixin):
                     auth_mod._quarantine_nous_pool_entries(auth_store, exc, reason="credential_pool_refresh_failure")
                     _save_provider_state(auth_store, "nous", state)
                     _save_auth_store(auth_store)
-        except Exception as clear_exc:
-            logger.debug("Failed to clear terminal Nous OAuth state: %s", clear_exc)
+        except Exception:
+            logger.debug("Failed to clear terminal Nous OAuth state")
 
     def _codex_quota_restored_upstream(self, entry: PooledCredential) -> bool:
         """Live-check whether an exhausted Codex entry's quota reset early.
@@ -1732,7 +1746,7 @@ class CredentialPool(CredentialPoolAdminMixin):
         try:
             return bool(auth_mod._probe_codex_quota_restored(token, base_url=entry.base_url))
         except Exception:
-            logger.debug("Codex quota-restored probe failed", exc_info=True)
+            logger.debug("Codex quota-restored probe failed")
             return False
 
     def _entry_needs_refresh(self, entry: PooledCredential) -> bool:
@@ -1851,9 +1865,8 @@ class CredentialPool(CredentialPoolAdminMixin):
                     if dead_at and now - dead_at > DEAD_MANUAL_PRUNE_TTL_SECONDS:
                         logger.warning(
                             "credential pool: pruning DEAD manual entry %s "
-                            "(reason=%s, age=%.1fh) — re-add via `hermes auth add %s`",
-                            entry.label or entry.id[:8],
-                            entry.last_error_reason or "unknown",
+                            "(age=%.1fh) — re-add via `hermes auth add %s`",
+                            entry.id[:8],
                             (now - dead_at) / 3600.0,
                             self.provider,
                         )
@@ -1969,8 +1982,8 @@ class CredentialPool(CredentialPoolAdminMixin):
                         "credential pool: credential_id %s runtime key "
                         "does not match api_key_hint; attributing failure "
                         "to key-matched entry %s instead (#79156)",
-                        (entry.label or entry.id[:8]),
-                        (hint_entry.label or hint_entry.id[:8]),
+                        entry.id[:8],
+                        hint_entry.id[:8],
                     )
                 # Otherwise the id is stale and the request key is not in the
                 # pool — drop the id so we do not mark the wrong entry.
@@ -2041,7 +2054,7 @@ class CredentialPool(CredentialPoolAdminMixin):
                 entry = self._current_unlocked() or self._select_unlocked(refresh=False)[0]
             if entry is None:
                 return None
-            _label = entry.label or entry.id[:8]
+            _label = entry.id[:8]
             self._mark_exhausted(entry, status_code, error_context, failure_reason=failure_reason)
             # A 402/429/401 is a key-level failure, and the same key can back
             # several entries (an explicit entry plus a ``model_config`` row
@@ -2064,16 +2077,16 @@ class CredentialPool(CredentialPoolAdminMixin):
             updated_entry = self._find(lambda e: e.id == entry.id) or entry
             if updated_entry.last_status == STATUS_DEAD:
                 logger.warning(
-                    "credential pool: marking %s DEAD (status=%s, reason=%s) — "
+                    "credential pool: marking %s DEAD (status=%s) — "
                     "permanently failed, will NOT re-enter rotation until re-auth",
-                    _label, status_code, updated_entry.last_error_reason or "unknown",
+                    _label, status_code,
                 )
             else:
                 logger.info("credential pool: marking %s exhausted (status=%s), rotating", _label, status_code)
             self._current_id = None
             next_entry, _pending = self._select_unlocked(refresh=False)
             if next_entry:
-                logger.info("credential pool: rotated to %s", next_entry.label or next_entry.id[:8])
+                logger.info("credential pool: rotated to %s", next_entry.id[:8])
             return next_entry
 
     # ---- leases ------------------------------------------------------------
@@ -2445,8 +2458,8 @@ def _seed_copilot_singleton(seed: _Seeder) -> None:
             "base_url": enterprise_base_url or (pconfig.inference_base_url if pconfig else ""),
             "label": source,
         })
-    except Exception as exc:
-        logger.debug("Copilot token seed failed: %s", exc)
+    except Exception:
+        logger.debug("Copilot token seed failed")
 
 
 def _seed_qwen_singleton(seed: _Seeder) -> None:
@@ -2465,8 +2478,8 @@ def _seed_qwen_singleton(seed: _Seeder) -> None:
                 "base_url": creds.get("base_url", ""),
                 "label": creds.get("auth_file", source_name),
             })
-    except Exception as exc:
-        logger.debug("Qwen OAuth token seed failed: %s", exc)
+    except Exception:
+        logger.debug("Qwen OAuth token seed failed")
 
 
 def _seed_minimax_singleton(seed: _Seeder) -> None:
@@ -2492,8 +2505,8 @@ def _seed_minimax_singleton(seed: _Seeder) -> None:
             "base_url": str(state.get("inference_base_url", "") or "").rstrip("/"),
             "label": state.get("label", "") or label_from_token(state.get("access_token", ""), "oauth"),
         })
-    except Exception as exc:
-        logger.debug("MiniMax OAuth token seed failed: %s", exc)
+    except Exception:
+        logger.debug("MiniMax OAuth token seed failed")
 
 
 def _seed_tokens_singleton(seed: _Seeder, auth_store: Dict[str, Any]) -> None:

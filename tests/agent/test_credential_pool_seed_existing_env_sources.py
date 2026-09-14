@@ -12,7 +12,9 @@ ba71e00db07c6263ee8d44b27dfbce2a92e6b39c (source d83e6fe3e4).
 
 from __future__ import annotations
 
+import io
 import json
+import logging
 import os
 from pathlib import Path
 from unittest.mock import patch
@@ -786,3 +788,95 @@ class TestSeedFromEnvRespectsExistingPoolEntries:
 
         assert _SECRET_SCOPE.get() is None
         assert not is_multiplex_active()
+
+    def test_mark_exhausted_redacts_error_metadata_and_pool_logs(self, tmp_path, monkeypatch):
+        """Provider error text never crosses the pool disk or logging boundary."""
+        home = tmp_path / "hermes"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("PROVIDER_API_KEY", SYN_PRIMARY)
+        from hermes_cli.config import invalidate_env_cache
+        invalidate_env_cache()
+
+        marker = "syn-sec001-" + "f" * 24
+        encoded_marker = marker.replace("-", "%2D")
+        split_marker = marker[:7] + "\u200b" + marker[7:]
+        hostile_errors = (
+            f"https://user:{marker}@example.test/path?access_token={marker}",
+            f"https://example.test/path?access_token={encoded_marker}",
+            f"https://example.test/path?access_token={encoded_marker.replace('%', '%25')}",
+            f"Bearer {split_marker}",
+        )
+
+        from agent.credential_pool import CredentialPool, PooledCredential
+        from agent.redact import RedactingFormatter
+
+        pool_logger = logging.getLogger("agent.credential_pool")
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        handler.setFormatter(RedactingFormatter("%(message)s"))
+        previous_level = pool_logger.level
+        previous_propagate = pool_logger.propagate
+        pool_logger.setLevel(logging.DEBUG)
+        pool_logger.propagate = False
+        pool_logger.addHandler(handler)
+        try:
+            for index, hostile_error in enumerate(hostile_errors):
+                entry = PooledCredential(
+                    provider="opencode-go",
+                    id=f"probe{index}",
+                    label="probe",
+                    auth_type="api_key",
+                    priority=index,
+                    source="env:PROVIDER_API_KEY",
+                    access_token=SYN_PRIMARY,
+                )
+                pool = CredentialPool(provider="opencode-go", entries=[entry])
+                pool._mark_exhausted(
+                    entry,
+                    401,
+                    {"reason": hostile_error, "message": hostile_error},
+                )
+
+            # Exercise the public rotation path as well; its normal pool log
+            # handler must not depend on URL-aware formatter options.
+            entry = PooledCredential(
+                provider="opencode-go",
+                id="rotate1",
+                label="probe",
+                auth_type="api_key",
+                priority=0,
+                source="env:PROVIDER_API_KEY",
+                access_token=SYN_PRIMARY,
+            )
+            pool = CredentialPool(provider="opencode-go", entries=[entry])
+            pool.select()
+            pool.mark_exhausted_and_rotate(
+                status_code=401,
+                error_context={"reason": hostile_errors[0], "message": hostile_errors[0]},
+            )
+        finally:
+            pool_logger.removeHandler(handler)
+            handler.close()
+            pool_logger.setLevel(previous_level)
+            pool_logger.propagate = previous_propagate
+
+        raw_auth = (home / "auth.json").read_text(encoding="utf-8")
+        formatted_logs = stream.getvalue()
+        assert marker not in raw_auth
+        assert encoded_marker not in raw_auth
+        assert encoded_marker.replace("%", "%25") not in raw_auth
+        assert marker not in formatted_logs
+        assert encoded_marker not in formatted_logs
+        assert encoded_marker.replace("%", "%25") not in formatted_logs
+        assert split_marker not in raw_auth
+        assert split_marker not in formatted_logs
+        assert "[REDACTED]" in raw_auth or "[REDACTED]" in formatted_logs
+
+        data = _read_auth(home)
+        disk_entries = data["credential_pool"]["opencode-go"]
+        assert disk_entries
+        for disk_entry in disk_entries:
+            assert "access_token" not in disk_entry or not disk_entry["access_token"]
+            assert disk_entry["last_error_message"] == "[REDACTED]"
+            assert disk_entry["last_error_reason"] == "[REDACTED]"
