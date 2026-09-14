@@ -1818,10 +1818,29 @@ class CredentialPool(CredentialPoolAdminMixin):
             # unhydrated duplicate as an empty key.
             if entry.auth_type == AUTH_TYPE_API_KEY and not entry.runtime_api_key:
                 continue
+            # Re-read exhausted/DEAD singleton rows from their token authority
+            # before availability checks. This preserves current-main recovery
+            # behavior without allowing an env-backed row to retain a legacy
+            # runtime secret after its source disappears.
             synced = self._resync_stale_entry(entry)
             if synced is not entry:
                 entry = synced
                 cleared_any = True
+            if entry.source.startswith("env:"):
+                _env_name = entry.source.split(":", 1)[1].strip()
+                if not _env_name or not get_env_prefer_dotenv(_env_name):
+                    if entry.access_token:
+                        try:
+                            _fp = fingerprint_secret_value(entry.access_token)
+                        except Exception:
+                            _fp = None
+                        _new_extra = dict(entry.extra) if entry.extra else {}
+                        if _fp:
+                            _new_extra["secret_fingerprint"] = _fp
+                        _cleared = replace(entry, access_token="", extra=_new_extra)
+                        self._replace_entry(entry, _cleared)
+                        cleared_any = True
+                    continue
             if entry.last_status == STATUS_DEAD:
                 # Manual DEAD credentials are pruned after a 24h quiet window;
                 # singleton-seeded ones stay (audit trail, and the seeder would
@@ -2082,9 +2101,14 @@ class CredentialPool(CredentialPoolAdminMixin):
     ) -> Tuple[Optional[str], List[PooledCredential]]:
         with self._lock:
             if credential_id:
+                available, pending_refresh = self._available_entries(clear_expired=True, refresh=True)
+                if not any(entry.id == credential_id for entry in available):
+                    if self._current_id == credential_id:
+                        self._current_id = None
+                    return None, pending_refresh
                 self._active_leases[credential_id] = self._active_leases.get(credential_id, 0) + 1
                 self._current_id = credential_id
-                return credential_id, []
+                return credential_id, pending_refresh
 
             available, pending_refresh = self._available_entries(clear_expired=True, refresh=True)
             if not available:
@@ -2267,6 +2291,32 @@ class _Seeder:
     @property
     def result(self) -> Tuple[bool, Set[str]]:
         return self.changed, self.active_sources
+
+
+def _clear_inactive_env_entries(
+    entries: List[PooledCredential], active_sources: Set[str],
+) -> bool:
+    """Clear runtime tokens for env rows whose source is not active."""
+    changed = False
+    for entry in list(entries):
+        if not entry.source.startswith("env:") or entry.source in active_sources:
+            continue
+        if not entry.access_token:
+            continue
+        try:
+            fingerprint = fingerprint_secret_value(entry.access_token)
+        except Exception:
+            fingerprint = None
+        extra = dict(entry.extra) if entry.extra else {}
+        if fingerprint:
+            extra["secret_fingerprint"] = fingerprint
+        cleared = replace(entry, access_token="", extra=extra)
+        for index, current in enumerate(entries):
+            if current.id == entry.id:
+                entries[index] = cleared
+                break
+        changed = True
+    return changed
 
 
 def _seed_anthropic_singletons(seed: _Seeder) -> None:
@@ -2582,6 +2632,7 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
             _env_payload(env_var="OPENROUTER_API_KEY", token=token, base_url=OPENROUTER_BASE_URL),
         ):
             _warn_env_ingestion_once(provider, "OPENROUTER_API_KEY")
+        seed.changed |= _clear_inactive_env_entries(seed.entries, seed.active_sources)
         return seed.result
 
     pconfig = PROVIDER_REGISTRY.get(provider)
@@ -2596,6 +2647,15 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
     if provider == "anthropic":
         env_vars = ["ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"]
 
+    # Rehydrate additional env-source rows already persisted in the pool.
+    # Provider registries declare only their primary variable, but users may
+    # configure multiple env-backed keys for round-robin rotation.
+    for entry in tuple(entries):
+        if entry.source.startswith("env:"):
+            env_name = entry.source.split(":", 1)[1].strip()
+            if env_name and env_name not in env_vars:
+                env_vars.append(env_name)
+
     resolve_base_url = _ENV_BASE_URL_RESOLVERS.get(provider)
     for env_var in env_vars:
         token = get_env_prefer_dotenv(env_var)
@@ -2605,6 +2665,7 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
         if resolve_base_url is not None:
             base_url = resolve_base_url(token, pconfig.inference_base_url, env_url)
         seed.upsert(f"env:{env_var}", _env_payload(env_var=env_var, token=token, base_url=base_url))
+    seed.changed |= _clear_inactive_env_entries(seed.entries, seed.active_sources)
     return seed.result
 
 
