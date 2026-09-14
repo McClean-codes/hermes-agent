@@ -103,6 +103,87 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
 
     _MAX_FLOOD_STRIKES = 3  # consecutive flood failures before edits are disabled
 
+    @staticmethod
+    def _strict_egress_text(text: Any) -> str:
+        """Sanitize every stream payload at the transport effect boundary."""
+        from gateway.run import _strict_gateway_egress_text
+
+        try:
+            return _strict_gateway_egress_text(text)
+        except Exception:
+            logger.debug("stream egress redaction unavailable", exc_info=True)
+            return "[REDACTED]"
+
+    async def _send_frame(self, text: str, *, finalize: bool):
+        """Send a native frame only after strict egress sanitization."""
+        return await super()._send_frame(self._strict_egress_text(text), finalize=finalize)
+
+    async def _send_draft_frame(self, text: str) -> bool:
+        """Send a draft frame only after strict egress sanitization."""
+        return await super()._send_draft_frame(self._strict_egress_text(text))
+
+    async def _edit_message(self, *, message_id: str, content: str, finalize: bool = False):
+        """Edit a stream preview only after strict egress sanitization."""
+        return await super()._edit_message(
+            message_id=message_id,
+            content=self._strict_egress_text(content),
+            finalize=finalize,
+        )
+
+    async def _try_fresh_final(self, text: str, *, is_turn_final: bool = True) -> bool:
+        """Send a fresh final only after strict egress sanitization."""
+        return await super()._try_fresh_final(
+            self._strict_egress_text(text), is_turn_final=is_turn_final,
+        )
+
+    async def _first_send(self, text: str, *, finalize: bool) -> bool:
+        """Send the first stream message only after strict egress sanitization."""
+        return await super()._first_send(self._strict_egress_text(text), finalize=finalize)
+
+    async def _send_new_chunk(
+        self, text: str, reply_to_id: Optional[str], *, final: bool = False,
+    ) -> Optional[str]:
+        """Send an overflow chunk only after strict egress sanitization."""
+        return await super()._send_new_chunk(
+            self._strict_egress_text(text), reply_to_id, final=final,
+        )
+
+    async def _send_with_flood_retry(self, *, content: str, retry_log: str, reply_to=None):
+        """Send a fallback chunk only after strict egress sanitization."""
+        return await super()._send_with_flood_retry(
+            content=self._strict_egress_text(content),
+            retry_log=retry_log,
+            reply_to=reply_to,
+        )
+
+    async def _send_fallback_final(self, text: str) -> None:
+        """Send a fallback final only after strict egress sanitization."""
+        await super()._send_fallback_final(self._strict_egress_text(text))
+
+    async def _send_commentary(self, text: str) -> bool:
+        """Send interim commentary only after strict egress sanitization."""
+        return await super()._send_commentary(self._strict_egress_text(text))
+
+    async def _flush_segment_tail_on_edit_failure(self) -> None:
+        """Flush an edit-failure tail through the strict egress boundary."""
+        if not self._fallback_final_send:
+            await self._try_strip_cursor()
+        visible = self._fallback_prefix or self._visible_prefix()
+        tail = self._accumulated
+        if visible and tail.startswith(visible):
+            tail = tail[len(visible):].lstrip()
+        tail = self._strict_egress_text(self._clean_for_display(tail))
+        if not tail.strip():
+            return
+        try:
+            _md = dict(self.metadata) if self.metadata else {}
+            _md["_interim_send"] = True
+            result = await self.adapter.send(chat_id=self.chat_id, content=tail, metadata=_md)
+            if result.success:
+                self._already_sent = True
+        except Exception as e:
+            logger.error("Segment-break tail flush error: %s", e)
+
     # Class-wide monotonic draft-id counter (Telegram animates a draft only when the
     # same non-zero draft_id is reused).  RANDOM seed: draft_id keys the relay
     # connector's sealed-stream tombstones, which outlive this process — a replayed id
@@ -497,8 +578,9 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         logger.warning("%s boundary: finalize not confirmed, "
                        "falling back to send() for pre-prompt text (chat=%s)",
                        _reason, self.chat_id)
+        fallback_text = self._strict_egress_text(finalize_text)
         try:
-            if getattr(await self.adapter.send(self.chat_id, finalize_text), "success", False):
+            if getattr(await self.adapter.send(self.chat_id, fallback_text), "success", False):
                 return True
         except Exception as send_err:
             logger.warning("%s boundary: fallback send also failed: %s", _reason, send_err)
