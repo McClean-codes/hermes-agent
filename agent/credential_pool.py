@@ -1818,10 +1818,75 @@ class CredentialPool(CredentialPoolAdminMixin):
             # unhydrated duplicate as an empty key.
             if entry.auth_type == AUTH_TYPE_API_KEY and not entry.runtime_api_key:
                 continue
+            # Fail-closed for env-backed rows: an env:VAR entry whose VAR is
+            # currently unset/empty must never be selected, even if a stale
+            # in-memory token remains from a legacy persisted raw value that
+            # was sanitized on disk. The disk row is retained
+            # (prune_env_sources=False) for cross-process safety, but this
+            # process must treat it as unavailable until the env source is
+            # active again.
+            if entry.source.startswith("env:"):
+                _env_name = entry.source.split(":", 1)[1].strip()
+                if not _env_name or not get_env_prefer_dotenv(_env_name):
+                    if entry.access_token:
+                        try:
+                            _fp = fingerprint_secret_value(entry.access_token)
+                        except Exception:
+                            _fp = None
+                        _new_extra = dict(entry.extra) if entry.extra else {}
+                        if _fp:
+                            _new_extra["secret_fingerprint"] = _fp
+                        _cleared = replace(entry, access_token="", extra=_new_extra)
+                        self._replace_entry(entry, _cleared)
+                        cleared_any = True
+                    continue
             synced = self._resync_stale_entry(entry)
             if synced is not entry:
                 entry = synced
                 cleared_any = True
+            # For anthropic claude_code entries, sync from the credentials file
+            # before any status/refresh checks. This picks up tokens refreshed
+            # by other processes (Claude Code CLI, other Hermes profiles).
+            if (self.provider == "anthropic" and entry.source == "claude_code"
+                    and entry.last_status in {STATUS_EXHAUSTED, STATUS_DEAD}):
+                synced = self._sync_anthropic_entry_from_credentials_file(entry)
+                if synced is not entry:
+                    entry = synced
+                    cleared_any = True
+            # For nous entries, sync from auth.json before status checks.
+            # Another process may have successfully refreshed via
+            # resolve_nous_runtime_credentials(), making this entry's
+            # exhausted status stale.
+            if (self.provider == "nous"
+                    and entry.source == "device_code"
+                    and entry.last_status in {STATUS_EXHAUSTED, STATUS_DEAD}):
+                synced = self._sync_nous_entry_from_auth_store(entry)
+                if synced is not entry:
+                    entry = synced
+                    cleared_any = True
+            # For openai-codex entries, same pattern: the user may have
+            # re-authed via `hermes model` / `hermes auth` after a 429/401,
+            # leaving fresh tokens on disk while the pool entry is still
+            # frozen behind last_error_reset_at (can be hours in the
+            # future for ChatGPT weekly windows).
+            if (self.provider == "openai-codex"
+                    and entry.source == "device_code"
+                    and entry.last_status in {STATUS_EXHAUSTED, STATUS_DEAD}):
+                synced = self._sync_codex_entry_from_auth_store(entry)
+                if synced is not entry:
+                    entry = synced
+                    cleared_any = True
+            # For xai-oauth singleton-seeded entries, identical pattern:
+            # an entry frozen as exhausted may simply be holding stale
+            # tokens that another process (or a fresh `hermes model` ->
+            # xAI Grok OAuth login) has since rotated in auth.json.
+            if (self.provider == "xai-oauth"
+                    and entry.source == "device_code"
+                    and entry.last_status in {STATUS_EXHAUSTED, STATUS_DEAD}):
+                synced = self._sync_xai_oauth_entry_from_auth_store(entry)
+                if synced is not entry:
+                    entry = synced
+                    cleared_any = True
             if entry.last_status == STATUS_DEAD:
                 # Manual DEAD credentials are pruned after a 24h quiet window;
                 # singleton-seeded ones stay (audit trail, and the seeder would
@@ -2082,9 +2147,14 @@ class CredentialPool(CredentialPoolAdminMixin):
     ) -> Tuple[Optional[str], List[PooledCredential]]:
         with self._lock:
             if credential_id:
+                available, pending_refresh = self._available_entries(clear_expired=True, refresh=True)
+                if not any(entry.id == credential_id for entry in available):
+                    if self._current_id == credential_id:
+                        self._current_id = None
+                    return None, pending_refresh
                 self._active_leases[credential_id] = self._active_leases.get(credential_id, 0) + 1
                 self._current_id = credential_id
-                return credential_id, []
+                return credential_id, pending_refresh
 
             available, pending_refresh = self._available_entries(clear_expired=True, refresh=True)
             if not available:
@@ -2582,6 +2652,30 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
             _env_payload(env_var="OPENROUTER_API_KEY", token=token, base_url=OPENROUTER_BASE_URL),
         ):
             _warn_env_ingestion_once(provider, "OPENROUTER_API_KEY")
+        # Fail-closed: clear stale in-memory token for env sources that are not
+        # active (including malformed env:). Mirrors generic provider path so the
+        # provider-specific early return does not leave a sanitized-on-disk legacy
+        # token live in memory.
+        for _stale in list(entries):
+            if not _stale.source.startswith("env:"):
+                continue
+            _stale_env = _stale.source.split(":", 1)[1].strip()
+            if _stale.source in seed.active_sources:
+                continue
+            if _stale.access_token:
+                try:
+                    _fp = fingerprint_secret_value(_stale.access_token)
+                except Exception:
+                    _fp = None
+                _new_extra = dict(_stale.extra) if _stale.extra else {}
+                if _fp:
+                    _new_extra["secret_fingerprint"] = _fp
+                _cleared = replace(_stale, access_token="", extra=_new_extra)
+                for _idx, _ent in enumerate(entries):
+                    if _ent.id == _stale.id:
+                        entries[_idx] = _cleared
+                        break
+                seed.changed = True
         return seed.result
 
     pconfig = PROVIDER_REGISTRY.get(provider)
@@ -2596,6 +2690,17 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
     if provider == "anthropic":
         env_vars = ["ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"]
 
+    # Also seed any env-source pool entries already on disk that aren't in
+    # the registry's tuple. A user can put `source: env:PROVIDER_API_KEY_2`
+    # in auth.json expecting it to be picked up from the environment; the
+    # registry only declares the primary env var, so this loop fills the
+    # gap and keeps multi-key rotation working without per-provider code.
+    for entry in entries:
+        if entry.source.startswith("env:"):
+            env_name = entry.source.split(":", 1)[1].strip()
+            if env_name and env_name not in env_vars:
+                env_vars.append(env_name)
+
     resolve_base_url = _ENV_BASE_URL_RESOLVERS.get(provider)
     for env_var in env_vars:
         token = get_env_prefer_dotenv(env_var)
@@ -2605,6 +2710,33 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
         if resolve_base_url is not None:
             base_url = resolve_base_url(token, pconfig.inference_base_url, env_url)
         seed.upsert(f"env:{env_var}", _env_payload(env_var=env_var, token=token, base_url=base_url))
+    # Fail-closed: clear stale in-memory token for env sources that are not
+    # active. The disk row is retained (load_pool uses prune_env_sources=False)
+    # for cross-process safety, but this process must not select a legacy
+    # persisted token when its env var is unset/empty. Preserve a fingerprint
+    # for audit before clearing so disk sanitization still leaves a trace.
+    # Malformed env: (no non-empty variable name) is treated as unavailable and
+    # its token is cleared — otherwise a non-empty legacy token in source env:
+    # would remain selectable.
+    for _stale in list(entries):
+        if not _stale.source.startswith("env:"):
+            continue
+        if _stale.source in seed.active_sources:
+            continue
+        if _stale.access_token:
+            try:
+                _fp = fingerprint_secret_value(_stale.access_token)
+            except Exception:
+                _fp = None
+            _new_extra = dict(_stale.extra) if _stale.extra else {}
+            if _fp:
+                _new_extra["secret_fingerprint"] = _fp
+            _cleared = replace(_stale, access_token="", extra=_new_extra)
+            for _idx, _ent in enumerate(entries):
+                if _ent.id == _stale.id:
+                    entries[_idx] = _cleared
+                    break
+            seed.changed = True
     return seed.result
 
 
