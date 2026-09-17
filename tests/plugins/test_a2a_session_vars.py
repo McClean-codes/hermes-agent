@@ -1,4 +1,5 @@
-"""A2A inbound binds session-context vars before agent dispatch.
+"""A2A inbound binds session-context vars before agent dispatch and isolates
+concurrent tasks in the same context.
 
 Regression test for the task-completion push-back gap: the
 A2A adapter never set the session-context vars that kanban
@@ -17,6 +18,11 @@ concurrent A2A contexts and leaks into sibling sessions):
 - ``_forward_to_profile`` carries the identity to the forwarded profile's
   CLI subprocess via the child env (``get_session_env`` falls back to
   ``os.environ`` in a CLI process).
+
+Also covers task-identity isolation: two tasks sharing the same context
+but with different task IDs must not cross-talk — a disconnect of one
+must not resolve the other's future, and a late completion addressed by
+explicit thread_id must finalize only the intended task.
 """
 
 from __future__ import annotations
@@ -70,24 +76,22 @@ def test_prepare_task_binds_session_vars_into_dispatched_context(monkeypatch, tm
                 get_session_env,
             )
 
-            captured.append(
-                {
-                    # The mechanism contract: the vars must be bound as
-                    # ContextVars (the old os.environ write leaves these
-                    # _UNSET and only masks a same-process read via the
-                    # fallback — invisible to the tool process under the
-                    # subprocess-env bridge).
-                    "platform_cv": _VAR_MAP["HERMES_SESSION_PLATFORM"].get(),
-                    "chat_id_cv": _VAR_MAP["HERMES_SESSION_CHAT_ID"].get(),
-                    "thread_id_cv": _VAR_MAP["HERMES_SESSION_THREAD_ID"].get(),
-                    # The value contract: what the tool process reads.
-                    "platform": get_session_env("HERMES_SESSION_PLATFORM", ""),
-                    "chat_id": get_session_env("HERMES_SESSION_CHAT_ID", ""),
-                    "thread_id": get_session_env("HERMES_SESSION_THREAD_ID", ""),
-                    "event_chat_id": getattr(event.source, "chat_id", None),
-                    "event_message_id": getattr(event, "message_id", None),
-                }
-            )
+            captured.append({
+                # The mechanism contract: the vars must be bound as
+                # ContextVars (the old os.environ write leaves these
+                # _UNSET and only masks a same-process read via the
+                # fallback — invisible to the tool process under the
+                # subprocess-env bridge).
+                "platform_cv": _VAR_MAP["HERMES_SESSION_PLATFORM"].get(),
+                "chat_id_cv": _VAR_MAP["HERMES_SESSION_CHAT_ID"].get(),
+                "thread_id_cv": _VAR_MAP["HERMES_SESSION_THREAD_ID"].get(),
+                # The value contract: what the tool process reads.
+                "platform": get_session_env("HERMES_SESSION_PLATFORM", ""),
+                "chat_id": get_session_env("HERMES_SESSION_CHAT_ID", ""),
+                "thread_id": get_session_env("HERMES_SESSION_THREAD_ID", ""),
+                "event_chat_id": getattr(event.source, "chat_id", None),
+                "event_message_id": getattr(event, "message_id", None),
+            })
 
         adapter.handle_message = fake_handle_message  # type: ignore[method-assign]
         adapter._message_handler = object()  # type: ignore[assignment]
@@ -109,7 +113,9 @@ def test_prepare_task_binds_session_vars_into_dispatched_context(monkeypatch, tm
 
         got = captured[0]
         assert got["platform_cv"] is not _UNSET and got["platform_cv"] == "a2a"
-        assert got["chat_id_cv"] is not _UNSET and got["chat_id_cv"] == "peer-a2a-test-ctx"
+        assert (
+            got["chat_id_cv"] is not _UNSET and got["chat_id_cv"] == "peer-a2a-test-ctx"
+        )
         assert got["thread_id_cv"] is not _UNSET and got["thread_id_cv"] == task_id
         assert got["platform"] == "a2a"
         assert got["chat_id"] == "peer-a2a-test-ctx"
@@ -196,7 +202,12 @@ def test_forward_to_profile_carries_session_vars_in_child_env(monkeypatch, tmp_p
         adapter._lookup_forward_session = lambda *a, **k: ""  # type: ignore[method-assign]
         adapter._latest_a2a_session = lambda *a, **k: ""  # type: ignore[method-assign]
 
-        agent = {"slug": "worker-a", "profile": "worker-a", "local": False, "timeout": 30}
+        agent = {
+            "slug": "worker-a",
+            "profile": "worker-a",
+            "local": False,
+            "timeout": 30,
+        }
         reply, state = adapter._forward_to_profile(
             agent, "ip:127.0.0.1", "worker-a2a-fwd-ctx", "hello", "task-fwd-1"
         )
@@ -209,4 +220,81 @@ def test_forward_to_profile_carries_session_vars_in_child_env(monkeypatch, tmp_p
         assert env["HERMES_SESSION_THREAD_ID"] == "task-fwd-1"
         assert env["HERMES_A2A_PEER"] == "ip:127.0.0.1"
     finally:
+        adapter._unregister_adapter()
+
+
+def test_concurrent_same_context_tasks_do_not_cross_talk_on_disconnect(
+    monkeypatch, tmp_path
+):
+    """Two tasks sharing the same context must remain isolated — a
+    disconnect of one must not resolve the other's future, and a late
+    completion addressed by explicit thread_id must finalize only the
+    intended task.
+
+    Behaviour contract: after marking task A out-of-band (client
+    disconnected), its pending waiter is removed from the per-context
+    order while task B stays; a send addressed to A's thread_id resolves
+    only A's future and completes only A's TaskStore record.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from plugins.platforms.a2a import adapter as mod
+
+    monkeypatch.setattr(mod, "_persist_context_peers", lambda x: None)
+    monkeypatch.setattr(mod, "_persist_context_sessions", lambda x: None)
+    monkeypatch.setattr(mod, "_task_ledger_path", lambda: tmp_path / "ledger.json")
+
+    adapter = _bare_adapter()
+    adapter.host = "127.0.0.1"
+    adapter.port = 19999
+    ctx = "ctx-cross-1"
+    tA = protocol.new_task_id()
+    tB = protocol.new_task_id()
+    adapter.tasks.create(tA, ctx, "peer-a", "", "")
+    adapter.tasks.create(tB, ctx, "peer-a", "", "")
+    adapter.tasks.set_state(tA, protocol.STATE_WORKING)
+    adapter.tasks.set_state(tB, protocol.STATE_WORKING)
+    futA = adapter._add_pending(tA, ctx)
+    futB = adapter._add_pending(tB, ctx)
+    pendingA = {
+        "task_id": tA,
+        "context_id": ctx,
+        "peer": "peer-a",
+        "future": futA,
+        "started": 0,
+        "created_iso": "",
+    }
+    adapter._mark_out_of_band(pendingA, "[client disconnected]", pop_waiter=True)
+    assert tA not in adapter._pending_order.get(ctx, [])
+    assert tB in adapter._pending_order.get(ctx, [])
+    assert tA in adapter._pending
+    assert tB in adapter._pending
+
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    tokens = set_session_vars(
+        platform="a2a", chat_id=ctx, chat_type="dm", thread_id=tA, user_id="peer-a"
+    )
+    try:
+
+        async def do_send():
+            return await adapter.send(
+                ctx, "reply-for-a", metadata={"notify": True}, reply_to=tA
+            )
+
+        result = asyncio.run(do_send())
+        assert result.success
+        assert futA.done()
+        assert futA.result()[1] == "reply-for-a"
+        assert not futB.done() or futB.result()[1] != "reply-for-a"
+        recA = adapter.tasks.get(tA)
+        recB = adapter.tasks.get(tB)
+        assert recA is not None and recA["state"] == protocol.STATE_COMPLETED
+        assert recB is not None and recB["state"] == protocol.STATE_WORKING
+        assert tA not in adapter._pending
+        if futB.done():
+            assert futB.result()[1] != "reply-for-a"
+    finally:
+        clear_session_vars(tokens)
+        adapter._pending.clear()
+        adapter._pending_order.clear()
         adapter._unregister_adapter()
