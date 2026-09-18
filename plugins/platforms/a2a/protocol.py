@@ -1431,8 +1431,6 @@ class TaskStore:
                         if (
                             candidate_state == disk_state
                             and candidate_reply == disk_reply
-                            and candidate_record.get("push_url", "") == disk_rec.get("push_url", "")
-                            and candidate_record.get("push_config_id", "") == disk_rec.get("push_config_id", "")
                         ):
                             self._tasks[task_id] = dict(disk_rec)
                             return DurablePublishOutcome(
