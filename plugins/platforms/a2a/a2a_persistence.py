@@ -51,6 +51,63 @@ _MSVCRT_RETRIES = 50
 _MSVCRT_RETRY_DELAY = 0.01
 
 
+def _retained_terminal_ids(
+    records,
+    terminal_states,
+    *,
+    max_terminal: int = 500,
+) -> set[str]:
+    """Select terminal history by completion time, then stable insertion order."""
+    ranked: list[tuple[float, int, str]] = []
+    for index, (task_id, record) in enumerate(records.items()):
+        if record.get("state", "") not in terminal_states:
+            continue
+        timestamp = record.get("completed_at")
+        if timestamp is None:
+            timestamp = record.get("created_at", 0)
+        try:
+            sortable_timestamp = float(timestamp)
+        except (TypeError, ValueError):
+            sortable_timestamp = 0.0
+        ranked.append((sortable_timestamp, index, task_id))
+    ranked.sort()
+    return {task_id for _timestamp, _index, task_id in ranked[-max_terminal:]}
+
+
+def _durable_task_snapshot(
+    records,
+    terminal_states,
+    *,
+    max_terminal: int = 500,
+) -> dict[str, dict]:
+    """Keep every live task and only the newest bounded terminal history."""
+    kept_terminal = _retained_terminal_ids(
+        records,
+        terminal_states,
+        max_terminal=max_terminal,
+    )
+    snapshot: dict[str, dict] = {}
+    for task_id, record in records.items():
+        state = record.get("state", "")
+        if state in terminal_states and task_id not in kept_terminal:
+            continue
+        snapshot[task_id] = {
+            "task_id": record.get("task_id", task_id),
+            "context_id": record.get("context_id", ""),
+            "peer": record.get("peer", ""),
+            "agent_slug": record.get("agent_slug", ""),
+            "tenant": record.get("tenant", ""),
+            "state": state,
+            "reply": record.get("reply", ""),
+            "created_at": record.get("created_at", 0),
+            "created_iso": record.get("created_iso", ""),
+            "completed_at": record.get("completed_at"),
+            "push_url": record.get("push_url", ""),
+            "push_config_id": record.get("push_config_id", ""),
+        }
+    return snapshot
+
+
 # ── File locking ────────────────────────────────────────────────────────
 
 @contextlib.contextmanager
@@ -509,15 +566,3 @@ def _safe_context_slug(value: str, max_len: int = 96) -> str:
     """Sanitize attacker-provided context ids before using in session titles."""
     slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(value or "")).strip("-._")
     return (slug or "ctx")[:max_len]
-
-def _try_persist_task_ledger(tasks, ledger_path, label: str = "") -> bool:
-    """Try to persist task ledger; log error and return False on failure (durable write failed)."""
-    try:
-        tasks.persist(ledger_path)
-        return True
-    except Exception:
-        try:
-            logger.error("A2A: failed to persist task ledger at %s", label or "unknown", exc_info=True)
-        except Exception:
-            pass
-        return False

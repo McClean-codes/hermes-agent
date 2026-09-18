@@ -275,6 +275,8 @@ def test_push_round_trip_surfaces_peer_reply(monkeypatch, tmp_path):
         # push the reply out-of-band.
         adapter_b = _bare_adapter()
         try:
+            adapter_b.tasks.create("task-b", "ctx-rt", "bob")
+            adapter_b.tasks.set_state("task-b", protocol.STATE_WORKING)
             fut = adapter_b._add_pending("task-b", "ctx-rt")
             pushes_b: list = []
             monkeypatch.setattr(
@@ -316,7 +318,10 @@ def test_patience_exceeded_pushes_and_skips_socket_write(monkeypatch, tmp_path):
         pushed: list[tuple[str, str, bool]] = []
         monkeypatch.setattr(
             adapter, "_push_out_of_band",
-            lambda cid, text, want_reply=False: pushed.append((cid, text, want_reply)),
+            lambda cid, text, want_reply=False: (
+                pushed.append((cid, text, want_reply))
+                or protocol.PushOutcome(success=True, category="transport", error="")
+            ),
         )
         audited: list[tuple[str, str, str]] = []
         monkeypatch.setattr(
@@ -331,6 +336,8 @@ def test_patience_exceeded_pushes_and_skips_socket_write(monkeypatch, tmp_path):
             "task_id": "task-p", "context_id": "ctx-p", "peer": "alice",
             "future": fut, "created_iso": protocol.now_iso(), "started": time.time(),
         }
+        adapter.tasks.create("task-p", "ctx-p", "alice")
+        adapter.tasks.set_state("task-p", protocol.STATE_WORKING)
         monkeypatch.setattr(
             adapter, "_prepare_task",
             lambda params, peer, agent=None: (None, pending),
@@ -444,7 +451,7 @@ def test_write_failure_pushes_and_skips_reprobe(monkeypatch):
         pushed: list = []
         monkeypatch.setattr(
             adapter, "_push_reply_after_client_gone",
-            lambda req_id, result: pushed.append((req_id, result)),
+            lambda req_id, result, **kwargs: pushed.append((req_id, result)),
         )
 
         def fake_rpc(req_id, params, peer, agent=None, v1_response=False, client_alive=None):
@@ -495,7 +502,9 @@ def test_send_task_stamps_sender_with_timeout_no_live_adapter(monkeypatch, tmp_p
         posted["body"] = body
         return protocol.jsonrpc_result(
             body["id"],
-            protocol.build_task("task-1", "ctx-s", protocol.STATE_COMPLETED, "ok"),
+            protocol.send_message_response(protocol.build_task(
+                "task-1", "ctx-s", protocol.STATE_COMPLETED, "ok",
+            )),
         )
 
     monkeypatch.setattr(tools, "_http_post_json", fake_post)

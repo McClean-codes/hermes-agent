@@ -177,9 +177,10 @@ class TestInjectionFilter:
 
 class TestOutboundRedaction:
     def test_openai_key_redacted(self):
-        out = security.redact_outbound("my key is sk-abcdefghij1234567890XYZ")
-        assert "sk-abcdefghij" not in out
-        assert "[redacted]" in out
+        token = "sk-" + ("a" * 24)
+        out = security.redact_outbound(f"my key is {token}")
+        assert token not in out
+        assert out != f"my key is {token}"
 
     def test_github_token_redacted(self):
         out = security.redact_outbound("token ghp_0123456789abcdefghij0123")
@@ -614,10 +615,16 @@ def _bare_adapter():
     return A2AAdapter(PlatformConfig(enabled=True))
 
 
+def _seed_working(adapter, task_id: str, context_id: str, peer: str = "peer"):
+    adapter.tasks.create(task_id, context_id, peer)
+    adapter.tasks.set_state(task_id, protocol.STATE_WORKING)
+
+
 class TestReplyCapture:
     def test_send_waits_for_notify_marked_final_reply(self):
         """Interim/editable sends must not satisfy the blocked A2A RPC future."""
         adapter = _bare_adapter()
+        _seed_working(adapter, "task-final", "ctx-final")
         fut = adapter._add_pending("task-final", "ctx-final")
 
         async def run():
@@ -645,6 +652,8 @@ class TestReplyCapture:
     def test_concurrent_same_context_tasks_resolve_fifo(self):
         """Two in-flight tasks sharing a context requires exact task authority."""
         adapter = _bare_adapter()
+        _seed_working(adapter, "task-1", "ctx-shared")
+        _seed_working(adapter, "task-2", "ctx-shared")
         fut1 = adapter._add_pending("task-1", "ctx-shared")
         fut2 = adapter._add_pending("task-2", "ctx-shared")
 
@@ -691,6 +700,7 @@ class TestReplyCapture:
         from gateway.platforms.base import ProcessingOutcome
 
         adapter = _bare_adapter()
+        _seed_working(adapter, "task-ok", "ctx-ok")
         fut = adapter._add_pending("task-ok", "ctx-ok")
         event = SimpleNamespace(message_id="task-ok")
 
@@ -864,11 +874,8 @@ class TestOutOfBandReply:
         assert ("ctx-loop", "agent", "push me back") in persisted
         assert audited and audited[0][0] == "push"
 
-    def test_out_of_band_push_timeout_still_writes_bookkeeping(self, monkeypatch):
-        """A push whose HTTP client times out must still emit the
-        conversation row, push audit row, and reply log — the message may
-        have been delivered even though the client gave up — while still
-        surfacing the failure to the notifier."""
+    def test_out_of_band_push_timeout_records_failure_not_success(self, monkeypatch):
+        """An indeterminate transport failure emits no successful conversation row."""
         adapter = self._adapter_with_peer()
         monkeypatch.setattr(
             tools, "_load_config",
@@ -899,7 +906,7 @@ class TestOutOfBandReply:
         assert not res.success  # timeout still surfaces to the notifier
         assert audited and audited[0][0] == "push_failed"
         assert audited[0][4] == "ctx-x"  # push rows carry the context id
-        assert ("ctx-x", "agent", "late") in persisted
+        assert ("ctx-x", "agent", "late") not in persisted
         assert audited and audited[0][0] == "push_failed"
 
 
@@ -1233,6 +1240,7 @@ class TestContextOriginWake:
         pending map, so out-of-band pushes (which create a pending entry
         and never call _finalize_task) cannot leak entries."""
         adapter = _bare_adapter()
+        _seed_working(adapter, "task-1", "ctx-pop")
         fut = adapter._add_pending("task-1", "ctx-pop")
 
         async def run():

@@ -54,11 +54,13 @@ Peers resolved from `config.yaml` → `a2a_agents`, or a direct URL.
   which fulfils the pending per-**task** `Future` the HTTP request is blocked
   on (per-context FIFO, so concurrent same-context requests can't cross-talk);
   `on_processing_complete` resolves failures/cancellations promptly.
-- **Task store:** every task (including terminal ones, bounded to the last
-  500) stays queryable via `tasks/get` / `tasks/list`, and `tasks/subscribe`
-  reattaches to a running task's stream via store watchers. A watchdog fails
-  orphaned tasks after 5 minutes (idempotent transitions — no double
-  counting in metrics).
+- **Task store:** every non-terminal task remains durable until an authoritative
+  terminal transition. Terminal history is bounded to the 500 most recently
+  completed tasks in memory and on disk. Tasks stay queryable via `tasks/get` /
+  `tasks/list`, and `tasks/subscribe` reattaches to a running task's stream via
+  store watchers. A watchdog fails orphaned tasks after 5 minutes through the
+  same per-task durable publication path; it never follows that merge-aware
+  transition with a stale whole-store rewrite.
 - **input-required:** the platform hint tells the agent to start a reply with
   `[INPUT_REQUIRED]` when it needs clarification; the adapter maps that to
   `TASK_STATE_INPUT_REQUIRED` with the question in `status.message`.
@@ -189,6 +191,11 @@ terminology below is canonical:
    stage clone → atomically replace ledger → update memory → wake
    observers → post-commit audit/metrics/callback/push → return success.
    No `memory terminal → persist → return` path is permitted.
+
+   A normal pending reply also passes through `TaskRPCHandler._finalize_task`
+   before its waiter resolves. That is the single owner for semantic state
+   mapping, outbound redaction, durable publication, and post-commit effects;
+   the waiting RPC's repeated finalization is an idempotent no-op.
 
 4. `adapter.send()` per-context FIFO does not prevent cross-talk.
    Exact `task_id` (via `HERMES_SESSION_THREAD_ID` or `reply_to`) plus

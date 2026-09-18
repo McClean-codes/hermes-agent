@@ -37,6 +37,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from .a2a_persistence import _durable_task_snapshot, _retained_terminal_ids
+
 PROTOCOL_VERSION = "1.0"
 
 # A2A v1.0 task lifecycle states.
@@ -1426,24 +1428,28 @@ class TaskStore:
                                     )
                         disk_state = disk_rec.get("state", "")
                         disk_reply = disk_rec.get("reply", "")
+                        if (
+                            candidate_state == disk_state
+                            and candidate_reply == disk_reply
+                            and candidate_record.get("push_url", "") == disk_rec.get("push_url", "")
+                            and candidate_record.get("push_config_id", "") == disk_rec.get("push_config_id", "")
+                        ):
+                            self._tasks[task_id] = dict(disk_rec)
+                            return DurablePublishOutcome(
+                                published=True,
+                                newly_published=False,
+                                record=dict(disk_rec),
+                                durable_state=disk_state,
+                            )
                         if disk_state in TERMINAL_STATES:
-                            if candidate_state == disk_state and candidate_reply == disk_reply:
-                                self._tasks[task_id] = dict(disk_rec)
-                                return DurablePublishOutcome(
-                                    published=True,
-                                    newly_published=False,
-                                    record=dict(disk_rec),
-                                    durable_state=disk_state,
-                                )
-                            else:
-                                self._tasks[task_id] = dict(disk_rec)
-                                return DurablePublishOutcome(
-                                    published=False,
-                                    newly_published=False,
-                                    record=dict(disk_rec),
-                                    durable_state=disk_state,
-                                    error="terminal conflict: existing terminal differs",
-                                )
+                            self._tasks[task_id] = dict(disk_rec)
+                            return DurablePublishOutcome(
+                                published=False,
+                                newly_published=False,
+                                record=dict(disk_rec),
+                                durable_state=disk_state,
+                                error="terminal conflict: existing terminal differs",
+                            )
 
                     # Only a nonterminal authoritative disk record may take a legal candidate transition.
 
@@ -1463,29 +1469,11 @@ class TaskStore:
                             if disk_rec_other.get("state") not in TERMINAL_STATES and rec.get("state") in TERMINAL_STATES:
                                 merged[tid] = dict(rec)
 
-                    snapshot: dict[str, dict[str, Any]] = {}
-                    for tid, rec in merged.items():
-                        state = rec.get("state", "")
-                        created = rec.get("created_at", 0)
-                        try:
-                            created_f = float(created)
-                        except Exception:
-                            created_f = 0.0
-                        if state in TERMINAL_STATES or (now - created_f < 300):
-                            snapshot[tid] = {
-                                "task_id": rec.get("task_id", tid),
-                                "context_id": rec.get("context_id", ""),
-                                "peer": rec.get("peer", ""),
-                                "agent_slug": rec.get("agent_slug", ""),
-                                "tenant": rec.get("tenant", ""),
-                                "state": state,
-                                "reply": rec.get("reply", ""),
-                                "created_at": rec.get("created_at", 0),
-                                "created_iso": rec.get("created_iso", ""),
-                                "completed_at": rec.get("completed_at"),
-                                "push_url": rec.get("push_url", ""),
-                                "push_config_id": rec.get("push_config_id", ""),
-                            }
+                    snapshot = _durable_task_snapshot(
+                        merged,
+                        TERMINAL_STATES,
+                        max_terminal=self._MAX_TERMINAL,
+                    )
                     tmp_fd = None
                     tmp_path = ""
                     try:
@@ -1730,10 +1718,14 @@ class TaskStore:
         return failed
 
     def _trim_locked(self) -> None:
-        terminal = [tid for tid, rec in self._tasks.items() if rec["state"] in TERMINAL_STATES]
-        excess = len(terminal) - self._MAX_TERMINAL
-        for tid in terminal[:max(0, excess)]:
-            self._tasks.pop(tid, None)
+        retained = _retained_terminal_ids(
+            self._tasks,
+            TERMINAL_STATES,
+            max_terminal=self._MAX_TERMINAL,
+        )
+        for task_id, record in list(self._tasks.items()):
+            if record["state"] in TERMINAL_STATES and task_id not in retained:
+                self._tasks.pop(task_id, None)
 
     @staticmethod
     def to_task(rec: dict, history_length: Optional[int] = None, include_artifacts: bool = True) -> dict:
@@ -1756,34 +1748,17 @@ class TaskStore:
     def persist(self, path: Path) -> None:
         """Persist terminal task records to disk for restart recovery.
 
-        Only records in terminal states (COMPLETED, FAILED, CANCELED) and
-        non-terminal records younger than a bound are persisted.  Follows
-        the safe persistence discipline: unique temp file, 0o600, atomic
-        replace.
+        Every non-terminal task remains recoverable until an authoritative
+        terminal transition. Terminal history is bounded to the newest 500
+        records. Follows the safe persistence discipline: unique temp file,
+        0o600, atomic replace.
         """
-        now = time.time()
         with self._lock:
-            snapshot = {}
-            for tid, rec in self._tasks.items():
-                state = rec["state"]
-                # Always persist terminal records; persist non-terminal
-                # only if younger than _ORPHAN_TIMEOUT (300s) so stale
-                # working tasks don't accumulate on disk.
-                if state in TERMINAL_STATES or (now - rec.get("created_at", 0) < 300):
-                    snapshot[tid] = {
-                        "task_id": rec["task_id"],
-                        "context_id": rec["context_id"],
-                        "peer": rec.get("peer", ""),
-                        "agent_slug": rec.get("agent_slug", ""),
-                        "tenant": rec.get("tenant", ""),
-                        "state": state,
-                        "reply": rec.get("reply", ""),
-                        "created_at": rec.get("created_at", 0),
-                        "created_iso": rec.get("created_iso", ""),
-                        "completed_at": rec.get("completed_at"),
-                        "push_url": rec.get("push_url", ""),
-                        "push_config_id": rec.get("push_config_id", ""),
-                    }
+            snapshot = _durable_task_snapshot(
+                self._tasks,
+                TERMINAL_STATES,
+                max_terminal=self._MAX_TERMINAL,
+            )
         try:
             import fcntl
             _HAS_FCNTL = True

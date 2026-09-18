@@ -120,16 +120,6 @@ class TestPortableMSGDONTWAIT:
         else:
             assert adapter_mod._PORTABLE_NONBLOCK_RECV == 0
 
-    def test_source_uses_portable_constant(self):
-        """adapter.py must not reference socket.MSG_DONTWAIT directly in recv."""
-        import inspect
-        handler_cls = adapter_mod.A2ARequestHandler
-        source = inspect.getsource(handler_cls._a2a_client_alive)
-        assert "socket.MSG_DONTWAIT" not in source, (
-            "_a2a_client_alive must use _PORTABLE_NONBLOCK_RECV, "
-            "not socket.MSG_DONTWAIT directly"
-        )
-        assert "_PORTABLE_NONBLOCK_RECV" in source
 
     def test_client_alive_uses_portable_recv_flag(self):
         """_a2a_client_alive must pass the portable flag to sock.recv."""

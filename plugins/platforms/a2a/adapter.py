@@ -117,7 +117,6 @@ from .a2a_persistence import (
     _safe_context_slug,
     _sender_url_acceptable,
     _task_ledger_path,
-    _try_persist_task_ledger,
 )
 
 def _orphan_timeout() -> float:
@@ -718,7 +717,6 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
             try:
                 failed = self._fail_orphans_once()
                 if failed:
-                    _try_persist_task_ledger(self.tasks, _task_ledger_path(), f"watchdog {failed}")
                     for tid in failed:
                         try:
                             rec = self.tasks.get(tid)
@@ -1623,57 +1621,6 @@ class A2AAdapter(BasePlatformAdapter, TaskRPCHandler):
     # ── Push notifications ────────────────────────────────────────────────
     # ── Sending (the agent's reply path) ──────────────────────────────────
 
-    def _durable_complete_pending(self, task_id: str, chat_id: str, content: str, message_id: str) -> tuple[bool, str]:
-        # Stage candidate from current durable record — pending map/Future is NOT Task authority (Amendment D)
-        rec = self.tasks.get(task_id)
-        if rec is None:
-            logger.warning("A2A: durable complete for unknown task %s — no authoritative TaskStore record (no fallback, Future unresolved)", task_id)
-            return False, "task not found: no authoritative record"
-        if rec.get("context_id") != chat_id:
-            logger.warning("A2A: context mismatch for task %s: %r != %r", task_id, rec.get("context_id"), chat_id)
-            return False, "context mismatch"
-        if rec.get("state") in protocol.TERMINAL_STATES:
-            # Already terminal — treat as not active for send authority
-            return False, "task already terminal"
-        candidate = dict(rec)
-        candidate["state"] = protocol.STATE_COMPLETED
-        candidate["reply"] = content or ""
-        candidate["completed_at"] = __import__("time").time()
-        try:
-            outcome = self.tasks.publish_durable(_task_ledger_path(), task_id, candidate)
-        except Exception as exc:
-            logger.error("A2A: publish_durable exception for task %s: %s", task_id, exc, exc_info=True)
-            return False, "A2A task state could not be durably published"
-        if not outcome.published:
-            logger.error("A2A: failed to durably publish COMPLETED for task %s: %s", task_id, outcome.error)
-            return False, "A2A task state could not be durably published"
-        # Publish succeeded — now resolve/remove Future atomically
-        with self._pending_lock:
-            ent = self._pending.get(task_id)
-            if ent is not None and ent[0] == chat_id and not ent[1].done():
-                try:
-                    ent[1].set_result((protocol.STATE_COMPLETED, content or ""))
-                except Exception:
-                    pass
-                order = self._pending_order.get(chat_id)
-                if order is not None:
-                    try:
-                        order.remove(task_id)
-                    except ValueError:
-                        pass
-                    if not order:
-                        self._pending_order.pop(chat_id, None)
-                self._pending.pop(task_id, None)
-            elif ent is not None:
-                # Pending exists but mismatched or already done — do not resolve again
-                pass
-        # Postcommit push notification (best-effort, only when newly published)
-        if outcome.newly_published:
-            try:
-                self._send_push_notification(task_id, chat_id, content or "", protocol.STATE_COMPLETED)
-            except Exception as exc:
-                logger.debug("A2A: _durable_complete_pending push failed for %s: %s", task_id, exc)
-        return True, ""
 
     async def send(
         self,

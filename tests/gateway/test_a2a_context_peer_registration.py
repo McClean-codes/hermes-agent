@@ -38,7 +38,9 @@ def test_outbound_call_registers_context_peer_on_local_adapter(monkeypatch):
         def fake_post(url, body, headers, timeout, **kw):
             return protocol.jsonrpc_result(
                 body["id"],
-                protocol.build_task("t2", "ctx-discord-born", protocol.STATE_COMPLETED, "ok"),
+                protocol.send_message_response(protocol.build_task(
+                    "t2", "ctx-discord-born", protocol.STATE_COMPLETED, "ok",
+                )),
             )
 
         monkeypatch.setattr(tools, "_http_post_json", fake_post)
@@ -66,7 +68,9 @@ def test_outbound_registration_is_best_effort(monkeypatch):
     def fake_post(url, body, headers, timeout, **kw):
         return protocol.jsonrpc_result(
             body["id"],
-            protocol.build_task("t2", "ctx-x", protocol.STATE_COMPLETED, "ok"),
+            protocol.send_message_response(protocol.build_task(
+                "t2", "ctx-x", protocol.STATE_COMPLETED, "ok",
+            )),
         )
 
     monkeypatch.setattr(tools, "_http_post_json", fake_post)
@@ -102,7 +106,9 @@ def test_push_out_of_band_writes_push_audit(monkeypatch, tmp_path):
         def fake_post(url, body, headers, timeout, **kw):
             return protocol.jsonrpc_result(
                 body["id"],
-                protocol.build_task("t2", "ctx-audit", protocol.STATE_COMPLETED, "ok"),
+                protocol.send_message_response(protocol.build_task(
+                    "t2", "ctx-audit", protocol.STATE_COMPLETED, "ok",
+                )),
             )
 
         monkeypatch.setattr(tools, "_http_post_json", fake_post)

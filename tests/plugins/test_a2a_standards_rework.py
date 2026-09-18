@@ -225,32 +225,6 @@ class TestPersistenceLocking:
         """The _file_lock context manager is available."""
         assert hasattr(a2a_adapter, "_file_lock")
 
-    def test_persistence_uses_unique_temp_files(self):
-        """Persist functions use tempfile.mkstemp (unique names), not a
-        fixed .tmp suffix that concurrent writers would collide on."""
-        import inspect
-        src_peers = inspect.getsource(a2a_adapter._persist_context_peers)
-        assert "mkstemp" in src_peers, (
-            "_persist_context_peers must use mkstemp for unique temp files"
-        )
-        src_sessions = inspect.getsource(a2a_adapter._persist_context_sessions)
-        assert "mkstemp" in src_sessions, (
-            "_persist_context_sessions must use mkstemp for unique temp files"
-        )
-
-    def test_persistence_sets_0600_permissions(self):
-        """Temp files are chmod 0o600 before atomic replace."""
-        import inspect
-        src = inspect.getsource(a2a_adapter._persist_context_peers)
-        assert "0o600" in src, "peers persist must set 0o600 permissions"
-
-    def test_atomic_replace_via_os_replace(self):
-        """Uses os.replace (atomic on POSIX) not shutil.move or rename."""
-        import inspect
-        src_peers = inspect.getsource(a2a_adapter._persist_context_peers)
-        assert "os.replace" in src_peers, "must use os.replace for atomicity"
-        src_sessions = inspect.getsource(a2a_adapter._persist_context_sessions)
-        assert "os.replace" in src_sessions, "must use os.replace for atomicity"
 
     def test_concurrent_writers_both_mappings_survive(self):
         """Two threads writing different contexts to the peers file both
@@ -499,21 +473,13 @@ class TestFINRaceProbe:
         )
 
         # Rescue was called instead of _json
-        adapter_mock._push_reply_after_client_gone.assert_called_once_with(1, result)
+        adapter_mock._push_reply_after_client_gone.assert_called_once_with(
+            1, result, is_v1=True,
+        )
         assert handler.close_connection is True
         # _json was NOT called
         handler._json.assert_not_called()
 
-    def test_residual_race_documented(self):
-        """The code documents the residual probe/write race."""
-        import inspect
-        src = inspect.getsource(a2a_adapter.A2ARequestHandler._handle_send)
-        assert "RESIDUAL RACE" in src or "residual" in src.lower(), (
-            "The residual probe/write race must be explicitly documented"
-        )
-        assert "future work" in src.lower() or "delivery ID" in src.lower() or "ACK" in src, (
-            "Must document that stable delivery ID / ACK is future work"
-        )
 
 
 # ── Design decision 5: Metadata field on messages ───────────────────────

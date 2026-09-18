@@ -603,13 +603,7 @@ class TestRealLoopbackPath:
     def test_fire_and_forget_real_path_completes_task(self, monkeypatch):
         """Real _prepare_task + _finalize_task: fire-and-forget reaches COMPLETED."""
         adapter, loop = self._make_real_adapter(monkeypatch)
-        captured_ids: list[str] = []
-        original_create = adapter.tasks.create
-        def _capture_create(*args, **kwargs):
-            rec = original_create(*args, **kwargs)
-            captured_ids.append(rec["task_id"])
-            return rec
-        adapter.tasks.create = _capture_create
+        before_ids = set(adapter.tasks._tasks)
         try:
             adapter._push_loopback_in_process(
                 "ctx-real-loop-ff", "ip:127.0.0.1", "fire-and-forget text",
@@ -620,8 +614,9 @@ class TestRealLoopbackPath:
 
         # The real _prepare_task created a task in TaskStore; _finalize_task
         # must have transitioned it to COMPLETED.
-        assert len(captured_ids) == 1, f"Expected 1 task created, got {len(captured_ids)}"
-        task_id = captured_ids[0]
+        created_ids = set(adapter.tasks._tasks) - before_ids
+        assert len(created_ids) == 1, f"Expected 1 task created, got {len(created_ids)}"
+        task_id = created_ids.pop()
         rec = adapter.tasks.get(task_id)
         assert rec is not None, "Task must exist in TaskStore after finalize"
         assert rec["state"] == protocol.STATE_COMPLETED, (
@@ -637,13 +632,7 @@ class TestRealLoopbackPath:
     def test_want_reply_real_path_stays_pending(self, monkeypatch):
         """Real _prepare_task: want_reply=True leaves task pending (not finalized)."""
         adapter, loop = self._make_real_adapter(monkeypatch)
-        captured_ids: list[str] = []
-        original_create = adapter.tasks.create
-        def _capture_create(*args, **kwargs):
-            rec = original_create(*args, **kwargs)
-            captured_ids.append(rec["task_id"])
-            return rec
-        adapter.tasks.create = _capture_create
+        before_ids = set(adapter.tasks._tasks)
         try:
             adapter._push_loopback_in_process(
                 "ctx-real-loop-reply", "ip:127.0.0.1", "reply text",
@@ -655,8 +644,9 @@ class TestRealLoopbackPath:
         # With want_reply=True, _finalize_task must NOT be called.
         # TaskStore record must remain in a non-terminal state (WORKING,
         # set by _prepare_task after dispatch).
-        assert len(captured_ids) == 1, f"Expected 1 task created, got {len(captured_ids)}"
-        task_id = captured_ids[0]
+        created_ids = set(adapter.tasks._tasks) - before_ids
+        assert len(created_ids) == 1, f"Expected 1 task created, got {len(created_ids)}"
+        task_id = created_ids.pop()
         rec = adapter.tasks.get(task_id)
         assert rec is not None, "Task must exist in TaskStore"
         assert rec["state"] not in protocol.TERMINAL_STATES, (

@@ -54,6 +54,70 @@ class TaskRPCHandler:
 
     # ── Inbound task handling ─────────────────────────────────────────────
 
+    def _durable_complete_pending(
+        self,
+        task_id: str,
+        chat_id: str,
+        content: str,
+        message_id: str,
+    ) -> tuple[bool, str]:
+        """Commit one finalized reply before resolving its pending waiter."""
+        rec = self.tasks.get(task_id)
+        if rec is None:
+            logger.warning(
+                "A2A: durable complete for unknown task %s — no authoritative "
+                "TaskStore record (no fallback, Future unresolved)",
+                task_id,
+            )
+            return False, "task not found: no authoritative record"
+        if rec.get("context_id") != chat_id:
+            logger.warning(
+                "A2A: context mismatch for task %s: %r != %r",
+                task_id,
+                rec.get("context_id"),
+                chat_id,
+            )
+            return False, "context mismatch"
+        if rec.get("state") in protocol.TERMINAL_STATES:
+            return False, "task already terminal"
+
+        with self._pending_lock:
+            entry = self._pending.get(task_id)
+            if entry is None or entry[0] != chat_id or entry[1].done():
+                return False, "task is not pending"
+            future = entry[1]
+
+        pending = {
+            "task_id": task_id,
+            "context_id": chat_id,
+            "peer": rec.get("peer", ""),
+            "future": future,
+            "created_iso": rec.get("created_iso", ""),
+            "started": rec.get("created_at", time.time()),
+        }
+        try:
+            state, reply = self._finalize_task(
+                pending,
+                protocol.STATE_COMPLETED,
+                content or "",
+                pop_pending=False,
+            )
+        except protocol.DurablePublishError as exc:
+            logger.error(
+                "A2A: pending completion durability failed for task %s: %s",
+                task_id,
+                exc,
+            )
+            return False, "A2A task state could not be durably published"
+
+        if not future.done():
+            try:
+                future.set_result((state, reply))
+            except Exception:
+                pass
+        self._pop_pending(task_id)
+        return True, ""
+
     def _prepare_task_rpc(self, params: dict, peer: str, agent=None):
         """Validate, register, and dispatch an inbound message.
 
@@ -418,7 +482,8 @@ class TaskRPCHandler:
 
 
     def _finalize_task(self, pending: dict, state: str, reply: str,
-                       audit_direction: str = "outbound") -> tuple[str, str]:
+                       audit_direction: str = "outbound", *,
+                       pop_pending: bool = True) -> tuple[str, str]:
         """Record the outcome of a dispatched task. Returns (state, reply) after
         redaction and input-required detection.
 
@@ -428,7 +493,6 @@ class TaskRPCHandler:
         task_id = pending["task_id"]
         context_id = pending["context_id"]
         peer = pending["peer"]
-        self._pop_pending(task_id)
 
         # B2: derive full safe redacted semantic reply before any surface
         try:
@@ -482,6 +546,8 @@ class TaskRPCHandler:
             # Terminal-write failure leaves last durable state (normally WORKING) visible, no success side effects
             # Do not invent INDETERMINATE; keep WORKING visible
             raise protocol.DurablePublishError(task_id, context_id, state, _outcome.durable_state, True)
+        if pop_pending:
+            self._pop_pending(task_id)
         # Post-commit ordering: only on newly_published do audit/metrics/push
         # These are best-effort append-only side effects; failure cannot downgrade committed success.
         # Enclose entire post-commit tail so no exception escapes a published success.
