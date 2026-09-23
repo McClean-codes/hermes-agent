@@ -37,16 +37,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from .a2a_persistence import (
-    _MAX_TOMBSTONES,
-    _durable_task_snapshot,
-    _evicted_terminal_tombstones,
-    _load_tombstones,
-    _reply_fingerprint,
-    _retained_terminal_ids,
-    _tombstone_path_for,
-    _write_tombstones,
-)
+from .a2a_persistence import (_apply_tombstone_evictions, _durable_task_snapshot, _evicted_terminal_tombstones,
+                              _load_tombstones, _retained_terminal_ids, _tombstone_gate, _tombstone_path_for)
 
 PROTOCOL_VERSION = "1.0"
 
@@ -1409,18 +1401,12 @@ class TaskStore:
                         self._ledger_unavailable = False
                         self._ledger_unavailable_reason = ""
 
-                    # Durable eviction evidence (review 5252598219, blocker 2).
-                    # Fail closed if the sidecar exists but cannot be read:
-                    # silently forgetting tombstones would reopen the hole.
                     tombstone_path = _tombstone_path_for(ledger_path)
                     tombstones, tombstone_error = _load_tombstones(tombstone_path)
                     if tombstone_error is not None:
                         return DurablePublishOutcome(
-                            published=False,
-                            newly_published=False,
-                            record=existing_mem_copy,
-                            durable_state=existing_mem_state,
-                            error=tombstone_error,
+                            published=False, newly_published=False, record=existing_mem_copy,
+                            durable_state=existing_mem_state, error=tombstone_error,
                         )
 
                     # Select authoritative disk record for task_id
@@ -1472,71 +1458,20 @@ class TaskStore:
                                 error="terminal conflict: existing terminal differs",
                             )
                     else:
-                        tombstone = tombstones.get(task_id)
-                        if tombstone is not None:
-                            # The row was durably terminal and later evicted from
-                            # the bounded window: the sidecar tombstone is the
-                            # terminal authority for this id (review 5252598219,
-                            # blocker 2). Reject any non-identical candidate —
-                            # resurrection to a live state or a divergent reply —
-                            # and never re-add the stale in-memory copy.
-                            for field_name, cand_val in [
-                                ("context_id", candidate_context),
-                                ("peer", candidate_peer),
-                                ("agent_slug", candidate_slug),
-                                ("tenant", candidate_tenant),
-                            ]:
-                                if cand_val is not None and cand_val != tombstone.get(field_name, ""):
-                                    self._tasks.pop(task_id, None)
-                                    return DurablePublishOutcome(
-                                        published=False,
-                                        newly_published=False,
-                                        record=None,
-                                        durable_state=tombstone.get("state", ""),
-                                        error=(
-                                            f"ownership mismatch for {field_name}: "
-                                            f"{cand_val!r} != {tombstone.get(field_name, '')!r}"
-                                        ),
-                                    )
-                            tombstone_state = tombstone.get("state", "")
-                            if (
-                                candidate_state == tombstone_state
-                                and _reply_fingerprint(candidate_reply)
-                                == tombstone.get("reply_sha256", "")
-                            ):
-                                # Identical terminal fact re-published after
-                                # eviction: idempotent success, no new side
-                                # effects, stale memory copy dropped.
-                                self._tasks.pop(task_id, None)
-                                return DurablePublishOutcome(
-                                    published=True,
-                                    newly_published=False,
-                                    record={
-                                        "task_id": tombstone.get("task_id", task_id),
-                                        "context_id": tombstone.get("context_id", ""),
-                                        "peer": tombstone.get("peer", ""),
-                                        "agent_slug": tombstone.get("agent_slug", ""),
-                                        "tenant": tombstone.get("tenant", ""),
-                                        "state": tombstone_state,
-                                        # Bounded tombstones keep the reply
-                                        # fingerprint, not the body.
-                                        "reply": "",
-                                        "created_at": tombstone.get("created_at", 0),
-                                        "created_iso": tombstone.get("created_iso", ""),
-                                        "completed_at": tombstone.get("completed_at"),
-                                        "push_url": "",
-                                        "push_config_id": "",
-                                    },
-                                    durable_state=tombstone_state,
-                                )
+                        gate_kind, gate_payload = _tombstone_gate(
+                            tombstones, task_id, candidate_state, candidate_reply,
+                            candidate_context, candidate_peer, candidate_slug, candidate_tenant)
+                        if gate_kind != "none":
                             self._tasks.pop(task_id, None)
+                        if gate_kind == "idempotent":
                             return DurablePublishOutcome(
-                                published=False,
-                                newly_published=False,
-                                record=None,
-                                durable_state=tombstone_state,
-                                error="terminal conflict: task tombstoned after terminal eviction",
-                            )
+                                published=True, newly_published=False, record=gate_payload,
+                                durable_state=gate_payload["state"])
+                        if gate_kind == "error":
+                            return DurablePublishOutcome(
+                                published=False, newly_published=False, record=None,
+                                durable_state=gate_payload["durable_state"],
+                                error=gate_payload["error"])
 
                     # Only a nonterminal authoritative disk record may take a legal candidate transition.
 
@@ -1551,11 +1486,7 @@ class TaskStore:
                             merged[tid] = dict(rec)
                         elif tid not in merged:
                             if tid in tombstones:
-                                # Durably terminal and evicted from the window:
-                                # the sidecar tombstone is the authority for this
-                                # id — a stale store's copy must not resurrect
-                                # the row (genuinely new tasks have no tombstone
-                                # and still merge in below).
+                                # Tombstoned id: sidecar is terminal authority; new tasks still merge (blocker 2).
                                 continue
                             merged[tid] = dict(rec)
                         else:
@@ -1568,31 +1499,17 @@ class TaskStore:
                         TERMINAL_STATES,
                         max_terminal=self._MAX_TERMINAL,
                     )
-                    # Record eviction evidence BEFORE replacing the ledger: a
-                    # crash between the two writes must never leave an evicted
-                    # row with no tombstone (the reverse order is safe — a
-                    # tombstone for a row still on disk is simply ignored).
-                    new_tombstones = _evicted_terminal_tombstones(merged, snapshot, TERMINAL_STATES)
-                    if new_tombstones:
-                        updated_tombstones = dict(tombstones)
-                        updated_tombstones.update(new_tombstones)
-                        try:
-                            _write_tombstones(
-                                tombstone_path,
-                                updated_tombstones,
-                                max_tombstones=_MAX_TOMBSTONES,
-                            )
-                        except Exception as tomb_exc:
-                            return DurablePublishOutcome(
-                                published=False,
-                                newly_published=False,
-                                record=existing_mem_copy if disk_rec is None else dict(disk_rec),
-                                durable_state=(
-                                    disk_rec.get("state", "") if disk_rec is not None
-                                    else existing_mem_state
-                                ),
-                                error=f"tombstone write failed: {tomb_exc}",
-                            )
+                    # Tombstones land BEFORE the ledger replace (crash-safe order, blocker 2).
+                    tomb_error = _apply_tombstone_evictions(
+                        tombstone_path, _evicted_terminal_tombstones(merged, snapshot, TERMINAL_STATES), tombstones)
+                    if tomb_error is not None:
+                        return DurablePublishOutcome(
+                            published=False, newly_published=False,
+                            record=existing_mem_copy if disk_rec is None else dict(disk_rec),
+                            durable_state=(disk_rec.get("state", "") if disk_rec is not None
+                                           else existing_mem_state),
+                            error=tomb_error,
+                        )
                     tmp_fd = None
                     tmp_path = ""
                     try:
@@ -1900,12 +1817,9 @@ class TaskStore:
             elif _HAS_MSVCRT:
                 msvcrt.locking(fd.fileno(), msvcrt.LK_NBLCK, 1)
             if new_tombstones:
-                tomb_path = _tombstone_path_for(path)
-                existing_tombs, tomb_error = _load_tombstones(tomb_path)
+                tomb_error = _apply_tombstone_evictions(_tombstone_path_for(path), new_tombstones)
                 if tomb_error is not None:
                     raise RuntimeError(tomb_error)
-                existing_tombs.update(new_tombstones)
-                _write_tombstones(tomb_path, existing_tombs, max_tombstones=_MAX_TOMBSTONES)
             import tempfile, os
             tmp_fd, tmp_path = tempfile.mkstemp(
                 dir=str(path.parent), suffix=".tmp"
@@ -2036,6 +1950,11 @@ def _safe_name(context_id: str) -> str:
     return "".join(c for c in (context_id or "default") if c.isalnum() or c in "-_") or "default"
 
 
+def _conv_path(context_id: str) -> Path:
+    """Path of a context's on-disk conversation log (upstream helper kept)."""
+    return _conv_dir() / f"{_safe_name(context_id)}.jsonl"
+
+
 def persist_message(context_id: str, role: str, text: str, task_id: str = "") -> None:
     """Append one message to the context's on-disk conversation log."""
     try:
@@ -2061,9 +1980,11 @@ def load_conversation(context_id: str, limit: int = 50) -> list[dict]:
                 if not line:
                     continue
                 try:
-                    out.append(json.loads(line))
+                    entry = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                if isinstance(entry, dict):
+                    out.append(entry)
     except Exception:
         return []
     return out[-limit:]

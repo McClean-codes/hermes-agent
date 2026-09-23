@@ -683,7 +683,18 @@ class TaskRPCHandler:
             else:
                 self._resolve_task(task_id, protocol.STATE_CANCELED, "")
         else:
-            self._resolve_task(task_id, protocol.STATE_COMPLETED, "")
+            # A streamed turn never calls send() with notify=True (the gateway suppresses
+            # the normal final send once streaming delivered the body), so the SUCCESS
+            # default must not resolve with "" — that strands every A2A streaming reply
+            # as an empty completed task (#116944, upstream fix carried into this
+            # extracted handler). _streamed_final_response is the same stash
+            # _final_text_for_post_turn_hooks reads for /goal and /loop.
+            _streamed = getattr(event, "_streamed_final_response", "")
+            self._resolve_task(
+                task_id,
+                protocol.STATE_COMPLETED,
+                _streamed if isinstance(_streamed, str) else "",
+            )
 
     # ── Push notification delivery ────────────────────────────────────────
 

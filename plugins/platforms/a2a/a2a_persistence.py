@@ -232,6 +232,69 @@ def _write_tombstones(path: Path, tombstones: dict, *,
         raise
 
 
+def _tombstone_gate(tombstones, task_id, candidate_state, candidate_reply,
+                    candidate_context, candidate_peer, candidate_slug, candidate_tenant):
+    """Terminal authority for an evicted id (review 5252598219, blocker 2).
+
+    Returns ``("idempotent", record)`` when the candidate re-publishes the
+    identical terminal fact, ``("error", {...})`` for ownership mismatches or
+    any divergent/non-identical candidate, or ``("none", {})`` when the id has
+    no tombstone (a genuinely new task; the caller proceeds with the normal
+    merge).  The reply BODY is not retained — only its sha256 fingerprint —
+    so divergence is detected exactly while the sidecar stays bounded.
+    """
+    tombstone = tombstones.get(task_id)
+    if tombstone is None:
+        return "none", {}
+    for field_name, cand_val in (("context_id", candidate_context), ("peer", candidate_peer),
+                                 ("agent_slug", candidate_slug), ("tenant", candidate_tenant)):
+        if cand_val is not None and cand_val != tombstone.get(field_name, ""):
+            return "error", {
+                "durable_state": tombstone.get("state", ""),
+                "error": f"ownership mismatch for {field_name}: {cand_val!r} != {tombstone.get(field_name, '')!r}",
+            }
+    tombstone_state = tombstone.get("state", "")
+    if candidate_state == tombstone_state and _reply_fingerprint(candidate_reply) == tombstone.get("reply_sha256", ""):
+        return "idempotent", {
+            "task_id": tombstone.get("task_id", task_id),
+            "context_id": tombstone.get("context_id", ""),
+            "peer": tombstone.get("peer", ""),
+            "agent_slug": tombstone.get("agent_slug", ""),
+            "tenant": tombstone.get("tenant", ""),
+            "state": tombstone_state,
+            "reply": "",  # bounded tombstones keep the fingerprint, not the body
+            "created_at": tombstone.get("created_at", 0),
+            "created_iso": tombstone.get("created_iso", ""),
+            "completed_at": tombstone.get("completed_at"),
+            "push_url": "",
+            "push_config_id": "",
+        }
+    return "error", {
+        "durable_state": tombstone_state,
+        "error": "terminal conflict: task tombstoned after terminal eviction",
+    }
+
+
+def _apply_tombstone_evictions(tombstone_path, new_tombstones, prior_tombstones=None,
+                               max_tombstones=_MAX_TOMBSTONES):
+    """Merge *new_tombstones* into the sidecar (loading it first when
+    *prior_tombstones* is None).  Returns an error string, or None on
+    success; never raises."""
+    if not new_tombstones:
+        return None
+    if prior_tombstones is None:
+        prior_tombstones, error = _load_tombstones(tombstone_path)
+        if error is not None:
+            return error
+    updated = dict(prior_tombstones)
+    updated.update(new_tombstones)
+    try:
+        _write_tombstones(tombstone_path, updated, max_tombstones=max_tombstones)
+    except Exception as exc:
+        return f"tombstone write failed: {exc}"
+    return None
+
+
 # ── File locking ────────────────────────────────────────────────────────
 
 @contextlib.contextmanager
