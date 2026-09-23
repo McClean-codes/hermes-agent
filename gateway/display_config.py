@@ -9,12 +9,16 @@ Exception: ``display.streaming`` is CLI-only; gateway streaming follows the top-
 
 from __future__ import annotations
 
+import logging
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 # Settings configurable per-platform; other display settings are CLI-only.
 _GLOBAL_DEFAULTS: dict[str, Any] = {
     "tool_progress": "all",
     "tool_progress_grouping": "accumulate",  # "accumulate" = edit one bubble; "separate" = one msg per tool
+    "tool_progress_filter": {},  # per-tool/category overrides: {"terminal": "off", "skills": "all", "mcp": "off"}
     "show_reasoning": False,
     "reasoning_style": "code",  # "code" (💭 **Reasoning:** + fence), "blockquote" ("> "), "subtext" ("-# " Discord)
     "tool_preview_length": 0,
@@ -182,8 +186,93 @@ def _norm_int(value: Any) -> int:
         return 0
 
 
+# ``tool_progress_filter`` accepts tool names/categories as keys and the same
+# modes as ``tool_progress`` as values. A list is an allowlist shorthand.
+_FILTER_VALID_MODES = {"off", "new", "all", "verbose", "log"}
+
+
+def _norm_tool_progress_filter(value: Any) -> dict[str, str]:
+    """Normalize a filter without allowing malformed config to alter visibility."""
+    if value is None:
+        return {}
+    if isinstance(value, list):
+        result: dict[str, str] = {}
+        for entry in value:
+            if not isinstance(entry, str):
+                logger.warning("Ignoring non-string tool_progress_filter list entry %r", entry)
+                continue
+            key = entry.strip().lower()
+            if key:
+                result[key] = "all"
+            else:
+                logger.warning("Ignoring empty tool_progress_filter list entry %r", entry)
+        return result
+    if not isinstance(value, dict):
+        logger.warning(
+            "Invalid tool_progress_filter (expected dict or list, got %s); ignoring",
+            type(value).__name__,
+        )
+        return {}
+
+    result: dict[str, str] = {}
+    for raw_key, raw_value in value.items():
+        if not isinstance(raw_key, str):
+            logger.warning("Ignoring non-string tool_progress_filter key %r", raw_key)
+            continue
+        key = raw_key.strip().lower()
+        if not key:
+            logger.warning("Ignoring empty/blank tool_progress_filter key %r", raw_key)
+            continue
+        if isinstance(raw_value, bool):
+            mode = "all" if raw_value else "off"
+        elif isinstance(raw_value, str):
+            normalized = raw_value.strip().lower()
+            if normalized in _FALSY:
+                mode = "off"
+            elif normalized in _TRUTHY:
+                mode = "all"
+            elif normalized in _FILTER_VALID_MODES:
+                mode = normalized
+            else:
+                logger.warning("Ignoring unknown tool_progress_filter mode %r for key %r", raw_value, raw_key)
+                continue
+        elif isinstance(raw_value, int) and raw_value in (0, 1):
+            mode = "all" if raw_value else "off"
+        else:
+            logger.warning("Ignoring malformed tool_progress_filter value %r for key %r", raw_value, raw_key)
+            continue
+        result[key] = mode
+    return result
+
+
+def resolve_tool_progress_filter(user_config: dict, platform_key: str) -> dict[str, str]:
+    """Return global and per-platform filter entries with platform precedence."""
+    try:
+        display_cfg = user_config.get("display") or {}
+        if not isinstance(display_cfg, dict):
+            return {}
+        global_raw = display_cfg.get("tool_progress_filter")
+        platform_raw = None
+        platforms = display_cfg.get("platforms")
+        if isinstance(platforms, dict):
+            platform_cfg = platforms.get(platform_key)
+            if isinstance(platform_cfg, dict):
+                platform_raw = platform_cfg.get("tool_progress_filter")
+        global_filter = _norm_tool_progress_filter(global_raw) if global_raw is not None else {}
+        platform_filter = _norm_tool_progress_filter(platform_raw) if platform_raw is not None else None
+        if platform_filter is None or not platform_filter:
+            return global_filter
+        merged = dict(global_filter)
+        merged.update(platform_filter)
+        return merged
+    except Exception as exc:
+        logger.debug("resolve_tool_progress_filter failed: %s", exc)
+        return {}
+
+
 _NORMALISERS: dict[str, Any] = {
     "tool_progress": _norm_tristate("all", "off", {"off", "new", "all", "verbose", "log"}),
+    "tool_progress_filter": _norm_tool_progress_filter,
     "show_reasoning": _norm_bool,
     "streaming": _norm_bool,
     "interim_assistant_messages": _norm_bool,

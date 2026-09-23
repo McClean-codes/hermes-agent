@@ -3445,6 +3445,13 @@ class BasePlatformAdapter(ABC):
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Hook called when background processing begins."""
 
+    async def on_tool_call_start(self, event: MessageEvent, tool_name: str) -> None:
+        """Hook called when a tool call begins during message processing.
+
+        Adapters may use this for per-tool lifecycle indicators. The runner
+        invokes it before the visible progress queue is filtered.
+        """
+
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Hook called when background processing completes. Default: opt-in reaction ack — with
         ``_OK_EMOJI``/``_FAIL_EMOJI`` set and ``_add_reaction``/``_remove_reaction`` present, swap

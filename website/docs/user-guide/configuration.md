@@ -2156,6 +2156,7 @@ This controls both the `text_to_speech` tool and spoken replies in voice mode (`
 ```yaml
 display:
   tool_progress: all      # off | new | all | verbose
+  tool_progress_filter: {} # Per-tool/category overrides; exact tool wins over skills/mcp/plugins
   tool_progress_command: false  # Enable /verbose slash command in messaging gateway
   focus_view: false       # CLI focus view (/focus) — reduced output, display-only
   platforms: {}           # Per-platform display overrides (see below)
@@ -2270,6 +2271,8 @@ display:
 | `new` | Tool indicator only when the tool changes |
 | `all` | Every tool call with a short preview (default) |
 | `verbose` | Full args, results, and debug logs |
+
+`display.tool_progress_filter` overrides the global mode for selected tool names or categories. For example, `{"terminal": "off", "skills": "all"}` hides terminal updates while allowing skill tools, even when the global mode is `off`. An entry in `display.platforms.<platform>.tool_progress_filter` merges over the global map; exact tool names take precedence over category entries, then the global mode is used. `skills`, `mcp`, and `plugins` are recognized categories when runtime metadata identifies the tool. Filtered progress is display-only: tool execution, errors, results, final replies, and delivery are unchanged.
 
 In the CLI, cycle through these modes with `/verbose`. To use `/verbose` in messaging platforms (Telegram, Discord, Slack, etc.), set `tool_progress_command: true` in the `display` section above. The command will then cycle the mode and save to config.
 
@@ -2782,12 +2785,16 @@ discord:
   free_response_channels: ""     # Comma-separated channel IDs where bot responds without @mention
   auto_thread: true              # Auto-create threads on @mention in channels
   free_response_auto_thread: false  # Free-response channels also auto-thread (default: reply inline)
+  persona_emoji: ""              # Processing and successful-completion reaction (default: 👀)
+  dynamic_reactions: true        # Swap the reaction to the current tool while processing
 ```
 
 - `require_mention` — when `true` (default), the bot only responds in server channels when mentioned with `@BotName`. DMs always work without mention.
 - `free_response_channels` — comma-separated list of channel IDs where the bot responds to every message without requiring a mention.
 - `auto_thread` — when `true` (default), mentions in channels automatically create a thread for the conversation, keeping channels clean (similar to Slack threading).
 - `free_response_auto_thread` — when `true`, channels in `free_response_channels` also auto-create a thread per top-level message. Default `false`: free-response channels reply inline. Requires `auto_thread: true`.
+- `persona_emoji` — optional per-platform override for the processing acknowledgment and successful-completion reaction. The global default is `👀` when this value is empty.
+- `dynamic_reactions` — when `true` (default), the acknowledgment reaction changes to the current tool's emoji during processing. It is independent of `display.tool_progress` and does not reveal tool arguments.
 
 ## Security
 

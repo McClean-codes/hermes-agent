@@ -793,6 +793,13 @@ DEFAULT_CONFIG = {
         "moa_aggregator": _aux(900, reasoning_effort=False),
     },
 
+    # Agent identity emoji shown on message acknowledgment and completion.
+    # Platform-specific values live in each adapter's ``extra`` config.
+    "persona_emoji": "",
+    # Swap the active reaction emoji to reflect the current tool call.
+    # Platform-specific values live in each adapter's ``extra`` config.
+    "dynamic_reactions": True,
+
     "display": {
         "compact": False,
         "personality": "",
@@ -899,6 +906,9 @@ DEFAULT_CONFIG = {
         # updates; false routes it to reasoning (visible only with show_reasoning).
         "show_commentary": True,
         "tool_progress_command": False,  # enable /verbose command in messaging gateway
+        # Per-tool/category progress mode overrides. Exact tool names win over
+        # skills/mcp/plugins categories; per-platform values merge over this map.
+        "tool_progress_filter": {},
         # display.tool_progress_overrides is deprecated (use display.platforms); a user-set value is
         # still honored at runtime and folded into platforms by migration.
         "tool_preview_length": 0,  # max chars for tool call previews (0 = no limit)

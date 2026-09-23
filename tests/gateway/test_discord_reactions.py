@@ -1,4 +1,4 @@
-"""Tests for Discord message reactions tied to processing lifecycle hooks."""
+"""Discord persona and dynamic reaction lifecycle tests."""
 
 import asyncio
 import sys
@@ -58,7 +58,10 @@ class FakeTree:
 
 @pytest.fixture
 def adapter():
-    config = PlatformConfig(enabled=True, token="***")
+    config = PlatformConfig(
+        enabled=True,
+        extra={"persona_emoji": "🧪", "dynamic_reactions": True, "reaction_cooldown": 0},
+    )
     adapter = DiscordAdapter(config)
     adapter._client = SimpleNamespace(
         tree=FakeTree(),
@@ -67,6 +70,19 @@ def adapter():
         user=SimpleNamespace(id=99999, name="HermesBot"),
     )
     return adapter
+
+
+def test_global_persona_config_is_used_when_platform_extra_is_unset(monkeypatch):
+    from hermes_cli import config as config_module
+
+    monkeypatch.setattr(
+        config_module, "load_config",
+        lambda: {"persona_emoji": "🌟", "dynamic_reactions": False},
+    )
+    candidate = DiscordAdapter(PlatformConfig(enabled=True, extra={}))
+
+    assert candidate._rxn_persona_emoji == "🌟"
+    assert candidate._rxn_dynamic is False
 
 
 def _make_event(message_id: str, raw_message) -> MessageEvent:
@@ -86,40 +102,90 @@ def _make_event(message_id: str, raw_message) -> MessageEvent:
 
 
 @pytest.mark.asyncio
-async def test_process_message_background_adds_and_swaps_reactions(adapter):
-    raw_message = SimpleNamespace(
-        add_reaction=AsyncMock(),
-        remove_reaction=AsyncMock(),
-    )
-
-    async def handler(_event):
-        await asyncio.sleep(0)
-        return "ack"
-
-    async def hold_typing(_chat_id, interval=2.0, metadata=None):
-        await asyncio.Event().wait()
-
-    adapter.set_message_handler(handler)
-    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="999"))
-    adapter._keep_typing = hold_typing
-
+async def test_processing_lifecycle_uses_persona_and_tool_reactions(adapter):
+    raw_message = SimpleNamespace(add_reaction=AsyncMock(), remove_reaction=AsyncMock())
     event = _make_event("1", raw_message)
-    await adapter._process_message_background(event, build_session_key(event.source))
 
-    assert raw_message.add_reaction.await_args_list[0].args == ("👀",)
-    assert raw_message.remove_reaction.await_args_list[0].args == ("👀", adapter._client.user)
-    assert raw_message.add_reaction.await_args_list[1].args == ("✅",)
+    await adapter.on_processing_start(event)
+    await adapter.on_tool_call_start(event.source, "terminal")
+    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+    added = [call.args[0] for call in raw_message.add_reaction.await_args_list]
+    removed = [call.args[0] for call in raw_message.remove_reaction.await_args_list]
+    assert added[0] == "🧪"
+    assert len(added) == 3
+    assert added[1] != "🧪"
+    assert added[2] == "🧪"
+    assert removed == ["🧪", added[1]]
+    assert not adapter._rxn_active
+    assert not adapter._rxn_msg_refs
+    assert not adapter._session_raw_messages
 
 
 @pytest.mark.asyncio
-async def test_reactions_disabled_via_env(adapter, monkeypatch):
-    """When DISCORD_REACTIONS=false, no reactions should be added."""
-    monkeypatch.setenv("DISCORD_REACTIONS", "false")
+async def test_dynamic_reactions_are_independent_of_visible_progress(adapter):
+    """The runner hook remains active when no progress queue is allocated."""
+    from gateway.run_turn_runner import TurnRunner
+    from gateway.turn_context import TurnContext
 
-    raw_message = SimpleNamespace(
-        add_reaction=AsyncMock(),
-        remove_reaction=AsyncMock(),
+    raw_message = SimpleNamespace(add_reaction=AsyncMock(), remove_reaction=AsyncMock())
+    event = _make_event("2", raw_message)
+    await adapter.on_processing_start(event)
+
+    ctx = TurnContext(
+        source=event.source,
+        _run_still_current=lambda: True,
+        progress_mode="off",
+        tool_progress_enabled=False,
+        progress_queue=None,
+        _status_adapter=adapter,
+        _loop_for_step=asyncio.get_running_loop(),
     )
+    TurnRunner(SimpleNamespace(), ctx).progress_callback("tool.started", "terminal", "ls", {})
+    await asyncio.sleep(0.05)
+
+    added = [call.args[0] for call in raw_message.add_reaction.await_args_list]
+    assert len(added) == 2
+    assert added[0] == "🧪"
+    assert added[1] != "🧪"
+
+
+@pytest.mark.asyncio
+async def test_failure_reaction_is_not_success_persona(adapter):
+    raw_message = SimpleNamespace(add_reaction=AsyncMock(), remove_reaction=AsyncMock())
+    event = _make_event("3", raw_message)
+
+    await adapter.on_processing_start(event)
+    await adapter.on_processing_complete(event, ProcessingOutcome.FAILURE)
+
+    added = [call.args[0] for call in raw_message.add_reaction.await_args_list]
+    removed = [call.args[0] for call in raw_message.remove_reaction.await_args_list]
+    assert added == ["🧪", "❌"]
+    assert removed == ["🧪"]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_lifecycle_cleans_up_without_terminal_reaction(adapter):
+    raw_message = SimpleNamespace(add_reaction=AsyncMock(), remove_reaction=AsyncMock())
+    event = _make_event("4", raw_message)
+
+    await adapter.on_processing_start(event)
+    await adapter.on_tool_call_start(event.source, "terminal")
+    await adapter.on_processing_complete(event, ProcessingOutcome.CANCELLED)
+
+    added = [call.args[0] for call in raw_message.add_reaction.await_args_list]
+    removed = [call.args[0] for call in raw_message.remove_reaction.await_args_list]
+    assert len(added) == 2
+    assert removed == [added[0], added[1]]
+    assert not adapter._rxn_active
+    assert not adapter._rxn_msg_refs
+    assert not adapter._session_raw_messages
+
+
+@pytest.mark.asyncio
+async def test_reactions_disabled_still_delivers_response(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REACTIONS", "false")
+    raw_message = SimpleNamespace(add_reaction=AsyncMock(), remove_reaction=AsyncMock())
 
     async def handler(_event):
         await asyncio.sleep(0)
@@ -131,13 +197,10 @@ async def test_reactions_disabled_via_env(adapter, monkeypatch):
     adapter.set_message_handler(handler)
     adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="999"))
     adapter._keep_typing = hold_typing
+    event = _make_event("5", raw_message)
 
-    event = _make_event("4", raw_message)
     await adapter._process_message_background(event, build_session_key(event.source))
 
     raw_message.add_reaction.assert_not_awaited()
     raw_message.remove_reaction.assert_not_awaited()
-    # Response should still be sent
     adapter.send.assert_awaited_once()
-
-

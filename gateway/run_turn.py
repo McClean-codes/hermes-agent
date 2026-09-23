@@ -2994,9 +2994,16 @@ class GatewayTurnMixin:
                 logger.debug("generic status phrase selection failed: %s", _phrase_err)
                 return "still on it" if kind in {"heartbeat", "waiting", "long_running", "status"} else "one sec"
 
-        # Webhooks can't edit messages, so tool progress / log mode are off there.
+        # Webhooks can't edit messages, so tool progress / log mode are off.
         is_webhook = source.platform == Platform.WEBHOOK
         tool_progress_enabled = progress_mode not in {"off", "log"} and not is_webhook
+        # Per-tool/category filter: a positive override keeps the queue alive even when
+        # global progress is off. The callback applies exact-tool/category precedence.
+        from gateway.display_config import resolve_tool_progress_filter
+        tool_progress_filter = resolve_tool_progress_filter(user_config, platform_key)
+        if not tool_progress_enabled and tool_progress_filter and not is_webhook:
+            if any(mode != "off" for mode in tool_progress_filter.values()):
+                tool_progress_enabled = True
         # Live status for text-rendering typing indicators (Slack); independent of tool_progress.
         _live_status_mode = resolve_display_setting(user_config, platform_key, "live_status", "full")
         _live_status_adapter = (
@@ -3037,8 +3044,8 @@ class GatewayTurnMixin:
             disabled_toolsets=disabled_toolsets, resolve_display_setting=resolve_display_setting,
             progress_mode=progress_mode, progress_grouping=progress_grouping,
             _display_surface_mode=_display_surface_mode,
-            tool_progress_enabled=tool_progress_enabled, _live_status_mode=_live_status_mode,
-            _live_status_adapter=_live_status_adapter, log_mode_enabled=log_mode_enabled,
+            tool_progress_enabled=tool_progress_enabled, tool_progress_filter=tool_progress_filter,
+            _live_status_mode=_live_status_mode, _live_status_adapter=_live_status_adapter, log_mode_enabled=log_mode_enabled,
             log_queue=queue.Queue() if log_mode_enabled else None,
             interim_assistant_messages_enabled=interim_assistant_messages_enabled,
             _thinking_enabled=_thinking_enabled, _native_slack_task_cards=_native_slack_task_cards,
@@ -3049,7 +3056,7 @@ class GatewayTurnMixin:
     # _RunAgentDisplay fields copied verbatim onto the TurnContext.
     _DISPLAY_TO_TURN_CTX = (
         "_live_status_adapter", "_live_status_mode", "_thinking_enabled", "progress_mode",
-        "progress_grouping", "tool_progress_enabled", "log_queue", "resolve_display_setting",
+        "progress_grouping", "tool_progress_enabled", "tool_progress_filter", "log_queue", "resolve_display_setting",
         "user_config", "enabled_toolsets", "disabled_toolsets", "log_mode_enabled",
         "interim_assistant_messages_enabled", "needs_progress_queue", "_native_slack_task_cards",
     )

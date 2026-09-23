@@ -38,6 +38,98 @@ logger = logging.getLogger("gateway.run")
 # _load_turn_history escalates the lag line from WARNING to ERROR (#114266: 11 days of WARNING).
 _TRANSCRIPT_LAG_ESCALATION_TURNS = 3
 
+
+# ---- progress filter helpers (per-tool + category) ---------------------------
+# Filter keys are tool names or the canonical categories below. Aliases are
+# accepted for configuration ergonomics, but unknown categories never match.
+_CATEGORY_ALIASES: dict[str, str] = {
+    "skill": "skills",
+    "skills": "skills",
+    "mcp": "mcp",
+    "mcp_tools": "mcp",
+    "mcp-tools": "mcp",
+    "mcp_tool": "mcp",
+    "plugin": "plugins",
+    "plugins": "plugins",
+}
+_SKILL_TOOL_NAMES = frozenset({
+    "skill_manage", "skill_view", "skill_ledger", "skill_evaluator", "skill_usage",
+    "skills_tool", "skills_hub", "skill_manager_tool", "memory",
+})
+
+
+def _normalize_filter_key(key: str) -> str:
+    normalized = key.strip().lower()
+    return _CATEGORY_ALIASES.get(normalized, normalized)
+
+
+def _get_tool_categories(tool_name: str) -> list[str]:
+    """Return runtime categories for *tool_name* without affecting execution."""
+    if not isinstance(tool_name, str) or not tool_name.strip():
+        return []
+    name_lower = tool_name.strip().lower()
+    categories: list[str] = []
+    if name_lower.startswith("skill") or name_lower in _SKILL_TOOL_NAMES:
+        categories.append("skills")
+
+    # Registry metadata is authoritative when available. This is best effort:
+    # filtering must never make a tool unavailable or break tool execution.
+    try:
+        from tools.registry import registry
+        toolset = registry.get_toolset_for_tool(tool_name) or registry.get_toolset_for_tool(name_lower)
+        if isinstance(toolset, str) and toolset.startswith("mcp-"):
+            categories.append("mcp")
+        entry = next(
+            (item for item in registry._snapshot_entries()
+             if str(getattr(item, "name", "")).strip().lower() == name_lower),
+            None,
+        )
+        if entry is not None:
+            handler = getattr(entry, "handler", None)
+            owner = registry._plugin_owner_of(handler) if callable(handler) else None
+            module = getattr(handler, "__module__", "")
+            if (module.startswith("hermes_plugins.") or owner
+                    or toolset == "plugin" or (isinstance(toolset, str) and "plugin" in toolset)):
+                categories.append("plugins")
+    except Exception:
+        pass
+
+    # MCP discovery keeps a name→server map outside the registry. Read it only
+    # as metadata; the filter has no bearing on authorization or dispatch.
+    try:
+        import tools.mcp_tool as mcp_tool
+        names = getattr(mcp_tool, "_mcp_tool_server_names", {})
+        if isinstance(names, dict) and name_lower in {str(key).lower() for key in names}:
+            categories.append("mcp")
+    except Exception:
+        pass
+
+    return list(dict.fromkeys(categories))
+
+
+def _resolve_effective_mode(tool_name: str, global_mode: str, filter_dict: dict | None) -> str:
+    """Resolve exact tool, then category, then global progress mode."""
+    if not isinstance(filter_dict, dict) or not filter_dict:
+        return global_mode
+    normalized = {
+        str(key).strip().lower(): value
+        for key, value in filter_dict.items()
+        if isinstance(key, str)
+    }
+    name = tool_name.strip().lower() if isinstance(tool_name, str) else ""
+    if name in normalized:
+        return normalized[name]
+    for category in _get_tool_categories(tool_name):
+        canonical = _normalize_filter_key(category)
+        if canonical in normalized:
+            return normalized[canonical]
+        if category in normalized:
+            return normalized[category]
+        for alias, alias_target in _CATEGORY_ALIASES.items():
+            if alias_target == canonical and alias in normalized:
+                return normalized[alias]
+    return global_mode
+
 # Exact refusals retained for older adapters/connectors without destination preflight.
 # Substring matching would also silence transient thread-resolution errors.
 _CARD_DESTINATION_REFUSALS = {
@@ -136,6 +228,19 @@ class TurnRunner:
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             preview_str = f' "{preview}"' if preview else ""
             ctx.log_queue.put(f"{ts}  {tool_name}:{preview_str}".rstrip())
+        # Reaction lifecycle is independent from visible tool progress. In particular,
+        # a Discord adapter must still receive authorized callbacks when progress is off.
+        if event_type == "tool.started" and tool_name and ctx._run_still_current():
+            adapter = getattr(ctx, "_status_adapter", None)
+            hook_runner = getattr(adapter, "_run_processing_hook", None)
+            if callable(hook_runner):
+                try:
+                    self._schedule(
+                        hook_runner("on_tool_call_start", ctx.source, tool_name),
+                        "on_tool_call_start scheduling error",
+                    )
+                except Exception:
+                    logger.debug("on_tool_call_start scheduling failed", exc_info=True)
         if not ctx.progress_queue or not ctx._run_still_current():
             return
         if event_type == "tool.completed" and not ctx.long_tool_hint_fired[0]:
@@ -168,11 +273,19 @@ class TurnRunner:
             or self._agent_interrupted()
         ):
             return
-        # "new" mode: only report when tool changes
-        if ctx.progress_mode == "new" and tool_name == ctx.last_tool[0]:
+        # Per-tool/category filter: resolve the exact tool first, then its
+        # runtime category, then the global mode. A filtered tool is omitted
+        # from the progress rail only; execution and result delivery are elsewhere.
+        effective_mode = _resolve_effective_mode(
+            tool_name, ctx.progress_mode, getattr(ctx, "tool_progress_filter", None),
+        )
+        if effective_mode == "off":
+            return
+        # "new" mode: only report when tool changes (using the effective mode).
+        if effective_mode == "new" and tool_name == ctx.last_tool[0]:
             return
         ctx.last_tool[0] = tool_name
-        msg = self._progress_build_message(tool_name, preview, args)
+        msg = self._progress_build_message(tool_name, preview, args, _effective_mode=effective_mode)
         if msg is not None:
             self._progress_emit(msg)
 
@@ -258,8 +371,10 @@ class TurnRunner:
             cmd_short += " ..."
         return f"{header}```\n{cmd_full}\n```", f"{header}```\n{cmd_short}\n```"
 
-    def _progress_build_message(self, tool_name, preview, args) -> Optional[str]:
-        """Render the progress line. Verbose mode queues directly (no dedup) and returns None."""
+    def _progress_build_message(
+        self, tool_name, preview, args, _effective_mode: str | None = None,
+    ) -> Optional[str]:
+        """Render progress using the per-tool effective mode."""
         ctx = self._ctx
         from agent.display import get_tool_emoji
         emoji = get_tool_emoji(tool_name, default="⚙️")
@@ -268,7 +383,11 @@ class TurnRunner:
         except Exception:
             adapter = None
         code_full, code_short = self._progress_terminal_blocks(adapter, tool_name, args, emoji)
-        verbose = ctx.progress_mode == "verbose"
+        if _effective_mode is None:
+            _effective_mode = _resolve_effective_mode(
+                tool_name, ctx.progress_mode, getattr(ctx, "tool_progress_filter", None),
+            )
+        verbose = _effective_mode == "verbose"
         code = code_full if verbose else code_short
         ctx.last_was_terminal_block[0] = code is not None
         if verbose:

@@ -263,6 +263,7 @@ from gateway.platforms.helpers import (
 from gateway.platforms.helpers import cancel_task
 from utils import atomic_json_write, env_float
 from gateway.platforms.base_exec_approval import EA_HEADER_TEXT, EA_REASON_LABEL_TEXT
+from gateway.platforms.reaction_mixin import DynamicReactionMixin
 from gateway.platforms.base import (
     BasePlatformAdapter, ExecApprovalPrompt, SendResult, unauthorized_action_notice,
     cache_image_from_url, cache_image_from_bytes_async, cache_audio_from_url, cache_audio_from_bytes_async,
@@ -1000,7 +1001,7 @@ def _read_discord_prompt_timeout() -> int:
 from plugins.platforms.discord.adapter_media import DiscordMediaMixin
 
 
-class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
+class DiscordAdapter(DynamicReactionMixin, DiscordMediaMixin, BasePlatformAdapter):
     """Discord bot adapter: guild/DM messages, threads, slash commands, button approvals, reactions."""
 
     MAX_MESSAGE_LENGTH = 2000
@@ -1122,6 +1123,10 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         # Telegram #58563 fix.
         self._last_overflow_preview: Dict[tuple, str] = {}
         self._warned_fail_closed_default = False
+        # Raw Discord messages are absent from SessionSource callbacks. Keep one
+        # live reference per session while the turn runs so tool hooks can react.
+        self._session_raw_messages: Dict[str, Any] = {}
+        self._init_reaction_mixin()
 
     def _config_value(self, key: str, default: Any, *, env_key: Optional[str] = None) -> Any:
         """Resolve a liveness value from profile config, legacy env, or default."""
@@ -2934,26 +2939,55 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         """Reactions enabled via ``extra.reactions`` (YAML, per profile) or ``DISCORD_REACTIONS``."""
         return self._extra_or_env_flag("reactions", "DISCORD_REACTIONS", "true", truthy=False)
 
+    def _session_key_from_source(self, source) -> str:
+        """Derive a stable key from either ``MessageEvent`` or ``SessionSource``."""
+        if hasattr(source, "source") and source.source is not None:
+            source = source.source
+        platform = getattr(source, "platform", "")
+        platform = getattr(platform, "value", platform)
+        return f"{platform}:{source.chat_id}:{source.thread_id or ''}"
+
+    async def _reaction_add(self, msg_ref, emoji):
+        """Add an emoji reaction through the Discord adapter primitive."""
+        return await self._add_reaction(msg_ref, emoji)
+
+    async def _reaction_remove(self, msg_ref, emoji):
+        """Remove the bot's own emoji reaction through the adapter primitive."""
+        return await self._remove_reaction(msg_ref, emoji)
+
+    def _reaction_resolve_message(self, event):
+        """Resolve the raw Discord message from an event or the live session cache."""
+        raw = getattr(event, "raw_message", None)
+        if raw is not None and hasattr(raw, "add_reaction"):
+            return raw
+        source = getattr(event, "source", event)
+        return self._session_raw_messages.get(self._session_key_from_source(source))
+
+    def _reaction_msg_key(self, event):
+        """Return the stable session key used to serialize reaction swaps."""
+        source = getattr(event, "source", event)
+        return self._session_key_from_source(source)
+
     async def on_processing_start(self, event: MessageEvent) -> None:
-        """Add an in-progress reaction and record durable handling state."""
-        message = event.raw_message
-        acked = False
-        if self._reactions_enabled() and hasattr(message, "add_reaction"):
-            acked = await self._add_reaction(message, "👀")
+        """Add persona emoji, cache the raw message, and record recovery state."""
+        source = getattr(event, "source", event)
+        key = self._session_key_from_source(source)
+        raw = getattr(event, "raw_message", None)
+        if raw is not None:
+            self._session_raw_messages[key] = raw
+        acked = await self._rxn_on_processing_start(event)
         await asyncio.to_thread(self._record_discord_processing_start, event, emoji_ack=acked)
 
+    async def on_tool_call_start(self, event, tool_name: str) -> None:
+        """Swap the active reaction to the current tool's emoji."""
+        await self._rxn_on_tool_call_start(event, tool_name)
+
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
-        """Swap the in-progress reaction for final reaction and durable state."""
+        """Swap the active reaction for the final reaction and close recovery state."""
         await asyncio.to_thread(self._record_discord_processing_complete, event, outcome)
-        if not self._reactions_enabled():
-            return
-        message = event.raw_message
-        if hasattr(message, "add_reaction"):
-            await self._remove_reaction(message, "👀")
-            if outcome == ProcessingOutcome.SUCCESS:
-                await self._add_reaction(message, "✅")
-            elif outcome == ProcessingOutcome.FAILURE:
-                await self._add_reaction(message, "❌")
+        await self._rxn_on_processing_complete(event, outcome)
+        source = getattr(event, "source", event)
+        self._session_raw_messages.pop(self._session_key_from_source(source), None)
 
     @staticmethod
     def _message_reference_from_ids(message_id, channel) -> "discord.MessageReference":
