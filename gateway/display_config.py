@@ -187,7 +187,11 @@ def _norm_int(value: Any) -> int:
 
 
 # ``tool_progress_filter`` accepts tool names/categories as keys and the same
-# modes as ``tool_progress`` as values. A list is an allowlist shorthand.
+# modes as ``tool_progress`` as values. A list is an allowlist shorthand
+# (every listed key → ``all``). Sink semantics, resolved BEFORE each output
+# sink in ``gateway.run_turn_runner``: ``off`` is silent everywhere (no chat,
+# no tool_calls.log line, no live-status preview); ``log`` is file-only; the
+# chat modes (``all``/``new``/``verbose``) render on the progress rail only.
 _FILTER_VALID_MODES = {"off", "new", "all", "verbose", "log"}
 
 

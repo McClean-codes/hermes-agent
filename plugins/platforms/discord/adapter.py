@@ -263,7 +263,7 @@ from gateway.platforms.helpers import (
 from gateway.platforms.helpers import cancel_task
 from utils import atomic_json_write, env_float
 from gateway.platforms.base_exec_approval import EA_HEADER_TEXT, EA_REASON_LABEL_TEXT
-from gateway.platforms.reaction_mixin import DynamicReactionMixin
+from gateway.platforms.reaction_mixin import DynamicReactionMixin, TurnReactionEvent
 from gateway.platforms.base import (
     BasePlatformAdapter, ExecApprovalPrompt, SendResult, unauthorized_action_notice,
     cache_image_from_url, cache_image_from_bytes_async, cache_audio_from_url, cache_audio_from_bytes_async,
@@ -1123,8 +1123,10 @@ class DiscordAdapter(DynamicReactionMixin, DiscordMediaMixin, BasePlatformAdapte
         # Telegram #58563 fix.
         self._last_overflow_preview: Dict[tuple, str] = {}
         self._warned_fail_closed_default = False
-        # Raw Discord messages are absent from SessionSource callbacks. Keep one
-        # live reference per session while the turn runs so tool hooks can react.
+        # Raw Discord messages are absent from SessionSource callbacks. Keep one live
+        # reference per MESSAGE (chat base + message id) while the turn runs so tool
+        # hooks can react; per-message keys keep concurrent sessions in one channel
+        # from overwriting each other's target.
         self._session_raw_messages: Dict[str, Any] = {}
         self._init_reaction_mixin()
 
@@ -2940,54 +2942,72 @@ class DiscordAdapter(DynamicReactionMixin, DiscordMediaMixin, BasePlatformAdapte
         return self._extra_or_env_flag("reactions", "DISCORD_REACTIONS", "true", truthy=False)
 
     def _session_key_from_source(self, source) -> str:
-        """Derive a stable key from either ``MessageEvent`` or ``SessionSource``."""
+        """Derive the chat-level base key from either ``MessageEvent`` or ``SessionSource``."""
         if hasattr(source, "source") and source.source is not None:
             source = source.source
         platform = getattr(source, "platform", "")
         platform = getattr(platform, "value", platform)
         return f"{platform}:{source.chat_id}:{source.thread_id or ''}"
 
+    @staticmethod
+    def _event_message_identity(event) -> Optional[str]:
+        """Stable per-message id carried by *event*: its own ``message_id`` first (the
+        ``MessageEvent`` that opened the turn), else the source's triggering-message id."""
+        message_id = getattr(event, "message_id", None)
+        if not message_id:
+            source = getattr(event, "source", event)
+            message_id = getattr(source, "message_id", None)
+        return str(message_id) if message_id else None
+
     async def _reaction_add(self, msg_ref, emoji):
         """Add an emoji reaction through the Discord adapter primitive."""
         return await self._add_reaction(msg_ref, emoji)
 
     async def _reaction_remove(self, msg_ref, emoji):
-        """Remove the bot's own emoji reaction through the adapter primitive."""
+        """Remove the bot's own emoji reaction through the Discord adapter primitive."""
         return await self._remove_reaction(msg_ref, emoji)
 
     def _reaction_resolve_message(self, event):
-        """Resolve the raw Discord message from an event or the live session cache."""
+        """Resolve the raw Discord message from an event or the live per-message cache."""
         raw = getattr(event, "raw_message", None)
         if raw is not None and hasattr(raw, "add_reaction"):
             return raw
-        source = getattr(event, "source", event)
-        return self._session_raw_messages.get(self._session_key_from_source(source))
+        return self._session_raw_messages.get(self._reaction_msg_key(event))
 
     def _reaction_msg_key(self, event):
-        """Return the stable session key used to serialize reaction swaps."""
-        source = getattr(event, "source", event)
-        return self._session_key_from_source(source)
+        """Per-MESSAGE reaction state key: chat/session base + the turn's message id.
+
+        Two users (or two messages) processed concurrently in one group channel are
+        distinct keys, so neither turn's raw-message cache, active reaction, cooldown
+        nor lock entries can overwrite or clear the other's. Falls back to the bare
+        chat-level key only when the event carries no message identity at all.
+        """
+        base = self._session_key_from_source(getattr(event, "source", event))
+        message_id = self._event_message_identity(event)
+        return f"{base}:{message_id}" if message_id else base
 
     async def on_processing_start(self, event: MessageEvent) -> None:
-        """Add persona emoji, cache the raw message, and record recovery state."""
-        source = getattr(event, "source", event)
-        key = self._session_key_from_source(source)
+        """Add persona emoji, cache the raw message per message, and record recovery state."""
         raw = getattr(event, "raw_message", None)
         if raw is not None:
-            self._session_raw_messages[key] = raw
+            self._session_raw_messages[self._reaction_msg_key(event)] = raw
         acked = await self._rxn_on_processing_start(event)
         await asyncio.to_thread(self._record_discord_processing_start, event, emoji_ack=acked)
 
-    async def on_tool_call_start(self, event, tool_name: str) -> None:
-        """Swap the active reaction to the current tool's emoji."""
+    async def on_tool_call_start(self, event, tool_name: str, *, turn_identity: Optional[str] = None) -> None:
+        """Swap the active reaction to the current tool's emoji, keyed to THIS turn's message."""
+        if turn_identity and str(getattr(event, "message_id", "") or "") != str(turn_identity):
+            # The runner passes the turn's SessionSource; re-key onto a message-carrying
+            # view so tool swaps, start/complete hooks and the raw-message cache all
+            # resolve the same per-message key.
+            event = TurnReactionEvent(source=getattr(event, "source", event), message_id=str(turn_identity))
         await self._rxn_on_tool_call_start(event, tool_name)
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Swap the active reaction for the final reaction and close recovery state."""
         await asyncio.to_thread(self._record_discord_processing_complete, event, outcome)
         await self._rxn_on_processing_complete(event, outcome)
-        source = getattr(event, "source", event)
-        self._session_raw_messages.pop(self._session_key_from_source(source), None)
+        self._session_raw_messages.pop(self._reaction_msg_key(event), None)
 
     @staticmethod
     def _message_reference_from_ids(message_id, channel) -> "discord.MessageReference":

@@ -2155,8 +2155,8 @@ This controls both the `text_to_speech` tool and spoken replies in voice mode (`
 
 ```yaml
 display:
-  tool_progress: all      # off | new | all | verbose
-  tool_progress_filter: {} # Per-tool/category overrides; exact tool wins over skills/mcp/plugins
+  tool_progress: all      # off | new | all | verbose | log
+  tool_progress_filter: {} # Per-tool/category overrides (off|log|all|new|verbose); exact tool wins over skills/mcp/plugins
   tool_progress_command: false  # Enable /verbose slash command in messaging gateway
   focus_view: false       # CLI focus view (/focus) — reduced output, display-only
   platforms: {}           # Per-platform display overrides (see below)
@@ -2271,8 +2271,19 @@ display:
 | `new` | Tool indicator only when the tool changes |
 | `all` | Every tool call with a short preview (default) |
 | `verbose` | Full args, results, and debug logs |
+| `log` | Nothing in chat — tool lines go to `~/.hermes/logs/tool_calls.log` instead |
 
 `display.tool_progress_filter` overrides the global mode for selected tool names or categories. For example, `{"terminal": "off", "skills": "all"}` hides terminal updates while allowing skill tools, even when the global mode is `off`. An entry in `display.platforms.<platform>.tool_progress_filter` merges over the global map; exact tool names take precedence over category entries, then the global mode is used. `skills`, `mcp`, and `plugins` are recognized categories when runtime metadata identifies the tool. Filtered progress is display-only: tool execution, errors, results, final replies, and delivery are unchanged.
+
+The effective per-tool mode is resolved **before every output sink** — the `tool_calls.log` file line, the chat progress rail, and the live-status typing preview — so each mode means exactly one place:
+
+- `off` — that tool produces no progress output anywhere: no chat line, no file-log line, no live-status preview.
+- `log` — that tool's progress goes only to `~/.hermes/logs/tool_calls.log`, never to chat or the live-status preview. The log sink is allocated whenever the global mode is `log` **or** any filter entry is `log`.
+- `all` / `new` / `verbose` — normal chat rendering. A positive entry also keeps the chat rail alive when the global mode is `off` or `log`, but only for the tools it matches: unmatched tools keep the global mode, so a global `log` stays file-only for them.
+
+The filter governs output sinks only — it is **not** a confidentiality boundary for Discord dynamic reactions (see the Discord section): while a message is processing, reaction emojis may independently disclose which tool is running.
+
+Dynamic reactions aside, the filter never changes what the agent can call or return; it only decides where progress about a call is rendered.
 
 In the CLI, cycle through these modes with `/verbose`. To use `/verbose` in messaging platforms (Telegram, Discord, Slack, etc.), set `tool_progress_command: true` in the `display` section above. The command will then cycle the mode and save to config.
 
@@ -2786,7 +2797,7 @@ discord:
   auto_thread: true              # Auto-create threads on @mention in channels
   free_response_auto_thread: false  # Free-response channels also auto-thread (default: reply inline)
   persona_emoji: ""              # Processing and successful-completion reaction (default: 👀)
-  dynamic_reactions: true        # Swap the reaction to the current tool while processing
+  dynamic_reactions: true        # Swap the reaction to the current tool while processing (tool identity/category only; independent of tool_progress_filter)
 ```
 
 - `require_mention` — when `true` (default), the bot only responds in server channels when mentioned with `@BotName`. DMs always work without mention.
@@ -2794,7 +2805,7 @@ discord:
 - `auto_thread` — when `true` (default), mentions in channels automatically create a thread for the conversation, keeping channels clean (similar to Slack threading).
 - `free_response_auto_thread` — when `true`, channels in `free_response_channels` also auto-create a thread per top-level message. Default `false`: free-response channels reply inline. Requires `auto_thread: true`.
 - `persona_emoji` — optional per-platform override for the processing acknowledgment and successful-completion reaction. The global default is `👀` when this value is empty.
-- `dynamic_reactions` — when `true` (default), the acknowledgment reaction changes to the current tool's emoji during processing. It is independent of `display.tool_progress` and does not reveal tool arguments.
+- `dynamic_reactions` — when `true` (default), the acknowledgment reaction changes to the current tool's emoji during processing. **Independent disclosure:** reactions are not governed by `display.tool_progress` or `display.tool_progress_filter` — while a message is processing, anyone who can see the message's reactions can see which tool (by emoji identity/category) is running, regardless of the progress mode or filter. Reactions never include tool arguments or previews, and reaction state is tracked per message, so concurrently processed messages in one channel never affect each other's reactions. Set `dynamic_reactions: false` (or `reactions: false`) to turn reaction disclosure off entirely.
 
 ## Security
 

@@ -221,22 +221,47 @@ class TurnRunner:
         if event_type == "subagent.complete":
             self._progress_subagent_notice(preview, kwargs)
             return
-        self._progress_live_status(event_type, tool_name, args)
+        # Resolve the effective per-tool mode BEFORE any output sink (file log, chat rail,
+        # live-status preview). Every sink consults this one resolution: `log` is file-only,
+        # `off` is silent everywhere, and a positive filter entry never widens what the
+        # global mode emits for unmatched tools.
+        effective_mode: Optional[str] = None
+        if event_type == "tool.started" and tool_name != "_thinking":
+            effective_mode = _resolve_effective_mode(
+                tool_name, ctx.progress_mode, getattr(ctx, "tool_progress_filter", None),
+            )
+        self._progress_live_status(event_type, tool_name, args, effective_mode=effective_mode)
         # "log" mode: append tool.started lines to the log queue, silent in chat. Handled before
-        # the progress_queue guard because log mode runs without a chat progress queue.
-        if ctx.log_queue is not None and event_type == "tool.started" and tool_name and tool_name != "_thinking":
+        # the progress_queue guard because log mode runs without a chat progress queue. A
+        # per-tool `off` suppresses even this file line — off is silent on every sink.
+        if (
+            ctx.log_queue is not None and event_type == "tool.started" and tool_name
+            and tool_name != "_thinking" and effective_mode != "off"
+        ):
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             preview_str = f' "{preview}"' if preview else ""
             ctx.log_queue.put(f"{ts}  {tool_name}:{preview_str}".rstrip())
         # Reaction lifecycle is independent from visible tool progress. In particular,
         # a Discord adapter must still receive authorized callbacks when progress is off.
+        # Dynamic reactions may disclose tool identity/category (never arguments or
+        # previews) regardless of the progress filter — documented in the Discord config
+        # docs; this filter controls output sinks only, not reactions.
         if event_type == "tool.started" and tool_name and ctx._run_still_current():
             adapter = getattr(ctx, "_status_adapter", None)
             hook_runner = getattr(adapter, "_run_processing_hook", None)
             if callable(hook_runner):
                 try:
+                    # Bind the hook to THIS turn's message so per-message reaction,
+                    # raw-message, cache and lock state cannot collide across
+                    # concurrently processed sessions in one chat. Adapters without the
+                    # keyword keep the legacy call shape (guarded, never force-fed).
+                    hook_kwargs = {}
+                    turn_identity = getattr(ctx, "turn_identity", None)
+                    hook = getattr(adapter, "on_tool_call_start", None)
+                    if turn_identity and callable(hook) and _accepts_keyword(hook, "turn_identity"):
+                        hook_kwargs["turn_identity"] = str(turn_identity)
                     self._schedule(
-                        hook_runner("on_tool_call_start", ctx.source, tool_name),
+                        hook_runner("on_tool_call_start", ctx.source, tool_name, **hook_kwargs),
                         "on_tool_call_start scheduling error",
                     )
                 except Exception:
@@ -273,13 +298,10 @@ class TurnRunner:
             or self._agent_interrupted()
         ):
             return
-        # Per-tool/category filter: resolve the exact tool first, then its
-        # runtime category, then the global mode. A filtered tool is omitted
-        # from the progress rail only; execution and result delivery are elsewhere.
-        effective_mode = _resolve_effective_mode(
-            tool_name, ctx.progress_mode, getattr(ctx, "tool_progress_filter", None),
-        )
-        if effective_mode == "off":
+        # Per-tool/category filter, resolved above before every sink: a filtered tool is
+        # omitted from the progress rail only; execution and result delivery are elsewhere.
+        # `off` is silent on every sink; `log` already went to the file sink only.
+        if effective_mode in ("off", "log"):
             return
         # "new" mode: only report when tool changes (using the effective mode).
         if effective_mode == "new" and tool_name == ctx.last_tool[0]:
@@ -307,15 +329,25 @@ class TurnRunner:
         except Exception:
             logger.debug("subagent failure notice failed", exc_info=True)
 
-    def _progress_live_status(self, event_type: str, tool_name, args) -> None:
+    def _progress_live_status(self, event_type: str, tool_name, args, effective_mode: Optional[str] = None) -> None:
         """Live status line (Slack assistant status): stash the tool phrase on the adapter; the
-        _keep_typing refresh renders it. Plain dict write, safe from the sync worker thread."""
+        _keep_typing refresh renders it. Plain dict write, safe from the sync worker thread.
+
+        ``effective_mode`` gates this sink exactly like the file log and the chat rail
+        (resolved by the caller BEFORE any sink): a per-tool ``off`` or ``log`` tool must
+        not disclose its identity or arguments through the status preview.
+        """
         ctx = self._ctx
         adapter = ctx._live_status_adapter
         if adapter is None or ctx._live_status_mode == "off" or tool_name == "_thinking":
             return
         try:
             if event_type == "tool.started" and tool_name and ctx._run_still_current():
+                if effective_mode in ("off", "log"):
+                    # No phrase and no args: emit nothing for a tool the operator routed
+                    # away from every visible sink (a stale prior phrase is harmless; a
+                    # preview of THIS tool would leak through the status surface).
+                    return
                 from agent.display import build_status_phrase
                 adapter.set_status_text(ctx.source.chat_id, build_status_phrase(tool_name, args if ctx._live_status_mode == "full" else None))
             elif event_type == "tool.completed":

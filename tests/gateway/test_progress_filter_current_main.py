@@ -21,17 +21,24 @@ def _make_ctx(
     tool_progress_filter: dict | None = None,
     tool_progress_enabled: bool | None = None,
     with_queue: bool = True,
+    log: bool = False,
+    live_status: bool = False,
 ) -> TurnContext:
     if tool_progress_enabled is None:
         tool_progress_enabled = progress_mode not in {"off", "log"}
-    return TurnContext(
+    ctx = TurnContext(
         source=SimpleNamespace(chat_id="test-chat"),
         _run_still_current=lambda: True,
         progress_mode=progress_mode,
         tool_progress_enabled=tool_progress_enabled,
         tool_progress_filter=tool_progress_filter,
         progress_queue=queue.Queue() if with_queue else None,
+        log_queue=queue.Queue() if log else None,
     )
+    if live_status:
+        ctx._live_status_adapter = SimpleNamespace(set_status_text=MagicMock())
+        ctx._live_status_mode = "full"
+    return ctx
 
 
 def _make_runner(ctx: TurnContext) -> TurnRunner:
@@ -197,6 +204,76 @@ class TestTurnRunnerProgressSeam:
         assert ctx.tool_progress_enabled is True
 
 
+class TestPerToolModeBeforeEverySink:
+    """Regression: the effective per-tool mode is resolved BEFORE every output sink —
+    file log, chat rail, and live-status preview (review findings Raven P1, Ada
+    SEC-2/SEC-3). `log` is file-only; `off` is silent on every sink."""
+
+    def test_global_log_with_chat_filter_keeps_unmatched_tools_file_only(self):
+        # Global `log` + `terminal: all`: the matched tool renders in chat, but an
+        # unmatched read_file must stay file-only — no chat line, no status preview.
+        ctx = _make_ctx(
+            progress_mode="log",
+            tool_progress_enabled=True,
+            tool_progress_filter={"terminal": "all"},
+            log=True,
+            live_status=True,
+        )
+        runner = _make_runner(ctx)
+
+        runner.progress_callback("tool.started", "read_file", "README", {"path": "/x/README.md"})
+        assert _drain(ctx.progress_queue) == []                      # no chat leak
+        assert any("read_file" in line for line in _drain(ctx.log_queue))  # file-only
+        ctx._live_status_adapter.set_status_text.assert_not_called()  # no status preview
+
+        runner.progress_callback("tool.started", "terminal", "ls", {"command": "ls -la"})
+        chat = _drain(ctx.progress_queue)
+        assert chat and "ls" in str(chat[0])                          # matched tool renders
+        assert ctx._live_status_adapter.set_status_text.call_count == 1
+
+    def test_per_tool_log_never_reaches_chat_or_status_under_global_all(self):
+        # Global `all` + `terminal: log`: the tool line goes to the file sink only —
+        # no chat bubble and no live-status preview (which would carry the args).
+        ctx = _make_ctx(
+            progress_mode="all",
+            tool_progress_filter={"terminal": "log"},
+            log=True,
+            live_status=True,
+        )
+        runner = _make_runner(ctx)
+
+        runner.progress_callback("tool.started", "terminal", "ls", {"command": "ls -la /secret"})
+
+        assert _drain(ctx.progress_queue) == []
+        ctx._live_status_adapter.set_status_text.assert_not_called()
+        logged = _drain(ctx.log_queue)
+        assert any("terminal" in line for line in logged)            # routed to file sink
+        assert not any("/secret" in str(v) for v in logged)          # args never escape
+        assert not any("/secret" in str(v) for v in ctx._live_status_adapter.set_status_text.call_args_list)
+
+    def test_per_tool_off_suppresses_log_chat_and_status_under_global_log(self):
+        # Global `log` + `terminal: off`: zero output of any kind for terminal, while
+        # unmatched tools keep global log semantics (file-only).
+        ctx = _make_ctx(
+            progress_mode="log",
+            tool_progress_enabled=False,
+            tool_progress_filter={"terminal": "off"},
+            log=True,
+            live_status=True,
+        )
+        runner = _make_runner(ctx)
+
+        runner.progress_callback("tool.started", "terminal", "ls", {"command": "ls -la"})
+        assert _drain(ctx.progress_queue) == []
+        assert _drain(ctx.log_queue) == []
+        ctx._live_status_adapter.set_status_text.assert_not_called()
+
+        runner.progress_callback("tool.started", "read_file", "README", {"path": "README.md"})
+        assert _drain(ctx.progress_queue) == []
+        assert any("read_file" in line for line in _drain(ctx.log_queue))
+        ctx._live_status_adapter.set_status_text.assert_not_called()
+
+
 class TestDisplayResolutionProductionWiring:
     def test_runner_display_resolution_allocates_queue_for_positive_filter(self, monkeypatch):
         """Exercise GatewayTurnMixin's real display-resolution seam."""
@@ -243,3 +320,64 @@ class TestDisplayResolutionProductionWiring:
 
         assert display.tool_progress_enabled is False
         assert display.needs_progress_queue is False
+
+    @staticmethod
+    def _display_for(config, monkeypatch):
+        import gateway.run as run_module
+        from gateway.run import GatewayRunner
+        from gateway.session import SessionSource
+
+        monkeypatch.setattr(run_module, "_load_gateway_config", lambda: config)
+        runner = object.__new__(GatewayRunner)
+        runner._resolve_turn_toolsets = lambda *_args: ([], [])
+        runner._adapter_for_source = lambda _source: SimpleNamespace(supports_status_text=False)
+        source = SessionSource(platform=Platform.DISCORD, chat_id="chat", user_id="user", chat_type="dm")
+        return runner._run_agent_display_settings(source)
+
+    def test_chat_filter_entry_allocates_queue_but_log_and_off_entries_do_not(self, monkeypatch):
+        """A positive filter keeps the chat rail alive over global off/log ONLY for
+        chat-mode entries — `log`/`off` entries must never turn global `log` into
+        chat output, and any `log` entry allocates the file sink."""
+        # global log + chat-mode entry: chat rail on, file sink on, queue allocated.
+        d = self._display_for(
+            {"display": {"tool_progress": "log", "tool_progress_filter": {"terminal": "all"}}},
+            monkeypatch,
+        )
+        assert d.tool_progress_enabled is True
+        assert d.needs_progress_queue is True
+        assert d.log_mode_enabled is True and d.log_queue is not None
+
+        # global log + off entry: NO chat queue at all (nothing may render), file sink on.
+        d = self._display_for(
+            {"display": {"tool_progress": "log", "tool_progress_filter": {"terminal": "off"}}},
+            monkeypatch,
+        )
+        assert d.tool_progress_enabled is False
+        assert d.needs_progress_queue is False
+        assert d.log_mode_enabled is True and d.log_queue is not None
+
+        # global all + per-tool log: the file sink exists for the per-tool log entry.
+        d = self._display_for(
+            {"display": {"tool_progress": "all", "tool_progress_filter": {"terminal": "log"}}},
+            monkeypatch,
+        )
+        assert d.tool_progress_enabled is True
+        assert d.log_mode_enabled is True and d.log_queue is not None
+
+        # global off + only a log entry: no chat queue, file sink allocated.
+        d = self._display_for(
+            {"display": {"tool_progress": "off", "tool_progress_filter": {"read_file": "log"}}},
+            monkeypatch,
+        )
+        assert d.tool_progress_enabled is False
+        assert d.needs_progress_queue is False
+        assert d.log_mode_enabled is True and d.log_queue is not None
+
+        # global off + only an off entry: nothing allocated anywhere.
+        d = self._display_for(
+            {"display": {"tool_progress": "off", "tool_progress_filter": {"terminal": "off"}}},
+            monkeypatch,
+        )
+        assert d.tool_progress_enabled is False
+        assert d.needs_progress_queue is False
+        assert d.log_mode_enabled is False and d.log_queue is None

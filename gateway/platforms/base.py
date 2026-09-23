@@ -3445,11 +3445,19 @@ class BasePlatformAdapter(ABC):
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Hook called when background processing begins."""
 
-    async def on_tool_call_start(self, event: MessageEvent, tool_name: str) -> None:
+    async def on_tool_call_start(
+        self, event: MessageEvent, tool_name: str, *, turn_identity: Optional[str] = None,
+    ) -> None:
         """Hook called when a tool call begins during message processing.
 
         Adapters may use this for per-tool lifecycle indicators. The runner
-        invokes it before the visible progress queue is filtered.
+        invokes it before the visible progress queue is filtered, passing
+        ``turn_identity`` (the turn's raw inbound message id) so per-message
+        state — reactions, raw-message caches, locks — keys to THIS message
+        and never collides across concurrently processed sessions in one
+        chat. ``event`` may be the turn's ``SessionSource`` rather than a
+        full ``MessageEvent``; adapters without this keyword keep the legacy
+        call shape.
         """
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:

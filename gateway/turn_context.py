@@ -26,6 +26,11 @@ class TurnContext:
     progress_grouping: str = "grouped"
     tool_progress_enabled: bool = False
     tool_progress_filter: Optional[dict] = None
+    # Stable per-message/turn identity (the RAW inbound message id, never the reply
+    # anchor — that may name another message). Lifecycle hooks key reaction,
+    # raw-message, cache and lock state to it so concurrent sessions processed in one
+    # chat can never overwrite each other's state.
+    turn_identity: Optional[str] = None
     progress_queue: Any = None
     log_queue: Any = None
     # mutable single-element containers (shared with the outer body)
