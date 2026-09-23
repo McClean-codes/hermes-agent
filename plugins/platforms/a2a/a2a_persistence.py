@@ -8,6 +8,7 @@ module-level functions consumed by both the adapter class and the
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -17,7 +18,7 @@ import threading
 import time
 import urllib.parse
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +107,129 @@ def _durable_task_snapshot(
             "push_config_id": record.get("push_config_id", ""),
         }
     return snapshot
+
+
+# ── Durable terminal tombstones ─────────────────────────────────────────
+# Bounded terminal retention evicts a terminal row from the ledger window.
+# Without durable evidence of that eviction, eviction is indistinguishable
+# from "never existed", so a stale second TaskStore can re-add its stale
+# WORKING copy during merge and settle the task again with a different
+# reply, repeating terminal side effects (PR #92494 review 5252598219,
+# blocker 2).  A tombstone records the terminal fact out-of-band so the
+# merge contract can tell terminal eviction apart from a genuinely new
+# task: an id with a tombstone may only re-publish its identical terminal
+# fact (idempotent, no side effects) and can never return to a live state
+# or complete with a divergent reply.  The sidecar is bounded
+# (_MAX_TOMBSTONES, 4x the terminal window): the reply BODY is never
+# stored, only its sha256 fingerprint, which detects divergence exactly
+# while keeping the file small.  The caller must hold the ledger lock.
+_TOMBSTONES_SUFFIX = ".tombstones.json"
+_MAX_TOMBSTONES = 2000
+
+
+def _tombstone_path_for(ledger_path: Path) -> Path:
+    """Sidecar holding eviction tombstones for *ledger_path* (same directory)."""
+    return ledger_path.with_name(ledger_path.stem + _TOMBSTONES_SUFFIX)
+
+
+def _task_tombstones_path() -> Path:
+    return _tombstone_path_for(_task_ledger_path())
+
+
+def _reply_fingerprint(reply: Any) -> str:
+    """Stable fingerprint of a reply body for tombstone divergence checks."""
+    text = reply if isinstance(reply, str) else str(reply)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _tombstone_entry(task_id: str, record: dict) -> dict:
+    """Compact durable evidence that *record* was terminal when evicted."""
+    return {
+        "task_id": record.get("task_id", task_id),
+        "state": record.get("state", ""),
+        "reply_sha256": _reply_fingerprint(record.get("reply", "")),
+        "context_id": record.get("context_id", ""),
+        "peer": record.get("peer", ""),
+        "agent_slug": record.get("agent_slug", ""),
+        "tenant": record.get("tenant", ""),
+        "created_at": record.get("created_at", 0),
+        "created_iso": record.get("created_iso", ""),
+        "completed_at": record.get("completed_at"),
+    }
+
+
+def _load_tombstones(path: Path) -> "tuple[dict, Optional[str]]":
+    """Load the tombstone sidecar; returns ``(tombstones, error)``.
+
+    A missing file means "nothing evicted yet" -> ``({}, None)``.  A present
+    but unreadable sidecar fails closed with an error: silently forgetting
+    tombstones would reopen the resurrection hole.
+    """
+    if not path.exists():
+        return {}, None
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            loaded = json.load(fh)
+    except Exception as exc:  # noqa: BLE001 — fail closed on any read/parse error
+        return {}, f"tombstone store unreadable: {exc}"
+    if not isinstance(loaded, dict):
+        return {}, "tombstone store not a dict"
+    return {tid: rec for tid, rec in loaded.items() if isinstance(rec, dict)}, None
+
+
+def _evicted_terminal_tombstones(merged, snapshot, terminal_states) -> dict:
+    """Tombstones for terminal records present in *merged* but evicted from *snapshot*."""
+    evicted: dict = {}
+    for task_id, record in merged.items():
+        if record.get("state", "") in terminal_states and task_id not in snapshot:
+            evicted[task_id] = _tombstone_entry(task_id, record)
+    return evicted
+
+
+def _write_tombstones(path: Path, tombstones: dict, *,
+                      max_tombstones: int = _MAX_TOMBSTONES) -> None:
+    """Atomically persist *tombstones*, keeping the newest ``max_tombstones``
+    by completion time then insertion order (mirrors the ledger retention
+    rule).  Unique temp file, 0o600, fsync, atomic replace."""
+    ranked: list = []
+    for index, (task_id, entry) in enumerate(tombstones.items()):
+        timestamp = entry.get("completed_at")
+        try:
+            sortable_timestamp = float(timestamp)
+        except (TypeError, ValueError):
+            sortable_timestamp = 0.0
+        ranked.append((sortable_timestamp, index, task_id))
+    ranked.sort()
+    kept = {task_id for _ts, _idx, task_id in ranked[-max_tombstones:]}
+    bounded = {tid: rec for tid, rec in tombstones.items() if tid in kept}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+    try:
+        try:
+            os.fchmod(tmp_fd, 0o600)
+        except Exception:
+            pass
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as fh:
+            tmp_fd = None
+            json.dump(bounded, fh, ensure_ascii=False, indent=2)
+            fh.flush()
+            os.fsync(fh.fileno())
+        try:
+            os.chmod(tmp_path, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp_path, str(path))
+    except BaseException:
+        if tmp_fd is not None:
+            try:
+                os.close(tmp_fd)
+            except OSError:
+                pass
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 # ── File locking ────────────────────────────────────────────────────────

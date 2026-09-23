@@ -14,7 +14,7 @@ import logging
 import time
 import urllib.request
 from concurrent.futures import TimeoutError as FuturesTimeout
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from gateway.platforms.base import MessageEvent, ProcessingOutcome
 from . import protocol, security
@@ -95,12 +95,20 @@ class TaskRPCHandler:
             "created_iso": rec.get("created_iso", ""),
             "started": rec.get("created_at", time.time()),
         }
+        def _resolve_waiter(published_state: str, published_reply: str) -> None:
+            if not future.done():
+                try:
+                    future.set_result((published_state, published_reply))
+                except Exception:
+                    pass
+
         try:
             state, reply = self._finalize_task(
                 pending,
                 protocol.STATE_COMPLETED,
                 content or "",
                 pop_pending=False,
+                on_published=_resolve_waiter,
             )
         except protocol.DurablePublishError as exc:
             logger.error(
@@ -110,11 +118,10 @@ class TaskRPCHandler:
             )
             return False, "A2A task state could not be durably published"
 
-        if not future.done():
-            try:
-                future.set_result((state, reply))
-            except Exception:
-                pass
+        # The on_published hook above resolved the waiter the instant the
+        # durable commit landed; this call only covers _finalize_task's
+        # no-publish early return (unknown-task path), where no hook ran.
+        _resolve_waiter(state, reply)
         self._pop_pending(task_id)
         return True, ""
 
@@ -483,12 +490,18 @@ class TaskRPCHandler:
 
     def _finalize_task(self, pending: dict, state: str, reply: str,
                        audit_direction: str = "outbound", *,
-                       pop_pending: bool = True) -> tuple[str, str]:
+                       pop_pending: bool = True,
+                       on_published: Optional[Callable[[str, str], None]] = None,
+                       ) -> tuple[str, str]:
         """Record the outcome of a dispatched task. Returns (state, reply) after
         redaction and input-required detection.
 
         ``audit_direction`` overrides the security audit direction (default
         ``"outbound"``).  Fire-and-forget loopback pushes use ``"push"``.
+
+        ``on_published(state, reply)`` runs immediately after the durable
+        commit succeeds and before any post-commit work, so callers can
+        settle their waiter without waiting on the callback/audit tail.
         """
         task_id = pending["task_id"]
         context_id = pending["context_id"]
@@ -546,6 +559,22 @@ class TaskRPCHandler:
             # Terminal-write failure leaves last durable state (normally WORKING) visible, no success side effects
             # Do not invent INDETERMINATE; keep WORKING visible
             raise protocol.DurablePublishError(task_id, context_id, state, _outcome.durable_state, True)
+        # The durable commit has landed. Settle the RPC waiter NOW, before the
+        # synchronous post-commit tail below (persist/audit/metrics/callback
+        # push): callback delivery can block past the caller's reply deadline,
+        # and an unresolved waiter then publishes FAILED against this durable
+        # COMPLETED, surfacing a false DurablePublishError for a valid result
+        # (PR #92494 review 5252598219, blocker 1).
+        if on_published is not None:
+            try:
+                on_published(state, display_reply)
+            except Exception as hook_exc:
+                bounded = self._bounded_redacted_detail(hook_exc, 300) if hasattr(self, '_bounded_redacted_detail') else str(hook_exc)[:300]
+                logger.warning(
+                    "A2A: on_published waiter hook failed for task %s (best-effort): %s",
+                    self._bounded_redacted_detail(task_id, 128) if hasattr(self, '_bounded_redacted_detail') else task_id,
+                    bounded,
+                )
         if pop_pending:
             self._pop_pending(task_id)
         # Post-commit ordering: only on newly_published do audit/metrics/push

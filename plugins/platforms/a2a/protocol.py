@@ -37,7 +37,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from .a2a_persistence import _durable_task_snapshot, _retained_terminal_ids
+from .a2a_persistence import (
+    _MAX_TOMBSTONES,
+    _durable_task_snapshot,
+    _evicted_terminal_tombstones,
+    _load_tombstones,
+    _reply_fingerprint,
+    _retained_terminal_ids,
+    _tombstone_path_for,
+    _write_tombstones,
+)
 
 PROTOCOL_VERSION = "1.0"
 
@@ -1400,6 +1409,20 @@ class TaskStore:
                         self._ledger_unavailable = False
                         self._ledger_unavailable_reason = ""
 
+                    # Durable eviction evidence (review 5252598219, blocker 2).
+                    # Fail closed if the sidecar exists but cannot be read:
+                    # silently forgetting tombstones would reopen the hole.
+                    tombstone_path = _tombstone_path_for(ledger_path)
+                    tombstones, tombstone_error = _load_tombstones(tombstone_path)
+                    if tombstone_error is not None:
+                        return DurablePublishOutcome(
+                            published=False,
+                            newly_published=False,
+                            record=existing_mem_copy,
+                            durable_state=existing_mem_state,
+                            error=tombstone_error,
+                        )
+
                     # Select authoritative disk record for task_id
                     disk_rec = None
                     if isinstance(disk_snapshot, dict) and task_id in disk_snapshot:
@@ -1448,6 +1471,72 @@ class TaskStore:
                                 durable_state=disk_state,
                                 error="terminal conflict: existing terminal differs",
                             )
+                    else:
+                        tombstone = tombstones.get(task_id)
+                        if tombstone is not None:
+                            # The row was durably terminal and later evicted from
+                            # the bounded window: the sidecar tombstone is the
+                            # terminal authority for this id (review 5252598219,
+                            # blocker 2). Reject any non-identical candidate —
+                            # resurrection to a live state or a divergent reply —
+                            # and never re-add the stale in-memory copy.
+                            for field_name, cand_val in [
+                                ("context_id", candidate_context),
+                                ("peer", candidate_peer),
+                                ("agent_slug", candidate_slug),
+                                ("tenant", candidate_tenant),
+                            ]:
+                                if cand_val is not None and cand_val != tombstone.get(field_name, ""):
+                                    self._tasks.pop(task_id, None)
+                                    return DurablePublishOutcome(
+                                        published=False,
+                                        newly_published=False,
+                                        record=None,
+                                        durable_state=tombstone.get("state", ""),
+                                        error=(
+                                            f"ownership mismatch for {field_name}: "
+                                            f"{cand_val!r} != {tombstone.get(field_name, '')!r}"
+                                        ),
+                                    )
+                            tombstone_state = tombstone.get("state", "")
+                            if (
+                                candidate_state == tombstone_state
+                                and _reply_fingerprint(candidate_reply)
+                                == tombstone.get("reply_sha256", "")
+                            ):
+                                # Identical terminal fact re-published after
+                                # eviction: idempotent success, no new side
+                                # effects, stale memory copy dropped.
+                                self._tasks.pop(task_id, None)
+                                return DurablePublishOutcome(
+                                    published=True,
+                                    newly_published=False,
+                                    record={
+                                        "task_id": tombstone.get("task_id", task_id),
+                                        "context_id": tombstone.get("context_id", ""),
+                                        "peer": tombstone.get("peer", ""),
+                                        "agent_slug": tombstone.get("agent_slug", ""),
+                                        "tenant": tombstone.get("tenant", ""),
+                                        "state": tombstone_state,
+                                        # Bounded tombstones keep the reply
+                                        # fingerprint, not the body.
+                                        "reply": "",
+                                        "created_at": tombstone.get("created_at", 0),
+                                        "created_iso": tombstone.get("created_iso", ""),
+                                        "completed_at": tombstone.get("completed_at"),
+                                        "push_url": "",
+                                        "push_config_id": "",
+                                    },
+                                    durable_state=tombstone_state,
+                                )
+                            self._tasks.pop(task_id, None)
+                            return DurablePublishOutcome(
+                                published=False,
+                                newly_published=False,
+                                record=None,
+                                durable_state=tombstone_state,
+                                error="terminal conflict: task tombstoned after terminal eviction",
+                            )
 
                     # Only a nonterminal authoritative disk record may take a legal candidate transition.
 
@@ -1461,6 +1550,13 @@ class TaskStore:
                         if tid == task_id:
                             merged[tid] = dict(rec)
                         elif tid not in merged:
+                            if tid in tombstones:
+                                # Durably terminal and evicted from the window:
+                                # the sidecar tombstone is the authority for this
+                                # id — a stale store's copy must not resurrect
+                                # the row (genuinely new tasks have no tombstone
+                                # and still merge in below).
+                                continue
                             merged[tid] = dict(rec)
                         else:
                             disk_rec_other = merged[tid]
@@ -1472,6 +1568,31 @@ class TaskStore:
                         TERMINAL_STATES,
                         max_terminal=self._MAX_TERMINAL,
                     )
+                    # Record eviction evidence BEFORE replacing the ledger: a
+                    # crash between the two writes must never leave an evicted
+                    # row with no tombstone (the reverse order is safe — a
+                    # tombstone for a row still on disk is simply ignored).
+                    new_tombstones = _evicted_terminal_tombstones(merged, snapshot, TERMINAL_STATES)
+                    if new_tombstones:
+                        updated_tombstones = dict(tombstones)
+                        updated_tombstones.update(new_tombstones)
+                        try:
+                            _write_tombstones(
+                                tombstone_path,
+                                updated_tombstones,
+                                max_tombstones=_MAX_TOMBSTONES,
+                            )
+                        except Exception as tomb_exc:
+                            return DurablePublishOutcome(
+                                published=False,
+                                newly_published=False,
+                                record=existing_mem_copy if disk_rec is None else dict(disk_rec),
+                                durable_state=(
+                                    disk_rec.get("state", "") if disk_rec is not None
+                                    else existing_mem_state
+                                ),
+                                error=f"tombstone write failed: {tomb_exc}",
+                            )
                     tmp_fd = None
                     tmp_path = ""
                     try:
@@ -1757,6 +1878,7 @@ class TaskStore:
                 TERMINAL_STATES,
                 max_terminal=self._MAX_TERMINAL,
             )
+            new_tombstones = _evicted_terminal_tombstones(self._tasks, snapshot, TERMINAL_STATES)
         try:
             import fcntl
             _HAS_FCNTL = True
@@ -1777,6 +1899,13 @@ class TaskStore:
                 fcntl.flock(fd, fcntl.LOCK_EX)
             elif _HAS_MSVCRT:
                 msvcrt.locking(fd.fileno(), msvcrt.LK_NBLCK, 1)
+            if new_tombstones:
+                tomb_path = _tombstone_path_for(path)
+                existing_tombs, tomb_error = _load_tombstones(tomb_path)
+                if tomb_error is not None:
+                    raise RuntimeError(tomb_error)
+                existing_tombs.update(new_tombstones)
+                _write_tombstones(tomb_path, existing_tombs, max_tombstones=_MAX_TOMBSTONES)
             import tempfile, os
             tmp_fd, tmp_path = tempfile.mkstemp(
                 dir=str(path.parent), suffix=".tmp"
