@@ -526,11 +526,163 @@ KANBAN_LINK_SCHEMA = _schema(
         "exist. The child won't promote to 'ready' until all parents "
         "are 'done'. Cycles and self-links are rejected. A running child "
         "is rejected unless the active owning worker is linking its own "
-        "card for a dependency handoff."
+        "card for a dependency handoff. The response reports the child's "
+        "ACTUAL resulting status and remaining gates — a link that could "
+        "not demote the child says so instead of claiming a transition "
+        "that did not happen."
     ),
     {
         "parent_id": {"type": "string", "description": "Parent task id."},
         "child_id":  {"type": "string", "description": "Child task id."},
     },
     ["parent_id", "child_id"],
+)
+
+KANBAN_UNLINK_SCHEMA = _schema(
+    "kanban_unlink",
+    (
+        "Counterpart to ``kanban_link``: drop an existing parent→child "
+        "dependency edge. Same edge validation and board scoping as "
+        "linking. Returns whether the edge was actually removed plus the "
+        "child's REAL resulting status, whether it was promoted by the "
+        "removal, and any parents still gating it — no transition is "
+        "claimed unless it actually occurred. Removing the last "
+        "unsatisfying parent re-evaluates the child immediately instead "
+        "of leaving it parked until the next dispatcher tick."
+    ),
+    {
+        "parent_id": {"type": "string", "description": "Parent task id (the dependency being dropped)."},
+        "child_id":  {"type": "string", "description": "Child task id (the dependent being released)."},
+    },
+    ["parent_id", "child_id"],
+)
+
+KANBAN_GRAPH_SCHEMA = _schema(
+    "kanban_graph",
+    (
+        "Read-only focus-task graph inspection. Returns the task's id, "
+        "title and status plus its DIRECT parents and children, each "
+        "with id, title and status. Strictly SELECT-only: it never "
+        "writes status, events or edges and never recomputes readiness, "
+        "so inspecting a graph can never move a card. Use kanban_show "
+        "for the full record (comments, runs, events) and this when you "
+        "only need the dependency shape around one task."
+    ),
+    {
+        "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
+    },
+    [],
+)
+
+KANBAN_PROMOTE_SCHEMA = _schema(
+    "kanban_promote",
+    (
+        "Promote a task out of 'triage' into the normal flow — and only "
+        "that. It becomes 'ready' only when every parent is already "
+        "terminal; otherwise it lands in 'todo' and the response reports "
+        "the unmet parent gate(s) so you know what must finish first. "
+        "The transition is a single guarded update, so a concurrent "
+        "board change can never be overwritten, and the response always "
+        "reports where the task ACTUALLY landed. There is no arbitrary "
+        "status setter: a 'running' or any other direct transition is "
+        "not expressible through this tool. Orchestrator-only."
+    ),
+    {
+        "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
+        "reason": _prop("string", (
+            "Optional audit note recorded on the promotion event, e.g. "
+            "'triage clarified by operator'."
+        )),
+    },
+    [],
+)
+
+KANBAN_ARCHIVE_SCHEMA = _schema(
+    "kanban_archive",
+    (
+        "Archive a task — but ONLY if it is currently 'blocked'. The "
+        "status check and the archive are one atomic guarded transition, "
+        "so a task that changed state concurrently is refused without "
+        "being archived. This tool never blocks a task on its own: block "
+        "it first (kanban_block), then archive. Existing CLI/dashboard "
+        "archive behaviour is unchanged — this stricter guard applies "
+        "only here. On success it returns an impact receipt: which "
+        "dependents actually changed status (before/after each), which "
+        "are still waiting and why (remaining parent gates, holds, or both), "
+        "and which are now 'ready' and need assignment/dispatch "
+        "follow-up. Orchestrator-only."
+    ),
+    {
+        "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
+    },
+    [],
+)
+
+KANBAN_DECOMPOSE_SCHEMA = _schema(
+    "kanban_decompose",
+    (
+        "Apply an agent-authored decomposition of a 'triage' task into a "
+        "graph of child tasks. No auxiliary/LLM call is made — you supply "
+        "the whole graph. The entire graph is validated first and applied "
+        "atomically: if anything is invalid (missing title, bad parent "
+        "index, a cycle, an unknown assignee) no child rows, edges or "
+        "events are written and the root is left untouched. On success "
+        "the root waits on the whole child graph and wakes when all "
+        "children finish; the response returns the created child ids and "
+        "the ACTUAL resulting status of the root and each child after "
+        "eligibility is recomputed. Only a 'triage' task can be "
+        "decomposed, and only once. Orchestrator-only."
+    ),
+    {
+        "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
+        "children": {
+            "type": "array",
+            "minItems": 1,
+            "description": (
+                "Ordered child specs. ``parents`` entries are 0-based "
+                "indexes into THIS array, expressing dependencies between "
+                "the new siblings (a child with parents waits for them). "
+                "The graph must be acyclic."
+            ),
+            "items": {
+                "type": "object",
+                "properties": {
+                    "title": _prop("string", "Short task title (required)."),
+                    "body": _prop("string", (
+                        "Opening post: full spec, acceptance criteria, "
+                        "links. The assigned worker reads this as part of "
+                        "its context."
+                    )),
+                    "assignee": _prop("string", (
+                        "Profile that should execute this child. Must be "
+                        "an installed profile; when omitted it falls back "
+                        "to the configured default assignee so a child is "
+                        "never left unassigned."
+                    )),
+                    "parents": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": (
+                            "0-based indexes into this same children "
+                            "array that must complete first. Omit for "
+                            "parallel work."
+                        ),
+                    },
+                    "workspace_kind": {
+                        "type": "string",
+                        "enum": ["scratch", "dir", "worktree"],
+                        "description": (
+                            "Workspace flavor for this child; inherits "
+                            "the root's when omitted."
+                        ),
+                    },
+                    "workspace_path": _prop("string", (
+                        "Absolute workspace path override for this child."
+                    )),
+                },
+                "required": ["title"],
+            },
+        },
+    },
+    ["children"],
 )

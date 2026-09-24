@@ -599,7 +599,12 @@ def test_link_running_child_allows_owner_but_rejects_foreign(monkeypatch, worker
     ))
 
     assert own["ok"] is True
-    assert "child is already running" in foreign["error"]
+    # The ownership guard now refuses the foreign card BEFORE the DB's
+    # running-child check (defense in depth: link_tasks still rejects a running
+    # child without the owner's trusted run id — covered directly by
+    # tests/hermes_cli/test_kanban_db.py and tests/hermes_cli/test_kanban_cli.py).
+    assert "refusing to mutate" in foreign["error"]
+    assert foreign_child in foreign["error"]
     with kbc.connect() as conn:
         assert kb.parent_ids(conn, worker_env) == [own_parent]
         assert kb.parent_ids(conn, foreign_child) == []

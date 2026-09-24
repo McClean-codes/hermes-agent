@@ -1700,7 +1700,19 @@ def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
     return False
 
 
-def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
+def unlink_tasks(
+    conn: sqlite3.Connection, parent_id: str, child_id: str, *,
+    board_wide_recompute: bool = True,
+) -> bool:
+    """Drop the ``parent_id -> child_id`` edge; True when it actually existed.
+
+    ``board_wide_recompute=False`` scopes the post-unlink readiness recompute
+    to ``child_id`` alone. The task-scoped worker tool path passes it: a worker
+    unlinking its OWN edge must not promote an unrelated stale-but-eligible
+    task (or append that task's ``promoted`` events) as a side effect. The
+    default keeps the historical board-wide recompute the CLI, dashboard and
+    dispatcher callers expect.
+    """
     with write_txn(conn):
         cur = conn.execute(
             "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?", (parent_id, child_id),
@@ -1711,7 +1723,7 @@ def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
     if removed:
         # Re-gate the child now (as complete_task/unblock_task do) instead of
         # leaving it in todo until the next tick.
-        recompute_ready(conn)
+        recompute_ready(conn, only_task_id=None if board_wide_recompute else child_id)
     return removed
 
 
@@ -2125,9 +2137,16 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
     return "ready"
 
 
-def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
+def recompute_ready(
+    conn: sqlite3.Connection, failure_limit: int = None, *, only_task_id: Optional[str] = None,
+) -> int:
     """Promote ``todo``/``blocked`` tasks whose parents are all done/archived;
     returns the count. Opens its own IMMEDIATE txn — call OUTSIDE any write txn.
+
+    ``only_task_id`` narrows the scan to that one task. Callers that are only
+    allowed to move a single card (the task-scoped worker's unlink) pass it so
+    re-evaluating eligibility cannot promote an unrelated stale-but-eligible
+    task or append ``promoted`` events to it. Default (None) = board-wide.
 
     ``blocked`` is skipped when sticky (explicit ``kanban_block``) or when
     ``consecutive_failures`` reached the limit (else the breaker could never
@@ -2141,10 +2160,17 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
         failure_limit = DEFAULT_FAILURE_LIMIT
     promoted = 0
     with write_txn(conn):
-        todo_rows = conn.execute(
-            "SELECT id, status, consecutive_failures, max_retries "
-            "FROM tasks WHERE status IN ('todo', 'blocked')"
-        ).fetchall()
+        if only_task_id is None:
+            todo_rows = conn.execute(
+                "SELECT id, status, consecutive_failures, max_retries "
+                "FROM tasks WHERE status IN ('todo', 'blocked')"
+            ).fetchall()
+        else:
+            todo_rows = conn.execute(
+                "SELECT id, status, consecutive_failures, max_retries "
+                "FROM tasks WHERE status IN ('todo', 'blocked') AND id = ?",
+                (only_task_id,),
+            ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
@@ -3611,6 +3637,49 @@ def promote_task(
     return True, None
 
 
+def promote_triage_task(
+    conn: sqlite3.Connection, task_id: str, *, actor: str, reason: Optional[str] = None,
+) -> tuple[bool, Optional[str], str]:
+    """Promote a ``triage`` task into the normal flow — and *only* a triage task.
+
+    Lands ``ready`` when every direct parent is already terminal, otherwise
+    ``todo`` with the unmet parents named in the error. The flip is a single
+    guarded ``UPDATE ... WHERE status = 'triage'`` inside one IMMEDIATE txn, so
+    a concurrent transition cannot be overwritten and no other status (in
+    particular never ``running``) is reachable from here.
+
+    Returns ``(ok, error, landed_status)``; ``landed_status`` is the status the
+    task was in when refused (so the caller can report it) or the status the
+    task actually landed in on success.
+    """
+    with write_txn(conn):
+        row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is None:
+            return False, f"task {task_id} not found", ""
+        current = row["status"]
+        if current != "triage":
+            return False, (
+                f"task {task_id} is {current!r}; kanban_promote only applies to "
+                f"'triage' — it is not an arbitrary status setter"
+            ), current
+        unmet = [pid for pid, _status in unsatisfied_parents(conn, task_id)]
+        landing = _landing_status_after_parents(conn, task_id)
+        upd = conn.execute(
+            "UPDATE tasks SET status = ? WHERE id = ? AND status = 'triage'",
+            (landing, task_id),
+        )
+        if upd.rowcount != 1:
+            return False, f"task {task_id} status changed during promotion", ""
+        _append_event(
+            conn, task_id, "promoted_manual",
+            {
+                "actor": actor, "reason": reason, "status": landing,
+                "source": "triage", "unsatisfied_parents": unmet,
+            },
+        )
+    return True, None, landing
+
+
 def _reclaim_dangling_run(
     conn: sqlite3.Connection, task_id: str, *, statuses, now: int, note: str,
 ) -> None:
@@ -3873,8 +3942,20 @@ def specify_triage_task(
     return True
 
 
-def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> bool:
+def archive_task(
+    conn: sqlite3.Connection, task_id: str, *, signal_fn=None,
+    require_status: Optional[str] = None,
+) -> bool:
     """Archive a task; a *running* task's host-local worker is terminated.
+
+    ``require_status`` (default ``None``) adds an agent-facing guard: the task
+    is archived only while it is currently in that status. The guard is the
+    SAME statement as the flip (``AND status = ?`` inside this IMMEDIATE txn),
+    so a concurrent transition can never slip between the check and the
+    archive — the loser sees ``rowcount != 1`` and archives nothing. Passing
+    ``None`` keeps the historical CLI/dashboard behaviour (archive anything not
+    already archived); only the guarded tool opts in, so no existing caller is
+    tightened.
 
     Clearing ``worker_pid`` in the DB alone left the OS process running past its
     own archive — it kept executing (and pushing work) against a task nothing
@@ -3894,12 +3975,23 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
         ).fetchone()
         if not row:
             return False
+        if require_status is not None and row["status"] != require_status:
+            # Fast, readable refusal — the guarded UPDATE below stays the authority.
+            return False
         was_running = row["status"] == "running"
         prev_pid, prev_lock, prev_started = row["worker_pid"], row["claim_lock"], row["worker_started_at"]
+        # The guard lives in the UPDATE predicate itself: the pre-read above is
+        # only for diagnostics/side-effect bookkeeping, never the authority.
+        guard = "id = ? AND status != 'archived'"
+        params: list[Any] = [task_id]
+        if require_status is not None:
+            guard += " AND status = ?"
+            params.append(require_status)
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
-            "WHERE id = ? AND status != 'archived'", (task_id,),
+            f"WHERE {guard}",
+            tuple(params),
         )
         if cur.rowcount != 1:
             return False
