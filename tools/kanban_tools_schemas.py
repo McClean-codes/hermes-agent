@@ -534,3 +534,39 @@ KANBAN_LINK_SCHEMA = _schema(
     },
     ["parent_id", "child_id"],
 )
+
+
+KANBAN_ARCHIVE_SCHEMA = _schema(
+    "kanban_archive",
+    (
+        "Archive a task — but NOT one whose work is still in flight. "
+        "'ready', 'running' and 'review' are protected: a direct archive is "
+        "refused with the block/stop-first instruction and nothing changes. "
+        "Every other status archives directly, including legacy raw statuses "
+        "such as 'completed'; 'archived' is the already-archived no-op "
+        "(archive is not deletion). The status check and the archive are one "
+        "atomic guarded transition, so a task that changed state "
+        "concurrently — or one whose worker cannot be proven stopped, or whose "
+        "spawn has started a worker whose PID is not published yet — is refused "
+        "without being archived. This tool never blocks a task on its own: "
+        "block it first (kanban_block), then archive. `reason` is REQUIRED and "
+        "is stored on the `archived` event as {source, actor, reason} so the "
+        "board keeps an audit trail of why an agent archived a card; an "
+        "invalid reason is rejected before anything changes. On success it "
+        "returns an impact receipt: which dependents actually changed status "
+        "(before/after each), which are still waiting and why (remaining "
+        "parent gates, holds, or both), which are now 'ready' and need "
+        "assignment/dispatch follow-up, plus the same-card review association "
+        "(the card's own review run and linked children). Orchestrator-only."
+    ),
+    {
+        "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
+        "reason": _prop("string", (
+            "Required. Why this task is being archived, in one or two "
+            "sentences (e.g. 'superseded by t_ab12cd34 — folded into the "
+            "parent card'). Stored verbatim on the `archived` event for "
+            "later audit; must be non-empty after trimming whitespace."
+        )),
+    },
+    ["task_id", "reason"],
+)

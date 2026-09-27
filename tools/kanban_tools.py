@@ -20,6 +20,7 @@ from hermes_cli.goals import judge_goal
 from tools.registry import no_cache_check_fn, registry, tool_error
 from hermes_cli.config import cfg_get, load_config
 from tools.kanban_tools_schemas import (
+    KANBAN_ARCHIVE_SCHEMA,
     KANBAN_ATTACH_SCHEMA,
     KANBAN_ATTACH_URL_SCHEMA, KANBAN_ATTACHMENTS_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_COMMENT_SCHEMA,
     KANBAN_COMPLETE_SCHEMA, KANBAN_CREATE_SCHEMA, KANBAN_HEARTBEAT_SCHEMA, KANBAN_LINK_SCHEMA,
@@ -798,10 +799,19 @@ def _handle_block(args: dict, **kw) -> str:
                f"{sorted(_GOAL_MODE_BLOCK_ALLOWED_KINDS)} (got {kind!r}). If the task is actually "
                f"finished or cannot proceed for another reason, call kanban_complete instead — "
                f"the completion judge will evaluate it.")
-        ok = kb.block_task(conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id(tid))
-        _check(ok, f"could not block {tid} (unknown id or not in running/ready)")
+        review_before = kb.review_association(conn, tid)
+        ok, why = kb.block_task(
+            conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id(tid),
+            with_reason=True,
+        )
+        _check(ok, why or f"could not block {tid} (unknown id or not in running/ready/review)")
         landed_kind = kb.get_task(conn, tid).block_kind
         extra: dict = {"block_kind": landed_kind}
+        if why:
+            # The card IS blocked, but its worker could not be proven stopped —
+            # or a spawn for it is still in flight and unpublished. Quote the
+            # exact blocker so the later archive refusal is never a surprise.
+            extra["stop_blocker"] = why
         if kind == "dependency" and landed_kind != kind:
             # block_task re-kinds a dependency wait that no open parent can satisfy.
             extra["requested_kind"] = kind
@@ -810,6 +820,7 @@ def _handle_block(args: dict, **kw) -> str:
                 "so this was recorded as needs_input (sticky until a human unblocks) "
                 "instead of parking in todo where the dispatcher would respawn it."
             )
+        extra["review"] = _review_receipt(review_before, kb.review_association(conn, tid))
         return _ok_landed(kb, conn, tid, "blocked", **extra)
 
 
@@ -1196,10 +1207,183 @@ def _handle_link(args: dict, **kw) -> str:
                    **({"gated_by": parent_id} if gated else {}))
 
 
+
+
+def _dependency_gates(kb, conn, task_id: str) -> list[dict]:
+    """``[{id, status}]`` for every direct parent still gating ``task_id``."""
+    return [{"id": pid, "status": status} for pid, status in kb.unsatisfied_parents(conn, task_id)]
+
+
+def _archive_impact_receipt(kb, conn, dependents: list[str], before: dict) -> dict:
+    """Classify each dependent AFTER the archive + readiness recompute.
+
+    Three disjoint questions, answered from the board rather than assumed:
+    ``changed`` — status actually moved (with before/after), ``waiting`` — still
+    held back and why (remaining parent gates, a block hold, or BOTH at once —
+    a blocked dependent is never reduced to one cause), ``ready_followup``
+    — now runnable and needing assignment or dispatch.
+    """
+    changed, waiting, ready_followup = [], [], []
+    for dep_id in dependents:
+        task = kb.get_task(conn, dep_id)
+        if task is None:
+            continue
+        prev = before.get(dep_id)
+        prev_status = prev.status if prev else None
+        if prev_status != task.status:
+            changed.append({
+                "id": task.id, "title": task.title,
+                "before": prev_status, "after": task.status,
+            })
+        gates = _dependency_gates(kb, conn, dep_id)
+        held = task.status == "blocked"
+        if gates or held:
+            # A blocked dependent can be GATED and HELD at the same time (its
+            # block hold plus another parent still open). Expose both causes:
+            # `hold` is reported whenever the card is blocked, and `reason`
+            # names every remaining cause instead of picking the first one.
+            hold_kind = getattr(task, "block_kind", None)
+            causes: list[str] = []
+            if gates:
+                causes.append("waiting on unsatisfied parent dependencies")
+            if held:
+                causes.append(f"held in blocked ({hold_kind or 'unclassified'})")
+            entry = {
+                "id": task.id, "title": task.title, "status": task.status,
+                "unsatisfied_parents": gates,
+                "reason": "; ".join(causes),
+            }
+            if held:
+                entry["hold"] = {"kind": hold_kind}
+            waiting.append(entry)
+        if task.status == "ready":
+            ready_followup.append({
+                "id": task.id, "title": task.title, "assignee": task.assignee,
+                "needs_assignment": not task.assignee,
+                "changed": prev_status != "ready",
+            })
+    return {"changed": changed, "waiting": waiting, "ready_followup": ready_followup}
+
+
+def _review_receipt(before: dict, after: dict) -> dict:
+    """Same-card review evidence for an archive/block receipt.
+
+    The review flow is same-card (``request_review`` + ``claim_review_task``
+    claim THIS card into a reviewer run), so the receipt names the review run
+    the move closed or preserved — nothing is inferred into a second card, and
+    nothing outside this card is stopped on its behalf. What the move affects
+    elsewhere is carried by the ordinary dependency graph
+    (``linked_before``/``linked_after``) plus the archive impact receipt, which
+    report dependents without mutating them.
+    """
+    run = after.get("active_review_run") or before.get("active_review_run")
+    if run:
+        was = ("active before this move and closed by it"
+               if before.get("active_review_run") and not after.get("active_review_run")
+               else "active")
+        note = (f"same-card review run {run['id']} (profile {run['profile']}, "
+                f"outcome {run['outcome']}) identified from its claimed event "
+                f"source_status=review — {was}")
+    elif after.get("review_runs"):
+        ids = ", ".join(str(r["id"]) for r in after["review_runs"])
+        note = f"no active review run; same-card review run(s) {ids} preserved in history"
+    else:
+        note = "no same-card review run"
+    return {
+        "lane": after.get("lane"), "note": note,
+        "reviewer": after.get("reviewer"), "active_review_run": run,
+        "review_runs": after.get("review_runs"),
+        "linked_before": before.get("linked"), "linked_after": after.get("linked"),
+    }
+
+
+def _archive_reason(args: dict) -> str:
+    """Required archive rationale, checked BEFORE the board is opened.
+
+    Missing, non-string, empty and whitespace-only input is rejected here, ahead
+    of ``_board``/``_existing_task``/``archive_task``, so a bad reason can never
+    leave a status flip, an event or a run behind. The text is preserved as the
+    caller sent it — no normalization, no generic stand-in — because the whole
+    point of the field is the agent's own wording in the audit trail.
+    """
+    reason = args.get("reason")
+    if reason is None:
+        raise _Reject(
+            "reason is required — say why this task is being archived; it is "
+            "recorded on the archive event. Nothing changed.")
+    if not isinstance(reason, str):
+        raise _Reject(
+            f"reason must be a string, got {type(reason).__name__}. Nothing changed.")
+    if not reason.strip():
+        raise _Reject(
+            "reason must not be empty or whitespace-only — say why this task is "
+            "being archived. Nothing changed.")
+    return reason
+
+
+# The agent-facing archive runs the ONE shared archive policy (see
+# ``hermes_cli.kanban_db.ARCHIVE_PROTECTED_STATUSES``): ``ready``/``running``/
+# ``review`` are refused with a block/stop-first instruction, everything else —
+# every other valid status AND legacy raw statuses such as ``completed`` —
+# archives directly, and ``archived`` is the already-archived no-op. This tool
+# NEVER blocks a task on the caller's behalf, so a refusal never parks a card.
+# It is also the ONLY surface that supplies a ``reason``, so it is the only one
+# whose ``archived`` event carries a payload.
+@_kanban_handler("kanban_archive")
+def _handle_archive(args: dict, **kw) -> str:
+    """Archive a task under the shared policy, with an impact + review receipt."""
+    _reject_delegated_child_mutation("kanban_archive")
+    _require_orchestrator_tool("kanban_archive")
+    tid = args.get("task_id")
+    _check(tid, "task_id is required")
+    tid = str(tid)
+    # Validated first: an invalid reason must fail with no status/event/run
+    # side effects, so nothing below it may have run yet.
+    reason = _archive_reason(args)
+    _enforce_worker_task_ownership(tid)
+    with _board(args.get("board")) as (kb, conn):
+        task = _existing_task(kb, conn, tid)
+        before_status = task.status
+        if before_status == "archived":
+            raise _Reject(f"{tid} is already archived; nothing changed")
+        # Review association and dependents are snapshotted BEFORE the move so
+        # the receipt reports real before/after instead of assuming it.
+        review_before = kb.review_association(conn, tid)
+        dependents = kb.child_ids(conn, tid)
+        before = {d: kb.get_task(conn, d) for d in dependents}
+        # One shared policy with the CLI/dashboard/DB lifecycle: the refusal
+        # copy (block/stop first, live worker, in-flight spawn) comes from the
+        # same writer that enforces it, and nothing is archived on refusal.
+        # Only this tool hands the writer a payload, so only agent archives
+        # carry provenance; refusals and the already-archived no-op above write
+        # no event at all. ``actor`` is the persisted runtime identity, never a
+        # caller argument (board records feed future workers' prompts).
+        ok, why = kb.archive_task(
+            conn, tid, with_reason=True,
+            event_payload={
+                "source": "kanban_archive",
+                "actor": _persisted_identity(),
+                "reason": reason,
+            },
+        )
+        if not ok:
+            raise _Reject(why or f"kanban_archive refused: {tid} was not archived")
+        receipt = _archive_impact_receipt(kb, conn, dependents, before)
+        return _ok(
+            task_id=tid, status="archived", previous_status=before_status,
+            reason=reason,
+            dependents=receipt,
+            review=_review_receipt(review_before, kb.review_association(conn, tid)),
+        )
+
+
 # --- Registration (order preserved: it is the order tools appear in the schema) ---
 
 # kanban_list / kanban_unblock route the board and are hidden from task workers.
-_ORCHESTRATOR_TOOLS = frozenset({"kanban_list", "kanban_unblock"})
+# kanban_archive is likewise a board-level lifecycle move: a task-scoped worker
+# must not archive a card (its own escape hatch around the complete/review
+# gates, or a sibling's), so it is orchestrator-only like the tools above.
+_ORCHESTRATOR_TOOLS = frozenset({"kanban_list", "kanban_unblock", "kanban_archive"})
 _TOOLS = (
     ("kanban_show", KANBAN_SHOW_SCHEMA, _handle_show, "📋"),
     ("kanban_list", KANBAN_LIST_SCHEMA, _handle_list, "📋"),
@@ -1214,7 +1398,8 @@ _TOOLS = (
     ("kanban_attachments", KANBAN_ATTACHMENTS_SCHEMA, _handle_attachments, "📎"),
     ("kanban_create", KANBAN_CREATE_SCHEMA, _handle_create, "➕"),
     ("kanban_unblock", KANBAN_UNBLOCK_SCHEMA, _handle_unblock, "▶"),
-    ("kanban_link", KANBAN_LINK_SCHEMA, _handle_link, "🔗"))
+    ("kanban_link", KANBAN_LINK_SCHEMA, _handle_link, "🔗"),
+    ("kanban_archive", KANBAN_ARCHIVE_SCHEMA, _handle_archive, "🗄"))
 
 for _name, _sch, _handler, _emoji in _TOOLS:
     _gate = _check_kanban_orchestrator_mode if _name in _ORCHESTRATOR_TOOLS else _check_kanban_mode

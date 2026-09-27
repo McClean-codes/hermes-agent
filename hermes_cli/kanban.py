@@ -985,24 +985,41 @@ def _cmd_block(args: argparse.Namespace) -> int:
     ids = _bulk_ids(args)
     suffix = f": {reason}" if reason else ""
     with kbc.connect_closing() as conn:
+        # ``with_reason`` carries either the refusal evidence (lost race) or the
+        # exact stop blocker when the work could not be proven stopped — a
+        # worker process that survived the stop, or a spawn whose PID was never
+        # published. Both belong in the operator's output.
+        notes: dict = {}
+
+        def op(tid):
+            ok, why = kb.block_task(
+                conn, tid, reason=reason, kind=kind,
+                expected_run_id=_worker_run_id_for(tid), with_reason=True)
+            if why:
+                notes[tid] = why
+            return ok
+
         def ok_msg(tid):
             # Report where it landed: dependency blocks -> todo, tripped unblock-loop breaker -> triage.
             landed = kb.get_task(conn, tid)
             where = landed.status if landed else "blocked"
             if where == "todo":
-                return f"{tid} → todo (dependency wait){suffix}"
-            if kind == "dependency" and where == "blocked":
-                return f"Blocked {tid} as needs_input (no open parent to wait on){suffix}"
-            if where == "triage":
+                msg = f"{tid} → todo (dependency wait){suffix}"
+            elif kind == "dependency" and where == "blocked":
+                msg = f"Blocked {tid} as needs_input (no open parent to wait on){suffix}"
+            elif where == "triage":
                 # Only a typed owner-input block carries a question for a human.
                 verdict = ("needs a human decision" if (landed.block_kind if landed else kind) == "needs_input"
                            else "orchestration attention needed")
-                return f"{tid} → triage (unblock loop detected — {verdict}){suffix}"
-            return f"Blocked {tid}{suffix}"
+                msg = f"{tid} → triage (unblock loop detected — {verdict}){suffix}"
+            else:
+                msg = f"Blocked {tid}{suffix}"
+            note = notes.get(tid)
+            return f"{msg} [!] {note}" if note else msg
 
-        op = _commented(conn, reason, author, "BLOCKED", lambda tid: kb.block_task(
-            conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id_for(tid)))
-        return _bulk_apply(ids, op, ok_msg, lambda tid: f"cannot block {tid}")
+        op = _commented(conn, reason, author, "BLOCKED", op)
+        return _bulk_apply(ids, op, ok_msg,
+                           lambda tid: f"cannot block {tid}" + (f": {notes[tid]}" if tid in notes else ""))
 
 
 def _cmd_schedule(args: argparse.Namespace) -> int:
@@ -1129,8 +1146,20 @@ def _cmd_archive(args: argparse.Namespace) -> int:
         if purge_ids:
             return _bulk_apply(purge_ids, lambda tid: kb.delete_archived_task(conn, tid), lambda tid: f"Deleted {tid}",
                                lambda tid: f"cannot delete {tid} (must already be archived)")
-        return _bulk_apply(ids, lambda tid: kb.archive_task(conn, tid),
-                           lambda tid: f"Archived {tid}", lambda tid: f"cannot archive {tid}")
+        # Same shared policy as the DB lifecycle, the dashboard and the agent
+        # tool: protected statuses / a live worker / an in-flight spawn refuse
+        # with the exact reason and change nothing.
+        reasons: dict = {}
+
+        def op(tid):
+            ok, why = kb.archive_task(conn, tid, with_reason=True)
+            if not ok:
+                reasons[tid] = why or f"cannot archive {tid}"
+            return ok
+
+        return _bulk_apply(ids, op,
+                           lambda tid: f"Archived {tid}",
+                           lambda tid: f"cannot archive {tid} — {reasons[tid]}")
 
 
 def _cmd_stats(args: argparse.Namespace) -> int:

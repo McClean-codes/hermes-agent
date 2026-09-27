@@ -230,7 +230,7 @@ def notify_task_updated(
 # DispatchResult counters whose non-zero value means the tick did something.
 _TICK_ACTIVITY_FIELDS = (
     "spawned", "reclaimed", "promoted", "reconciled_orphans", "reaped_terminal_workers", "crashed", "stale",
-    "timed_out", "auto_blocked", "rate_limited", "auto_assigned_default",
+    "timed_out", "auto_blocked", "discarded_spawns", "rate_limited", "auto_assigned_default",
     "respawn_guarded", "skipped_per_profile_capped", "skipped_unassigned",
     "skipped_nonspawnable",
 )
@@ -908,6 +908,15 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- spawn (held while live, never signalled). Column keeps its INTEGER affinity for the
     -- start-time-only integer values older rows carry.
     worker_started_at    INTEGER,
+    -- In-flight spawn marker (JSON: {"claim","run","at"[,"pid","started_at"]}), written by the
+    -- dispatcher AFTER it claims and BEFORE it starts the child, and cleared by whoever resolves
+    -- that spawn (publication, spawn failure, or the fenced-out stop). While it is set a worker may
+    -- exist that no row records yet, so ``worker_pid IS NULL`` is NOT evidence of quiescence:
+    -- archive refuses (see ARCHIVE_PROTECTED_STATUSES guard) and block reports the exact hold
+    -- instead of claiming the work stopped. ``pid``/``started_at`` are added only when a late
+    -- publication had to stop that worker and could not prove it gone — enough identity to recover
+    -- safely. NULL = no spawn in flight.
+    spawn_fence          TEXT,
     -- Short excerpt of the most recent failure's error text.
     last_failure_error   TEXT,
     max_runtime_seconds  INTEGER,
@@ -1025,7 +1034,7 @@ CREATE TABLE IF NOT EXISTS task_runs (
     ended_at            INTEGER,
     outcome             TEXT,
     -- outcome: completed | blocked | crashed | timed_out | spawn_failed |
-    --          gave_up | reclaimed | (null while still running)
+    --          spawn_refused | gave_up | reclaimed | (null while still running)
     summary             TEXT,
     metadata            TEXT,
     error               TEXT
@@ -3216,13 +3225,41 @@ def edit_task(
 def block_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
     kind: Optional[str] = None, expected_run_id: Optional[int] = None,
-) -> bool:
-    """``running``/``ready`` -> ``blocked`` (or ``todo`` / ``triage``, see
+    signal_fn=None, with_reason: bool = False,
+) -> Any:
+    """``running``/``ready``/``review`` -> ``blocked`` (or ``todo`` / ``triage``, see
     :func:`_route_block`). ``kind='dependency'`` with no incomplete parent is
     re-kinded to ``needs_input`` (sticky) so ``recompute_ready`` cannot
     promote it into a context-free respawn. ``transient`` still counts
     toward the loop breaker so a forever-flaky task escalates. True on any
     transition.
+
+    ``review`` is a first-class source: the card parks in ``blocked`` with
+    ``source_status='review'`` so :func:`unblock_task` / :func:`recompute_ready`
+    return it to the review lane — the supported, auditable stop-first path an
+    operator uses before archiving work under review. The review runs on THIS
+    card and only this card is stopped; a separate reviewer card is never
+    inferred from the graph or cascaded into.
+
+    Stopping the work is part of the transition. The worker identity
+    (``worker_pid`` + start-time fingerprint) is retained across the flip, the
+    worker is then stopped/reaped and re-checked, and only a proven-gone
+    identity is cleared; a survivor keeps its identity on the row with a
+    ``block_worker_termination`` event, which is what later refuses the
+    archive. A ``running -> blocked`` flip alone is never treated as proof the
+    work stopped.
+
+    A spawned-but-unpublished worker counts as work in flight too: when
+    ``spawn_fence`` is armed (the dispatcher claimed the card and is starting
+    the child, but has not recorded its PID yet) this transition still lands —
+    the operator asked to stop the card — but it does NOT report the work
+    stopped. The fence stays armed, it is named in the ``blocked`` payload and
+    the closed run's metadata, and it is returned as the blocker so the later
+    archive refusal is never a surprise. The dispatcher settles it: a
+    publication that finds its claim gone is fenced out and that worker is
+    stopped and verified instead of being attached to the new state.
+    ``with_reason=True`` returns ``(ok, reason)`` so the caller can quote the
+    refusal or the stop blocker.
 
     An already-``blocked`` card that the failure breaker parked UNTYPED
     (``block_kind IS NULL``, no live run) is classified in place when *kind*
@@ -3231,24 +3268,30 @@ def block_task(
     runs stay exactly as the breaker left them. A typed block, a card with a
     live run, or a kind-less call on a blocked card are still refused.
     """
+
+    def _ret(ok: bool, why: Optional[str] = None):
+        return (ok, why) if with_reason else ok
+
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")
+    dependency_hook_fired = False
     with write_txn(conn):
         cur_row = conn.execute(
-            "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?", (task_id,),
+            "SELECT status, block_kind, block_recurrences, claim_lock, worker_pid, "
+            "worker_started_at, spawn_fence FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if cur_row is None:
-            return False
+            return _ret(False, f"no such task: {task_id}")
         # The breaker (``_record_task_failure``) parks cards ``blocked`` with no
         # ``block_kind`` and no ``blocked`` event -- the policy is the
         # supervisor's, not the kernel's -- but the transition guard below only
-        # matches running/ready, so that policy could never be attached later
+        # matches running/ready/review, so that policy could never be attached later
         # (#117363). Classify in place; never re-type or flap status. A caller
         # asserting run ownership (``expected_run_id``) cannot own a parked
         # card -- its run is over -- so it is refused like any stale worker.
         if cur_row["status"] == "blocked":
             if kind is None or expected_run_id is not None or _row_get(cur_row, "block_kind") is not None:
-                return False
+                return _ret(False, f"{task_id} is not in running/ready/review (or it is already typed blocked)")
             classified = conn.execute(
                 "UPDATE tasks SET block_kind = ?, block_recurrences = 1 "
                 "WHERE id = ? AND status = 'blocked' AND block_kind IS NULL "
@@ -3256,12 +3299,22 @@ def block_task(
                 (kind, task_id),
             ).rowcount
             if classified != 1:
-                return False
+                return _ret(False, f"{task_id} changed concurrently; nothing was blocked")
             _append_event(conn, task_id, "blocked", {
                 "kind": kind, "reason": reason, "classified_in_place": True,
             })
-            return True
-        source_status = _retry_status_for_run(conn, task_id) if cur_row["status"] == "running" else "ready"
+            return _ret(True, None)
+        if cur_row["status"] not in ("running", "ready", "review"):
+            return _ret(False, (
+                f"{task_id} is {cur_row['status']!r}; only 'running', 'ready' or "
+                f"'review' can be blocked"
+            ))
+        if cur_row["status"] == "review":
+            source_status = "review"
+        elif cur_row["status"] == "running":
+            source_status = _retry_status_for_run(conn, task_id)
+        else:
+            source_status = "ready"
         requested_kind = kind
         rekind_reason = None
         # ``dependency`` only waits on incomplete parents. A worker filing that
@@ -3278,33 +3331,60 @@ def block_task(
         if rekind_reason:
             payload["requested_kind"] = requested_kind
             payload["rekind_reason"] = rekind_reason
+        # Snapshot of the row this caller is about to flip. ``spawn_fence`` is
+        # part of it: a child may already be alive for this claim even though no
+        # PID is recorded yet, and the evidence must survive the flip below.
+        prev_fence = _json_dict(_row_get(cur_row, "spawn_fence")) or None
+        if prev_fence is not None:
+            payload["spawn_fence"] = prev_fence
         sql = f"""
                 UPDATE tasks
                    SET status        = '{new_status}',
                        claim_lock    = NULL,
                        claim_expires = NULL,
-                       worker_pid    = NULL,
                        {set_sql}
                  WHERE id = ?
-                   AND status IN ('running', 'ready')
+                   AND status IN ('running', 'ready', 'review')
                 """
         params = (*params, task_id)
         if expected_run_id is not None:
             sql += " AND current_run_id = ?"
             params = (*params, int(expected_run_id))
         if conn.execute(sql, params).rowcount != 1:
-            return False
+            return _ret(False, f"{task_id} changed concurrently; nothing was blocked")
         run_id = _end_or_synthesize_run(
-            conn, task_id, outcome="blocked", status="blocked", summary=reason, synthesize=bool(reason),
+            conn, task_id, outcome="blocked", status="blocked", summary=reason,
+            synthesize=bool(reason),
+            # Provenance, not a stop claim: this run ended while its worker's
+            # identity was still unpublished, so "no PID recorded" cannot be
+            # read as "nothing was running".
+            metadata=({"spawn_fence": prev_fence} if prev_fence is not None else None),
         )
         _append_event(conn, task_id, event_kind, payload, run_id=run_id)
         blocked_task = get_task(conn, task_id)
+        # Identity snapshot taken in the same read as the flip: the stop below
+        # is contingent on THIS caller having won the transition above.
+        prev_pid = _opt_int(_row_get(cur_row, "worker_pid"))
+        prev_lock = _row_get(cur_row, "claim_lock")
+        prev_started = _row_get(cur_row, "worker_started_at")
         if kind == "dependency":
             # Historical ordering: the dependency lane fires inside the txn.
             _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
-            return True
-    _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
-    return True
+            dependency_hook_fired = True
+    if not dependency_hook_fired:
+        _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
+    blocker: Optional[str] = None
+    if prev_pid:
+        stop = _stop_task_worker(
+            conn, task_id, prev_pid, prev_lock, prev_started, signal_fn=signal_fn)
+        if not stop["stopped"]:
+            blocker = stop.get("blocker")
+    if prev_fence is not None:
+        # A spawn for this claim is still in flight, so nothing here can prove
+        # the work stopped: say exactly what is unresolved instead. The fence
+        # itself keeps the card unarchivable until the dispatcher settles it.
+        blocker = blocker or _spawn_fence_blocker(task_id, prev_fence)
+    return _ret(True, blocker)
 
 
 def _route_block(
@@ -3677,6 +3757,9 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         # is a fresh start for the retry budget.
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
+            # A retained worker identity (block could not prove the worker gone)
+            # must not leak into the next run: unblocking starts a fresh claim.
+            "worker_pid = NULL, worker_started_at = NULL, "
             "consecutive_failures = 0, last_failure_error = NULL "
             "WHERE id = ? AND status IN ('blocked', 'scheduled')", (new_status, task_id),
         )
@@ -3881,51 +3964,629 @@ def specify_triage_task(
     return True
 
 
-def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> bool:
-    """Archive a task; a *running* task's host-local worker is terminated.
+# --- In-flight spawn fence ---------------------------------------------------
+# ONE writer arms it: the dispatcher, between claiming a card and starting the
+# child. Whoever resolves that spawn (publication, spawn failure, or the
+# fenced-out stop) clears it; block and archive only READ it. It exists because
+# a child can be alive before any row records its PID: while the fence is set,
+# ``worker_pid IS NULL`` proves nothing, so a card can neither be archived off a
+# "no worker recorded" reading nor have a late PID welded onto a state its claim
+# no longer owns. A fence that can never be settled (its dispatcher died
+# mid-spawn) deliberately keeps the card unarchivable — refusing to archive an
+# identity we could not prove gone is the specified failure mode, not a bug.
 
-    Clearing ``worker_pid`` in the DB alone left the OS process running past its
-    own archive — it kept executing (and pushing work) against a task nothing
-    tracked anymore (#76196). Snapshot pid+claim inside the archive txn so the
-    kill is contingent on THIS caller winning the archive transition (a losing
-    concurrent archiver must never signal the pid); the kill itself runs after
-    commit — ``_poll_worker_exit`` can wait ~5 s and must not hold the write
-    lock. Post-release kill is safe here because ``archived`` is terminal: no
-    dispatcher can spawn a duplicate worker off the released claim. The
-    termination outcome lands as its own ``archive_worker_termination`` event so
-    the ``archived`` event stays atomic with the status flip.
-    """
+
+def _spawn_fence_payload(claim, run, *, at: Optional[int] = None, **extra) -> str:
+    """JSON text for ``tasks.spawn_fence``; ``claim``/``run`` name the spawn it belongs to."""
+    payload: dict = {"claim": claim, "run": int(run) if run else None,
+                     "at": int(at) if at is not None else int(time.time())}
+    payload.update(extra)
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def spawn_fence(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
+    """The in-flight spawn marker on ``task_id``, or ``None`` when no spawn is pending.
+
+    Read-only evidence for callers that must decide whether "no worker recorded"
+    means "nothing is running" (it does not, while this is set)."""
+    row = conn.execute("SELECT spawn_fence FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if row is None:
+        return None
+    raw = _row_get(row, "spawn_fence")
+    return _json_dict(raw) if raw else None
+
+
+def _spawn_fence_blocker(task_id: str, fence: dict) -> str:
+    """The precise reason a block cannot claim the work stopped while its spawn is in flight."""
+    pid = fence.get("pid")
+    if pid:
+        return (
+            f"{task_id} has a spawned worker (pid {int(pid)}, start fingerprint "
+            f"{fence.get('started_at')!r}) from claim {fence.get('claim')!r} / run "
+            f"{fence.get('run')} that could not be proven stopped; the card is held "
+            f"until that process is gone"
+        )
+    return (
+        f"{task_id} was blocked while its worker was still starting: claim "
+        f"{fence.get('claim')!r} / run {fence.get('run')} has not published a PID yet, "
+        f"so the work cannot be proven stopped. The card stays unarchivable until that "
+        f"spawn is settled (published then stopped, or its worker stopped and verified)"
+    )
+
+
+def _fence_is_mine(fence: Optional[dict], claim, run) -> bool:
+    """True when ``fence`` names this exact claim/run — or nothing is armed at all,
+    in which case no other spawn contradicts this one."""
+    if not fence:
+        return True
+    try:
+        return fence.get("claim") == claim and int(fence.get("run") or 0) == int(run or 0)
+    except (TypeError, ValueError):
+        return False
+
+
+def _spawn_fence_writable(
+    conn: sqlite3.Connection, task_id: str, claim, run,
+) -> tuple[Optional[dict], bool]:
+    """``(current fence, may this spawn write it?)``.
+
+    The marker on the row decides: a fence naming this claim/run can always be
+    settled (cleared once the worker is proven gone, or kept with its
+    identity), while another spawn's fence is untouchable — a late writer must
+    never clobber a live hold. With no marker left, a row a DIFFERENT claim now
+    owns is off limits too: that claim already published and cleared its own
+    fence, and re-arming ours would hold a card whose spawn is settled."""
+    row = conn.execute(
+        "SELECT claim_lock, spawn_fence FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None:
+        return None, False
+    fence = _json_dict(_row_get(row, "spawn_fence")) or None
+    if fence is not None:
+        return fence, _fence_is_mine(fence, claim, run)
+    row_claim = _row_get(row, "claim_lock")
+    if claim is not None and row_claim is not None and row_claim != claim:
+        return None, False
+    return None, True
+
+
+def _release_dead_fence(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Settle an armed fence whose retained identity can no longer be observed
+    alive — INSIDE the caller's write txn.
+
+    This is the same proof the archive uses (the canonical ``(pid, start
+    fingerprint)`` re-probed gone), applied earlier and guarded by the exact
+    payload that was read, so a concurrent writer makes this lose the race
+    instead of clearing a hold it did not check. The release is always
+    recorded as ``spawn_fence_released``: an identity is never dropped
+    silently. A fence that carries NO identity is never released here —
+    nothing can be proven about a spawn that never published one (fail closed;
+    only that spawn's own dispatcher can settle it)."""
+    row = conn.execute(
+        "SELECT spawn_fence FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None:
+        return False
+    fence_text = _row_get(row, "spawn_fence")
+    fence = _json_dict(fence_text) or None
+    if fence is None:
+        return False
+    pid = fence.get("pid")
+    if not pid or _worker_alive(int(pid), fence.get("started_at")):
+        return False
+    cur = conn.execute(
+        "UPDATE tasks SET spawn_fence = NULL WHERE id = ? AND spawn_fence = ?",
+        (task_id, fence_text),
+    )
+    if cur.rowcount != 1:
+        return False
+    release_run = fence.get("run")
+    _append_event(conn, task_id, "spawn_fence_released", {
+        "pid": int(pid), "started_at": fence.get("started_at"),
+        "claim": fence.get("claim"), "run": release_run,
+        "reason": "retained worker identity re-probed and proven gone",
+    }, run_id=int(release_run) if release_run else None)
+    return True
+
+
+def _settle_dead_spawn_fence(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Dispatcher-side settlement: release ``task_id``'s spawn fence when its
+    retained worker identity is provably gone, so a RESOLVED hold can never
+    wedge the card out of the pool forever. Returns True when a hold was
+    released. An unresolved hold is left exactly as it is — the caller decides
+    not to dispatch based on the fence that is still there.
+
+    The read runs OUTSIDE any txn so the ordinary tick (no fence, or a fence
+    that never published an identity) takes no writer lock at all; only a
+    retained identity that looks gone reaches :func:`_release_dead_fence`,
+    which re-reads and re-probes under the write txn before clearing anything."""
+    row = conn.execute(
+        "SELECT spawn_fence FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    fence = _json_dict(_row_get(row, "spawn_fence")) if row is not None else None
+    if fence is None:
+        return False
+    pid = fence.get("pid")
+    if not pid or _worker_alive(int(pid), fence.get("started_at")):
+        return False
+    with write_txn(conn):
+        return _release_dead_fence(conn, task_id)
+
+
+def _release_unarmed_claim(
+    conn: sqlite3.Connection, task_id: str, claim, run,
+) -> Optional[str]:
+    """Atomically unwind a claim whose spawn fence could not be armed.
+
+    A successor claim that cannot take the hold (an earlier spawn's fence is
+    still unresolved) must never be left on the row: that reads back as a
+    ``running`` card with no child anywhere. Under THIS claim's own CAS the
+    claim is released, the never-spawned run is closed and the card lands back
+    in the phase it was claimed from (``review`` for a reviewer claim, else
+    ``ready``) — one txn, so a concurrent writer sees either the original claim
+    or the fully unwound card, never a half state. Nothing about the card ran,
+    so the retry budget and ``last_failure_error`` are deliberately untouched.
+
+    Returns the status the card landed in, or ``None`` when this claim was no
+    longer the row's — someone else owns it (or it is already unwound) and
+    there is nothing of ours to release."""
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?",
-            (task_id,),
+            "SELECT status, claim_lock FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
-        if not row:
-            return False
-        was_running = row["status"] == "running"
-        prev_pid, prev_lock, prev_started = row["worker_pid"], row["claim_lock"], row["worker_started_at"]
+        if row is None or _row_get(row, "claim_lock") != claim:
+            return None
+        if _row_get(row, "status") != "running":
+            return None
+        retry_status = _retry_status_for_run(conn, task_id, run)
         cur = conn.execute(
-            "UPDATE tasks SET status = 'archived', "
-            "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
-            "WHERE id = ? AND status != 'archived'", (task_id,),
+            "UPDATE tasks SET status = ?, claim_lock = NULL, claim_expires = NULL, "
+            "    worker_pid = NULL, worker_started_at = NULL "
+            "WHERE id = ? AND claim_lock IS ?",
+            (retry_status, task_id, claim),
         )
         if cur.rowcount != 1:
+            return None
+        fence = spawn_fence(conn, task_id)
+        if fence is not None:
+            held = (f"an earlier spawn's fence (claim {fence.get('claim')!r}, run "
+                    f"{fence.get('run')}"
+                    + (f", pid {int(fence['pid'])}" if fence.get("pid") else "")
+                    + ") is still unresolved")
+        else:  # pragma: no cover - the hold is the only way we get here
+            held = "its spawn fence could not be armed"
+        error = f"spawn refused: {held}; no child was started for this claim"
+        run_id = _end_run(
+            conn, task_id, outcome="spawn_refused", status="spawn_refused",
+            error=error,
+            metadata={"spawn_fence": fence, "retry_status": retry_status},
+        )
+        _append_event(conn, task_id, "spawn_refused", {
+            "error": error, "spawn_fence": fence, "retry_status": retry_status,
+        }, run_id=run_id)
+        return retry_status
+
+
+def _hold_spawn_fence(conn: sqlite3.Connection, task_id: str, claim, run) -> bool:
+    """Arm the in-flight spawn marker under a claim CAS.
+
+    ``False`` when the card is gone, when its claim has already moved on (a
+    successor owns it, or it was blocked/archived mid-dispatch) — in both cases
+    this dispatcher must not start a child at all — or when an EARLIER spawn's
+    fence is still unresolved. A predecessor that has not published a PID yet
+    is exactly as exclusive as one that has: it is never overwritten and a
+    second child is never stacked beside it, because its own child may already
+    be alive under a NULL ``worker_pid``. The single predecessor this may clear
+    is one whose retained identity is provably gone — settled here and recorded
+    as ``spawn_fence_released``, never dropped silently."""
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT claim_lock, spawn_fence FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if row is None or _row_get(row, "claim_lock") != claim:
             return False
-        # Archived mid-run (dashboard): close the run so history isn't orphaned.
+        fence = _json_dict(_row_get(row, "spawn_fence")) or None
+        if fence is not None and not _fence_is_mine(fence, claim, run):
+            if not _release_dead_fence(conn, task_id):
+                return False
+        cur = conn.execute(
+            "UPDATE tasks SET spawn_fence = ? WHERE id = ? AND claim_lock IS ?",
+            (_spawn_fence_payload(claim, run), task_id, claim),
+        )
+        return cur.rowcount == 1
+
+
+def _release_spawn_fence(conn: sqlite3.Connection, task_id: str, claim, run) -> bool:
+    """Release the marker THIS spawn armed.
+
+    Never releases a fence that already carries a worker identity the stop path
+    could not prove gone — that hold is the only thing keeping the card
+    unarchivable — nor one belonging to a successor claim."""
+    with write_txn(conn):
+        fence, writable = _spawn_fence_writable(conn, task_id, claim, run)
+        if not writable or fence is None or fence.get("pid"):
+            return False
+        conn.execute("UPDATE tasks SET spawn_fence = NULL WHERE id = ?", (task_id,))
+        return True
+
+
+def _arm_spawn_fence_identity(
+    conn: sqlite3.Connection, task_id: str, *, claim, run, pid, started_at,
+) -> bool:
+    """Attach the just-started worker's identity to its spawn fence BEFORE any stop
+    is attempted: from that moment the card is held against a known process, so a
+    failure anywhere in the stop path can never leave a live child behind an
+    archivable card."""
+    with write_txn(conn):
+        fence, writable = _spawn_fence_writable(conn, task_id, claim, run)
+        if not writable:
+            return False
+        held = dict(fence or {})
+        held.update({
+            "claim": claim, "run": int(run) if run else None,
+            "at": held.get("at") or int(time.time()),
+            "pid": int(pid), "started_at": started_at,
+        })
+        conn.execute("UPDATE tasks SET spawn_fence = ? WHERE id = ?",
+                     (_json_or_null(held), task_id))
+        return True
+
+
+def _settle_fenced_spawn(
+    conn: sqlite3.Connection, task_id: str, *, claim, run, pid, started_at, stop: dict,
+) -> bool:
+    """Record a spawn whose publication lost its claim, and settle its fence.
+
+    The child NEVER becomes this row's ``worker_pid``: the claim it belonged to
+    is already blocked/archived/replaced, so attaching it would stamp the new
+    state with a worker that state does not own. Its identity goes to the
+    spawn's OWN run row (historical truth, and what ``reap_terminal_workers``
+    keys on) and — when the stop could not be proven — stays in the fence, which
+    is what keeps the card unarchivable. Returns True only when the hold was
+    released because the worker is proven gone. ``spawn_discarded`` is appended
+    either way so run outcome and event provenance stay truthful.
+    """
+    stopped = bool(stop.get("stopped"))
+    payload: dict = {
+        "pid": int(pid), "started_at": started_at, "claim": claim, "run": run,
+        "stopped": stopped, "reason": "claim lost before the worker PID could be published",
+        "termination_attempted": bool(stop.get("termination_attempted")),
+        "terminated": bool(stop.get("terminated")), "sigkill": bool(stop.get("sigkill")),
+    }
+    if not stopped:
+        payload["blocker"] = stop.get("blocker") or (
+            f"worker pid {pid} (start fingerprint {started_at!r}) survived the stop; "
+            f"its execution cannot be proven stopped"
+        )
+    released = False
+    with write_txn(conn):
+        if conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone() is None:
+            # Hard-deleted while the child was starting: no card left to hold or
+            # to record on (an event row here would be an orphan).
+            return False
+        if run:
+            conn.execute(
+                "UPDATE task_runs SET worker_pid = ?, worker_started_at = ? "
+                "WHERE id = ? AND task_id = ?",
+                (int(pid), started_at, int(run), task_id),
+            )
+        fence, writable = _spawn_fence_writable(conn, task_id, claim, run)
+        if writable:
+            if stopped:
+                conn.execute("UPDATE tasks SET spawn_fence = NULL WHERE id = ?", (task_id,))
+                released = True
+            else:
+                held = dict(fence or {})
+                held.update({"claim": claim, "run": int(run) if run else None,
+                             "at": held.get("at") or int(time.time()),
+                             "pid": int(pid), "started_at": started_at})
+                conn.execute("UPDATE tasks SET spawn_fence = ? WHERE id = ?",
+                             (_json_or_null(held), task_id))
+        _append_event(conn, task_id, "spawn_discarded", payload,
+                      run_id=int(run) if run else None)
+    return released
+
+
+# --- Archive policy (operator ruling, 2026-09-24) ----------------------------
+# Protect exactly the KNOWN work-in-flight statuses; every other status —
+# including legacy/unrecognized raw values such as ``completed`` — archives
+# directly ("don't refuse unknown, just protect the known"). ``VALID_STATUSES``
+# is deliberately NOT the allowlist: it is a write-side enum and legacy rows
+# predate it, so membership would refuse exactly the raw statuses that must
+# keep working.
+ARCHIVE_PROTECTED_STATUSES: frozenset = frozenset({"ready", "running", "review"})
+
+
+def archive_refusal_reason(task_id: str, status: Optional[str]) -> Optional[str]:
+    """Why a direct archive of ``status`` is refused, or ``None`` when allowed.
+
+    One shared sentence for every archive surface (DB lifecycle, operator CLI,
+    dashboard, agent tool) so the guard and its explanation cannot drift."""
+    if status not in ARCHIVE_PROTECTED_STATUSES:
+        return None
+    action = {
+        "ready": "fence it from the dispatcher",
+        "running": "stop the worker",
+        "review": "stop the review",
+    }[status]
+    return (
+        f"{task_id} is {status!r} — work in flight; {action} first by blocking it "
+        f"(`hermes kanban block {task_id} <reason>`, or kanban_block), then archive. "
+        f"Nothing changed."
+    )
+
+
+def review_association(conn: sqlite3.Connection, task_id: str) -> dict:
+    """Read-only evidence about the review lane on ``task_id`` (never mutates).
+
+    The review flow is SAME-CARD: ``request_review`` parks this card in
+    ``review`` and the dispatcher's ``claim_review_task`` claims the SAME card
+    into a new reviewer run, identified by that run's ``claimed`` event
+    carrying ``source_status='review'``. Nothing here is inferred into a second
+    card: blocking this card stops its own review run, and what an archive
+    affects is surfaced by the ordinary dependency graph (``linked``) plus the
+    archive impact receipt — dependents are reported, never mutated on this
+    card's behalf.
+    """
+    empty: dict = {
+        "task_id": task_id, "found": False, "lane": "same_card", "status": None,
+        "reviewer": None, "active_review_run": None, "review_runs": [], "linked": [],
+    }
+    trow = conn.execute(
+        "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if trow is None:
+        return empty
+    handoff = _json_dict(_row_get(_latest_event(conn, task_id, "review_requested"), "payload"))
+    reviewer = _nonblank_str(handoff.get("reviewer"))
+    claimed = {
+        int(r["run_id"]): _json_dict(r["payload"])
+        for r in conn.execute(
+            "SELECT run_id, payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'claimed' AND run_id IS NOT NULL",
+            (task_id,),
+        ).fetchall()
+    }
+    review_runs = [
+        {"id": int(r["id"]), "profile": r["profile"], "status": r["status"],
+         "outcome": r["outcome"], "started_at": r["started_at"], "ended_at": r["ended_at"]}
+        for r in conn.execute(
+            "SELECT id, profile, status, outcome, started_at, ended_at "
+            "FROM task_runs WHERE task_id = ? ORDER BY id", (task_id,),
+        ).fetchall()
+        if claimed.get(int(r["id"]), {}).get("source_status") == "review"
+    ]
+    current = int(trow["current_run_id"] or 0)
+    linked = [
+        {"id": r["id"], "title": r["title"], "status": r["status"],
+         "assignee": r["assignee"], "current_run_id": r["current_run_id"]}
+        for r in conn.execute(
+            "SELECT t.id, t.title, t.status, t.assignee, t.current_run_id "
+            "FROM task_links l JOIN tasks t ON t.id = l.child_id "
+            "WHERE l.parent_id = ? ORDER BY t.id", (task_id,),
+        ).fetchall()
+    ]
+    return {
+        "task_id": task_id, "found": True, "lane": "same_card",
+        "status": trow["status"], "reviewer": reviewer,
+        "active_review_run": next((r for r in review_runs if r["id"] == current), None),
+        "review_runs": review_runs, "linked": linked,
+    }
+
+
+def _stop_task_worker(
+    conn: sqlite3.Connection, task_id: str, pid, lock, started_at, *, signal_fn=None,
+) -> dict:
+    """Stop/reap the worker recorded on ``task_id`` and verify it is gone.
+
+    ``stopped`` holds only when the canonical identity (``worker_pid`` plus the
+    start-time fingerprint) can no longer be observed alive — the evidence a
+    later archive requires — and the outcome is recorded as a
+    ``block_worker_termination`` event either way. Identity columns are cleared
+    ONLY when proven gone, so a survivor keeps its identity on the row instead
+    of becoming an untracked process (#76196). This process never signals
+    itself (a worker blocking its own card), and an identity we cannot manage
+    is reported as the blocker rather than quietly read as stopped.
+    """
+    info: dict[str, Any] = {
+        "worker_pid": int(pid) if pid else None, "stopped": False,
+        "termination_attempted": False, "terminated": False,
+    }
+    if not pid:
+        info["stopped"] = True
+        info["note"] = "no worker recorded on the card"
+    elif int(pid) == os.getpid():
+        info["self"] = True
+        info["stopped"] = not _worker_alive(pid, started_at)
+        if not info["stopped"]:
+            info["blocker"] = (
+                f"worker pid {pid} is this process; it must exit before this card "
+                f"can be archived"
+            )
+    else:
+        info.update(_terminate_reclaimed_worker(
+            pid, lock, signal_fn=signal_fn, started_at=started_at))
+        info["stopped"] = not _worker_alive(pid, started_at)
+        if not info["stopped"]:
+            info["blocker"] = (
+                f"worker pid {pid} (start fingerprint {started_at!r}) is still alive; "
+                f"its execution cannot be proven stopped"
+            )
+    with write_txn(conn):
+        if pid and info["stopped"]:
+            conn.execute(
+                "UPDATE tasks SET worker_pid = NULL, worker_started_at = NULL "
+                "WHERE id = ? AND worker_pid = ?", (task_id, int(pid)),
+            )
+        _append_event(conn, task_id, "block_worker_termination", info)
+    return info
+
+
+def _archive_row(conn: sqlite3.Connection, task_id: str):
+    """``archive_task``'s diagnostic pre-read: the whole row the refusal copy needs.
+
+    Deliberately separate from (and weaker than) the guard: a transition that
+    lands between this read and the guarded UPDATE makes the archive lose on
+    ``rowcount != 1`` instead of archiving from a stale row."""
+    return conn.execute(
+        "SELECT status, claim_lock, worker_pid, worker_started_at, spawn_fence "
+        "FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+
+
+def archive_task(
+    conn: sqlite3.Connection, task_id: str, *, with_reason: bool = False,
+    event_payload: Optional[dict] = None,
+) -> Any:
+    """Archive a task under the shared archive policy.
+
+    One policy for every surface (DB lifecycle, operator CLI, dashboard, agent
+    tool), so none of them can drift or bypass the others:
+
+    * ``ready`` / ``running`` / ``review`` are work in flight and are refused
+      with the block/stop-first copy from :func:`archive_refusal_reason` —
+      nothing is written on refusal.
+    * every other status archives directly, including legacy/unrecognized raw
+      statuses (``completed`` and friends): unknown is not refused.
+    * ``archived`` keeps its already-archived/no-op refusal — archive is not
+      deletion, and no second ``archived`` event is written.
+    * a live worker identity blocks the archive until that process can be
+      proven gone (``worker_pid`` + start-time fingerprint).
+    * ``spawn_fence`` — a claim whose worker has started but has not published
+      its PID yet — blocks the archive for the same reason: while it is armed,
+      ``worker_pid IS NULL`` proves nothing. A fence that already carries a
+      retained worker identity releases that hold in the SAME guarded UPDATE
+      once its canonical ``(pid, start fingerprint)`` can no longer be observed
+      alive (recorded as ``spawn_fence_released``), so a card is never wedged
+      beside a dead process; a fence with no identity yet is never released.
+      Nothing on this card's behalf mutates another card; dependents are
+      reported through the archive impact receipt instead.
+
+    The guard is the SAME statement as the flip (``status NOT IN (...)`` inside
+    this IMMEDIATE txn), so a concurrent transition — a dispatcher claim racing
+    a ``ready`` archive included — can never slip between the check and the
+    archive: the loser sees ``rowcount != 1`` and changes nothing.
+    ``with_reason=True`` returns ``(ok, reason)`` for a caller that must quote
+    the precise refusal.
+
+    ``event_payload`` — an optional dict written as THIS event's payload in the
+    same guarded flip. The agent tool passes its provenance
+    (``{"source": ..., "actor": ..., "reason": ...}``) so an archive carries
+    who/why for later audit and recall. It defaults to ``None``, which keeps the
+    historical payload-less ``archived`` event: the operator CLI and the
+    dashboard never supply one, so those surfaces stay exactly as they were.
+    Refusals and the already-archived no-op return before any event is written,
+    payload or not.
+    """
+    if event_payload is not None and not isinstance(event_payload, dict):
+        raise ValueError(
+            f"event_payload must be a dict or None, got {type(event_payload).__name__}")
+
+    def _ret(ok: bool, reason: Optional[str] = None):
+        return (ok, reason) if with_reason else ok
+
+    with write_txn(conn):
+        row = _archive_row(conn, task_id)
+        if not row:
+            return _ret(False, f"no such task: {task_id}")
+        status = row["status"]
+        if status == "archived":
+            return _ret(False, f"{task_id} is already archived; nothing changed")
+        refusal = archive_refusal_reason(task_id, status)
+        if refusal is not None:
+            return _ret(False, refusal)
+        # A status alone is not "no work in flight": a live worker identity keeps
+        # the card unarchivable until that process can be proven gone.
+        pid, started_at = row["worker_pid"], row["worker_started_at"]
+        if pid and _worker_alive(pid, started_at):
+            return _ret(False, (
+                f"{task_id} still has a live worker (pid {int(pid)}); its execution "
+                f"cannot be proven stopped, so nothing was archived. Stop the worker "
+                f"(blocking the card stops it) and retry."
+            ))
+        # ...and neither is "no worker recorded": a spawn that has started the
+        # child but not yet published its PID leaves ``worker_pid`` NULL while a
+        # process may already be alive. Refuse with the exact hold; the fence is
+        # settled by the dispatcher that armed it (publish, or fence out and stop
+        # the worker), and only then can this card archive.
+        fence_text = _row_get(row, "spawn_fence")
+        fence = _json_dict(fence_text) or None
+        fence_released: Optional[dict] = None
+        if fence is not None:
+            held_pid = fence.get("pid")
+            if held_pid and not _worker_alive(held_pid, fence.get("started_at")):
+                # Recovery for a hold whose worker has since died: the retained
+                # identity is the canonical ``(pid, start fingerprint)`` and it
+                # can no longer be observed alive, so it IS the proof the stop
+                # path could not record at the time. Released below in the SAME
+                # guarded UPDATE as the flip, so this is never a blind clear.
+                fence_released = fence
+            else:
+                if held_pid:
+                    detail = (f" (pid {int(held_pid)}, start fingerprint "
+                              f"{fence.get('started_at')!r})")
+                    head = (f"{task_id} has a spawned worker{detail} from claim "
+                            f"{fence.get('claim')!r} / run {fence.get('run')}")
+                else:
+                    head = (f"{task_id} has a spawn in flight (claim {fence.get('claim')!r}, run "
+                            f"{fence.get('run')}) that has not published a worker identity yet")
+                return _ret(False, (
+                    f"{head}, so no live worker can be ruled out — nothing was archived. The card "
+                    f"becomes archivable once that spawn is settled and its worker is stopped and "
+                    f"verified."
+                ))
+        # The guard lives in the UPDATE predicate itself: the pre-read above is
+        # only for diagnostics/refusal copy, never the authority.
+        guard = ("id = ? AND status NOT IN ('ready', 'running', 'review') "
+                 "AND (spawn_fence IS NULL")
+        params: list[Any] = [task_id]
+        if fence_released is not None:
+            # The release is atomic with the flip: the predicate still demands
+            # the exact hold we probed, so a writer that touched the fence in
+            # between makes this archive lose instead of archiving over it.
+            guard += " OR spawn_fence = ?)"
+            params.append(fence_text)
+        else:
+            guard += ")"
+        if pid:
+            # The liveness probe above is authoritative: if the recorded identity
+            # moved underneath us, lose the race rather than archive blind.
+            guard += " AND (worker_pid IS NULL OR worker_pid = ?)"
+            params.append(pid)
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'archived', "
+            "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
+            "    spawn_fence = NULL "
+            f"WHERE {guard}",
+            tuple(params),
+        )
+        if cur.rowcount != 1:
+            return _ret(False, (
+                f"{task_id} changed concurrently; nothing was archived — re-read the "
+                f"card and retry"
+            ))
+        if fence_released is not None:
+            # Truthful evidence for the recovery: which identity was held, and
+            # that it was re-probed gone rather than silently dropped.
+            release_run = fence_released.get("run")
+            _append_event(conn, task_id, "spawn_fence_released", {
+                "pid": int(fence_released["pid"]),
+                "started_at": fence_released.get("started_at"),
+                "claim": fence_released.get("claim"), "run": release_run,
+                "reason": "retained worker identity re-probed and proven gone",
+            }, run_id=int(release_run) if release_run else None)
+        # Leaked run on a non-running card: close it so history isn't orphaned.
         run_id = _end_run(
             conn, task_id, outcome="reclaimed", status="reclaimed",
             summary="task archived with run still active",
         )
-        _append_event(conn, task_id, "archived", None, run_id=run_id)
-    if was_running:
-        termination = _terminate_reclaimed_worker(prev_pid, prev_lock, signal_fn=signal_fn, started_at=prev_started)
-        with write_txn(conn):
-            _append_event(conn, task_id, "archive_worker_termination", termination, run_id=run_id)
+        _append_event(conn, task_id, "archived", event_payload, run_id=run_id)
     # ``archived`` parents no longer block children; promote them now.
     recompute_ready(conn)
     # Reap the workspace on archive too (never-completed tasks kept it forever).
     _cleanup_workspace(conn, task_id)
-    return True
+    return _ret(True, None)
 
 
 def _delete_task_relations(conn: sqlite3.Connection, task_id: str) -> None:

@@ -397,6 +397,42 @@ hermes kanban unblock  t_abc t_def
 hermes kanban block    t_abc "need input" --ids t_def t_hij
 ```
 
+:::note What `archive` accepts
+`archive` protects exactly the work-in-flight statuses **`ready`**, **`running`** and
+**`review`**: a direct attempt on one of them changes nothing and tells you to block it
+first (`hermes kanban block <id> <reason>`, then archive). Every other status archives
+directly — including legacy raw values such as `completed` — and archiving an already
+`archived` card is a no-op (archive is not deletion). Blocking a `running` card stops
+its worker by `worker_pid` + start-time fingerprint and only lets the archive through
+once that process is provably gone; a survivor keeps its identity on the row and the
+archive quotes the blocker. The same holds while a worker is *starting*: the dispatcher
+arms a spawn fence before it begins the child, so a card whose PID is not published yet
+is never archived on a "no worker recorded" reading — the block quotes the in-flight
+spawn and the archive refuses until the dispatcher either publishes that PID (then the
+block stops it) or is fenced out and stops the child itself. If that stop could not
+prove the worker gone, its identity stays on the fence and the archive keeps refusing;
+once the same `(pid, start fingerprint)` can no longer be observed alive, the hold
+releases in the same guarded update as the archive and is recorded as
+`spawn_fence_released`. The dashboard and the
+`kanban_archive` tool run the same policy, so no surface can bypass it. The tool
+also takes a **required `reason`** — one or two sentences saying why the card is
+being archived — which is validated before anything changes (missing, non-string
+or blank input fails with no side effects) and then stored on the `archived`
+event as `{"source": "kanban_archive", "actor": <profile>, "reason": "<yours>"}`
+so the board keeps an audit trail of who archived what and why. The CLI `archive`
+verb and the dashboard archive without one, exactly as before. The hold
+also stops a *successor* dispatch: while a card's spawn fence is armed the
+dispatcher will not claim it or start a second child beside it — the card stays
+`ready` and the tick reports `respawn_guarded` / `spawn_fence_hold` — and a claim
+that reaches the fence arm anyway is unwound atomically instead of being left
+owning a `running` card with no worker. A retained identity that is proven gone
+releases the same way before the next claim, recorded rather than dropped.
+
+Review is same-card throughout: blocking the reviewed work stops its own reviewer run, and what
+that affects elsewhere is reported through the dependency graph and the archive impact
+receipt — other cards are never blocked or mutated on this card's behalf.
+:::
+
 :::note Where an unblocked task lands
 `unblock` restores the safe source phase: **`review`** for reviewer-origin work
 whose parents are complete, **`ready`** for implementation work whose parents
@@ -1373,7 +1409,7 @@ Runs are exposed on the dashboard (Run History section in the drawer, one colour
 
 **Live-claim guard on complete.** A `running` task whose worker holds a live claim is only completed by that worker (`kanban_complete` from inside the run) or by an explicit operator override: `hermes kanban complete <id> --force` and the dashboard's "mark done" action. A claim-less `hermes kanban complete <id>` or an orchestrator session's `kanban_complete` is refused with a pointer to `--force` / `hermes kanban reclaim`, so a second session can no longer close a live worker's run underneath it. Completing `ready`, `blocked` or `review` cards without a claim is unchanged.
 
-**Reclaimed runs from status changes.** If you drag a running task off `running` in the dashboard (back to `ready`, or straight to `todo`), or archive a task that was still running, the in-flight run closes with `outcome='reclaimed'` rather than being orphaned. The `task_runs` row is always in a terminal state when `tasks.current_run_id` is `NULL`, and vice versa — that invariant holds across CLI, dashboard, dispatcher, and notifier.
+**Reclaimed runs from status changes.** If you drag a running task off `running` in the dashboard (back to `ready`, or straight to `todo`), the in-flight run closes with `outcome='reclaimed'` rather than being orphaned. The `task_runs` row is always in a terminal state when `tasks.current_run_id` is `NULL`, and vice versa — that invariant holds across CLI, dashboard, dispatcher, and notifier. Archiving a running task is refused outright (see the archive policy below); stopping its worker is the block path's job.
 
 **Synthetic runs for never-claimed completions.** Completing or blocking a task that was never claimed (e.g. a human closes a `ready` task from the dashboard with a summary, or a CLI user runs `hermes kanban complete <ready-task> --summary X`) would otherwise drop the handoff. Instead the kernel inserts a zero-duration run row (`started_at == ended_at`) carrying the summary / metadata / reason so attempt history stays complete. The `completed` / `blocked` event's `run_id` points at that row.
 
@@ -1399,7 +1435,9 @@ Every transition appends a row to `task_events`. Each row carries an optional `r
 | `dependency_wait` | `{reason, kind}` or `{reason: parent_not_done, demoted: true, parent}` | Worker blocked with `kind=dependency` while at least one parent is still open — the task is only waiting on another task, so it routes to `todo` (parent-gated, auto-promoted) instead of `blocked` and no recurrence is counted. No human needed. Also emitted when `link`/`kanban_link` puts a `ready` child under a parent that is not `done`: the child drops back to `todo` and this event records why (the `ready → running` claim re-checks parents, so nothing can run it until the parent completes or the link is removed with `hermes kanban unlink`). |
 | `block_loop_detected` | `{reason, kind, recurrences, limit}` | A task was unblocked and re-blocked for the same reason `BLOCK_RECURRENCE_LIMIT` times (default 2). Instead of landing in `blocked` again — where a cron would keep unblocking it — it routes to `triage` for orchestration attention, breaking the unblock↔re-block loop. |
 | `unblocked` | — | `blocked → ready` (or `todo` if parents are still open), either manually or via `/unblock`. Resets the dispatcher's `consecutive_failures` but deliberately preserves `block_recurrences` so the loop breaker keeps its memory. `run_id` is `NULL`. |
-| `archived` | — | Hidden from the default board. If the task was still running, carries the `run_id` of the run that was reclaimed as a side effect. |
+| `archived` | `{source, actor, reason}?` — only when the agent-facing `kanban_archive` tool supplied its required `reason`; the CLI and the dashboard stay payload-less | Hidden from the default board. Refused while the task is `ready`, `running` or `review`; if a run was still open on a non-running card it is closed here with `run_id`. |
+| `block_worker_termination` | `{worker_pid, stopped, terminated, blocker?}` | A block stopped (or failed to stop) the card's worker: `stopped` is true only when the `worker_pid` + start-time fingerprint could no longer be observed alive. A survivor keeps its identity on the row, which is what later refuses the archive. |
+| `blocked` (spawn-in-flight) | `{spawn_fence}` | Also on the `blocked` event when the card was blocked while its worker was still starting: `spawn_fence` names the claim/run whose PID has not been published, so the run closing is provenance ("no PID recorded" is not "nothing was running") and the block's `stop_blocker` quotes the hold that keeps the card unarchivable. |
 
 **Edits** (human-driven changes that aren't transitions):
 
@@ -1414,16 +1452,19 @@ Every transition appends a row to `task_events`. Each row carries an optional `r
 
 | Kind | Payload | When |
 |---|---|---|
-| `spawned` | `{pid}` | Dispatcher successfully started a worker process. |
+| `spawned` | `{pid}` | Dispatcher successfully started a worker process and durably published its PID + start fingerprint (only while the row still shows the claim/run the spawn belongs to). |
 | `worker_registered` | `{pid, started_at}` | The dispatcher died after starting the worker but before recording its pid, so the worker recorded it itself before its first model call. Liveness checks then see it and an expired claim is extended instead of spawning a second worker. A worker whose run was reclaimed before it got that far exits without working the card. |
+| `spawn_discarded` | `{pid, started_at, claim, run, stopped, blocker?}` | A spawned worker's PID publication lost its claim — the card was blocked/archived/reclaimed while the child was starting. Nothing was written to `tasks.worker_pid` (the late PID never lands on a state its claim does not own); the identity is kept on that spawn's own run row, the child is stopped and verified with its canonical `(pid, start fingerprint)`, and `stopped` records the truth. A survivor leaves `blocker` and keeps the card's spawn fence armed, which is what refuses the archive until it is gone. |
+| `spawn_fence_released` | `{pid, started_at, claim, run, reason}` | A retained spawn-fence identity was released because that exact `(pid, start fingerprint)` could no longer be observed alive. Written by the archive atomically with the `archived` flip, and by the dispatcher before it re-arms a card's fence for a successor spawn — either way the hold is never dropped silently. |
 | `heartbeat` | `{note?}` | Worker called `hermes kanban heartbeat $TASK` to signal liveness during long operations. |
 | `reclaimed` | `{stale_lock}` | Claim TTL expired without a completion; task goes back to `ready`. An automatic reclaim counts as one non-successful attempt toward the `gave_up` breaker (a claim that never spawned a worker would otherwise loop claim → reclaim → claim forever); an operator `reclaim` resets the counter instead. |
 | `crashed` | `{pid, claimer, exit_kind?, exit_code?, worker_output?}` | Worker PID no longer alive but TTL hadn't expired yet. `worker_output` is the tail of the worker's own log (its final response or the rendered provider error, chrome stripped, ≤ 400 chars) and is also appended to the task's `last_failure_error`, so the board shows *why* instead of only the exit code. |
 | `timed_out` | `{pid, elapsed_seconds, limit_seconds, sigkill}` | `max_runtime_seconds` exceeded; dispatcher SIGTERM'd (then SIGKILL'd after 5 s grace) and re-queued. |
 | `stale` | `{elapsed_seconds, last_heartbeat_at, heartbeat_age_seconds, timeout_seconds, pid, terminated}` | Task ran longer than `kanban.dispatch_stale_timeout_seconds` (default 4 h) AND no `kanban_heartbeat` arrived in the last hour. Dispatcher SIGTERM'd the host-local worker (if any), reset the task to `ready` for re-dispatch. Does NOT tick the failure counter (stale is dispatcher-side absence detection, not a worker fault). Workers running long operations should call `kanban_heartbeat` at least once an hour to avoid this. |
 | `reconciled` | `{reason, claim_lock, claim_expires, worker_pid}` | Orphaned-card reconciliation: the card was `running` with broken claim bookkeeping (`claim_lock` or `claim_expires` NULL — crash mid-claim, manual SQL, DB restore) and no live worker, so none of the TTL/crash/stale paths could ever recover it. The dispatcher requeued it to `ready` with an explanatory comment. Gated by `kanban.reconcile_orphans` in config.yaml (default `true`). |
-| `respawn_guarded` | `{reason}` | Dispatcher refused to re-spawn this ready task this tick. Reasons: `infrastructure_cooldown` (the host refused the last spawn — no restart-safe systemd scope — and the cooldown has not elapsed; never counted against the card), `rate_limit_cooldown` (the last run hit a quota wall; same cooldown, never counted), `blocker_auth` (last failure was a quota/auth/429 error — wait for the rate window to reset), `recent_success` (a completed run happened in the last hour — wait for review before re-running), `active_pr` (a GitHub PR URL appears in a recent comment — a prior worker already opened a PR). The task stays in `ready`; the next tick gets another chance to spawn. If the underlying condition persists, the normal `consecutive_failures` circuit breaker will auto-block via `gave_up` after `failure_limit` failures. |
+| `respawn_guarded` | `{reason}` | Dispatcher refused to re-spawn this ready task this tick. Reasons: `spawn_fence_hold` (an earlier spawn's fence is still unresolved — its child may be alive under a NULL `worker_pid`, so this tick claims nothing and starts no second child; the predecessor's own dispatcher settles the fence, or a retained identity that is provably gone releases first), `infrastructure_cooldown` (the host refused the last spawn — no restart-safe systemd scope — and the cooldown has not elapsed; never counted against the card), `rate_limit_cooldown` (the last run hit a quota wall; same cooldown, never counted), `blocker_auth` (last failure was a quota/auth/429 error — wait for the rate window to reset), `recent_success` (a completed run happened in the last hour — wait for review before re-running), `active_pr` (a GitHub PR URL appears in a recent comment — a prior worker already opened a PR). The task stays in `ready`; the next tick gets another chance to spawn. If the underlying condition persists, the normal `consecutive_failures` circuit breaker will auto-block via `gave_up` after `failure_limit` failures. |
 | `spawn_failed` | `{error, failures}` | One spawn attempt failed (missing PATH, workspace unmountable, …). Counter increments; task returns to `ready` for retry. |
+| `spawn_refused` | `{error, spawn_fence, retry_status}` | A claim was taken but its spawn fence could not be armed — another spawn's fence already holds the card — so no child was ever started. The claim is unwound in the same transaction (claim released, the never-spawned run closed with outcome `spawn_refused`, card back in the phase it was claimed from: `ready`, or `review` for a reviewer claim). Nothing ran, so `consecutive_failures` and `last_failure_error` are deliberately untouched and the circuit breaker does not fire. |
 | `protocol_violation` | `{pid, claimer, exit_code, protocol_violation, worker_output?}` | Worker exited successfully while the task was still `running`, usually because it answered without a terminal board call (`kanban_complete`, `kanban_request_review` or `kanban_block`). Emitted on every violation (the payload's `protocol_violation: true` marker is copied into the run metadata and feeds the violation-only retry budget). Below the budget — up to `_PROTOCOL_VIOLATION_FAILURE_LIMIT` (default 3) *consecutive* violations, per-task `max_retries` overriding — the task simply returns to `ready` for another attempt; when the streak reaches the bound the dispatcher also emits `gave_up` and auto-blocks. `worker_output` carries the worker's own last printed text (usually its explanation of why it stopped), also folded into `last_failure_error` and shown to the retry worker as the prior-attempt error. |
 | `gave_up` | `{failures, effective_limit, limit_source, error, terminal_provider?}` | Circuit breaker fired after N consecutive non-successful attempts. Task auto-blocks with the last error. The effective limit resolves as task `max_retries`, then dispatcher `failure_limit` / `kanban.failure_limit`, then the built-in default. `terminal_provider: true` means the worker exited `78` on a provider error a retry cannot fix (credential revoked, model gone) and the breaker fired on that first attempt, sticky, regardless of the limit. |
 
