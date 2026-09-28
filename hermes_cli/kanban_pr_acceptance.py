@@ -14,20 +14,47 @@ _REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _PR = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)")
 # The rulesets API answers private Free-plan repositories with exactly this body.
 _PLAN_GATE = "Upgrade to GitHub Pro or make this repository public to enable this feature."
+# ``gh`` reports the status as ``gh: <message> (HTTP <code>)`` or
+# ``gh: HTTP <code>: <message> (<url>)``; the trailing ``\b`` keeps a longer
+# number (``HTTP 4030``) from counting as 403 evidence.
+_HTTP_403 = re.compile(r"HTTP 403\b")
+
+
+def _error_body(stdout: object) -> dict | None:
+    """Parse ``gh api``'s JSON error body, or ``None`` when it is not an object.
+
+    Empty, truncated, non-JSON and non-object bodies all yield ``None`` so the
+    caller fails closed instead of guessing at the message.
+    """
+    if not isinstance(stdout, str) or not stdout.strip():
+        return None
+    try:
+        body = json.loads(stdout)
+    except ValueError:
+        return None
+    return body if isinstance(body, dict) else None
 
 
 def _is_plan_gate(exc: subprocess.CalledProcessError) -> bool:
     """Whether ``exc`` is GitHub's plan/visibility 403 on the rulesets endpoint.
 
     ``gh api`` prints the JSON error body to stdout and ``gh: <message>
-    (HTTP <code>)`` (or ``gh: HTTP <code>: <message> (<url>)``) to stderr, so
-    both streams are matched: the verbatim plan-gate message plus an explicit
-    403 marker. Any other body, status or stream layout stays a failure.
+    (HTTP <code>)`` (or ``gh: HTTP <code>: <message> (<url>)``) to stderr. The
+    body is parsed structurally and its ``message`` must equal ``_PLAN_GATE``
+    verbatim — a prefixed, suffixed or otherwise reworded message is a
+    different error — on top of explicit 403 evidence (the parsed ``status``
+    field, else an ``HTTP 403`` marker on either stream). Malformed JSON, a
+    missing or non-string ``message``, and any other status stay a failure.
     """
-    text = "".join(part for part in (getattr(exc, "stdout", None), getattr(exc, "stderr", None))
-                   if isinstance(part, str))
-    return _PLAN_GATE in text and any(
-        marker in text for marker in ('HTTP 403', '"status": "403"', '"status":"403"'))
+    body = _error_body(getattr(exc, "stdout", None))
+    if body is None or body.get("message") != _PLAN_GATE:
+        return False
+    status = body.get("status")
+    if status is not None:
+        return str(status) == "403"
+    return any(_HTTP_403.search(part)
+               for part in (getattr(exc, "stdout", None), getattr(exc, "stderr", None))
+               if isinstance(part, str))
 
 
 def validate_contract(value: str | None) -> str:

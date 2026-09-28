@@ -1,6 +1,7 @@
 """Two lifecycle invariants, using real SQLite and a local GitHub HTTP contract."""
 import json
 import os
+import subprocess
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -9,6 +10,7 @@ from typing import Any
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_pr_acceptance as acceptance
 from hermes_cli.kanban_db_connect import connect
 
 
@@ -273,3 +275,85 @@ def test_plan_gate_fallback_still_rejects_missing_or_failing_checks(github):
             assert _status(conn, tid) != "done"
         github.pop("missing", None)
         github.update(conclusion="success")
+
+
+def _gate_body(message: str = PLAN_GATE, status: str | None = "403"):
+    """The exact stream ``gh api`` prints for a rulesets error."""
+    return json.dumps({"message": message,
+                       "documentation_url": "https://docs.github.com/rest",
+                       **({"status": status} if status is not None else {})})
+
+
+def _gate_error(stdout=None, stderr=""):
+    return subprocess.CalledProcessError(1, ["gh", "api", "repos/acme/repo/rules/branches/main"],
+                                         output=stdout, stderr=stderr)
+
+
+@pytest.mark.linux_only
+def test_plan_gate_predicate_requires_the_exact_message():
+    """The body is parsed, so only a verbatim ``message`` identifies the plan gate."""
+    stderr = f"gh: {PLAN_GATE} (HTTP 403)"
+    assert acceptance._is_plan_gate(_gate_error(_gate_body(), stderr)) is True
+    assert acceptance._is_plan_gate(_gate_error(_gate_body(), "")) is True
+    altered = (f"prefix {PLAN_GATE}", f"{PLAN_GATE} suffix", f"prefix {PLAN_GATE} suffix",
+               PLAN_GATE[:-1], PLAN_GATE + " ", " " + PLAN_GATE,
+               PLAN_GATE.replace(" ", "  "), PLAN_GATE.replace(".", ""),
+               PLAN_GATE.upper(), PLAN_GATE.lower().replace("github", "GitHub", 1),
+               json.dumps({"message": PLAN_GATE, "documentation_url": "x", "status": "403"}) * 2)
+    for message in altered:
+        assert acceptance._is_plan_gate(_gate_error(_gate_body(message), stderr)) is False, message
+        assert acceptance._is_plan_gate(_gate_error(_gate_body(message), "")) is False, message
+
+
+@pytest.mark.linux_only
+def test_plan_gate_predicate_fails_closed_on_unparsable_or_missing_message():
+    """No body, malformed JSON, a non-object body or a missing message never match."""
+    for stdout in (None, "", "   ", "Upgrade to GitHub Pro or make this repository public "
+                   "to enable this feature.", "{not json", '{"message":', b"{}",
+                   json.dumps([PLAN_GATE]), json.dumps(PLAN_GATE), json.dumps(None),
+                   json.dumps({"status": "403"}), json.dumps({"message": 403, "status": "403"}),
+                   json.dumps({"message": None, "status": "403"})):
+        for stderr in ("", f"gh: {PLAN_GATE} (HTTP 403)", "gh: HTTP 403: " + PLAN_GATE):
+            assert acceptance._is_plan_gate(_gate_error(stdout, stderr)) is False, (stdout, stderr)
+
+
+@pytest.mark.linux_only
+def test_plan_gate_predicate_requires_explicit_403_evidence():
+    """An exact message on a non-403 response, or with no status at all, stays a failure."""
+    exact_no_status = json.dumps({"message": PLAN_GATE})
+    assert acceptance._is_plan_gate(_gate_error(exact_no_status, f"gh: {PLAN_GATE} (HTTP 403)")) is True
+    assert acceptance._is_plan_gate(_gate_error(exact_no_status,
+                                                f"gh: HTTP 403: {PLAN_GATE} (https://docs.github.com)")) is True
+    assert acceptance._is_plan_gate(_gate_error(exact_no_status)) is False
+    assert acceptance._is_plan_gate(_gate_error(exact_no_status, f"gh: {PLAN_GATE} (HTTP 404)")) is False
+    assert acceptance._is_plan_gate(_gate_error(exact_no_status, "HTTP 4030")) is False
+    assert acceptance._is_plan_gate(_gate_error(_gate_body(status="404"),
+                                                f"gh: {PLAN_GATE} (HTTP 404)")) is False
+    assert acceptance._is_plan_gate(_gate_error(_gate_body(status=None),
+                                                f"gh: {PLAN_GATE} (HTTP 401)")) is False
+
+
+@pytest.mark.linux_only
+def test_altered_plan_gate_message_never_falls_back(github):
+    """A 403 whose message merely contains the plan-gate text is an infrastructure error.
+
+    Prefixing, suffixing or rewording the message must not reach the
+    GraphQL-only acceptance path, so no ``rules_source`` is ever recorded.
+    """
+    github.update(private=True)
+    with connect() as conn:
+        for label, message in (("prefixed", f"prefix {PLAN_GATE}"),
+                               ("suffixed", f"{PLAN_GATE} suffix"),
+                               ("wrapped", f"prefix {PLAN_GATE} suffix"),
+                               ("period", PLAN_GATE[:-1]),
+                               ("case", PLAN_GATE.upper())):
+            github.update(rules_error=(403, message))
+            tid = kb.create_task(conn, title=f"gate-{label}", completion_contract="acme/repo")
+            assert not kb.complete_task(conn, tid,
+                                        metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+            receipt = _receipt(conn, tid)
+            assert receipt["ok"] is False, (label, receipt)
+            assert receipt["classification"] == "infra", (label, receipt)
+            assert "rules_source" not in receipt, (label, receipt)
+            assert receipt["checks"] == [], (label, receipt)
+            assert _status(conn, tid) != "done", (label, receipt)
