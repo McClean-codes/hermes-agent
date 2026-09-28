@@ -12,6 +12,22 @@ from urllib.parse import quote
 
 _REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _PR = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)")
+# The rulesets API answers private Free-plan repositories with exactly this body.
+_PLAN_GATE = "Upgrade to GitHub Pro or make this repository public to enable this feature."
+
+
+def _is_plan_gate(exc: subprocess.CalledProcessError) -> bool:
+    """Whether ``exc`` is GitHub's plan/visibility 403 on the rulesets endpoint.
+
+    ``gh api`` prints the JSON error body to stdout and ``gh: <message>
+    (HTTP <code>)`` (or ``gh: HTTP <code>: <message> (<url>)``) to stderr, so
+    both streams are matched: the verbatim plan-gate message plus an explicit
+    403 marker. Any other body, status or stream layout stays a failure.
+    """
+    text = "".join(part for part in (getattr(exc, "stdout", None), getattr(exc, "stderr", None))
+                   if isinstance(part, str))
+    return _PLAN_GATE in text and any(
+        marker in text for marker in ('HTTP 403', '"status": "403"', '"status":"403"'))
 
 
 def validate_contract(value: str | None) -> str:
@@ -51,22 +67,36 @@ def collect_acceptance(contract: str, published_pr: str | None) -> dict:
         repo, number = match[1], int(match[2])
         receipt["pr_url"] = url
         owner, name = repo.split("/")
-        query = '''{repository(owner:%s,name:%s){pullRequest(number:%d){headRefOid baseRefName state
+        query = '''{repository(owner:%s,name:%s){isPrivate pullRequest(number:%d){headRefOid baseRefName state
             baseRef{branchProtectionRule{requiredStatusChecks{context app{databaseId}}}}}}}''' % (
                 json.dumps(owner), json.dumps(name), number)
-        pr = _api("graphql", query=query)["data"]["repository"]["pullRequest"]
+        repository = _api("graphql", query=query)["data"]["repository"]
+        pr = repository["pullRequest"]
         sha, branch = pr["headRefOid"], pr["baseRefName"]
         receipt["head_sha"] = sha
         if not re.fullmatch(r"[0-9a-f]{40}", sha) or pr["state"] not in {"OPEN", "MERGED"}:
             raise ValueError("PR is closed or current head is unavailable")
         protection = (pr.get("baseRef") or {}).get("branchProtectionRule") or {}
         required = {(r["context"], (r.get("app") or {}).get("databaseId")) for r in protection.get("requiredStatusChecks", [])}
-        rules = _api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100", paginate=True)
-        for page in rules:
-            for rule in page:
-                if rule["type"] == "required_status_checks":
-                    required.update((r["context"], r.get("integration_id"))
-                                    for r in rule["parameters"]["required_status_checks"])
+        try:
+            rules = _api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100", paginate=True)
+        except subprocess.CalledProcessError as exc:
+            # Private Free-plan repositories are plan-gated on the rulesets API while
+            # GraphQL still exposes classic branch protection, and such a repository
+            # cannot carry rulesets. Fall back only then: the exact plan-gate body, a
+            # confirmed private repository, and a non-empty GraphQL required set.
+            # Every other failure re-raises into the fail-closed handler below.
+            if not (_is_plan_gate(exc) and repository.get("isPrivate") is True and required):
+                raise
+            rules = None
+            receipt["rules_source"] = "graphql_only"
+        if rules is not None:
+            receipt["rules_source"] = "graphql_and_rest"
+            for page in rules:
+                for rule in page:
+                    if rule["type"] == "required_status_checks":
+                        required.update((r["context"], r.get("integration_id"))
+                                        for r in rule["parameters"]["required_status_checks"])
         receipt["required"] = [{"context": c, "app_id": a} for c, a in sorted(required, key=str)]
         if not required:
             receipt["detail"] = "No repository-required checks are configured; explicitly use a local-only contract for non-CI tasks."
