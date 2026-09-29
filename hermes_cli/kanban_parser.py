@@ -355,10 +355,12 @@ _SPECS = [
         _arg("--json", dest="json", action="store_true", help="Emit machine-readable JSON result"),
     ], help="Manually move one or more todo/blocked tasks to ready (recovery path)"),
     _cmd("archive", [
-        _arg("task_ids", nargs="*", help="Task ids to archive (default mode)"),
+        _arg("task_ids", nargs="*",
+             help="Task ids to archive (default mode). ready/running/review are "
+                  "protected: block the task first, then archive"),
         _arg("--rm", dest="purge_ids", nargs="+",
              help="Permanently delete already-archived task ids from the board"),
-    ], help="Archive one or more tasks"),
+    ], help="Archive tasks (anything except ready/running/review; block those first)"),
     _cmd("tail", [_TASK_ID, _arg("--interval", type=float, default=1.0)], help="Follow a task's event stream"),
     _cmd("dispatch", [
         _arg("--dry-run", action="store_true", help="Don't actually spawn processes; just print what would happen"),

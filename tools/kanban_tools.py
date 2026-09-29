@@ -20,11 +20,14 @@ from hermes_cli.goals import judge_goal
 from tools.registry import no_cache_check_fn, registry, tool_error
 from hermes_cli.config import cfg_get, load_config
 from tools.kanban_tools_schemas import (
+    KANBAN_ARCHIVE_SCHEMA,
     KANBAN_ATTACH_SCHEMA,
     KANBAN_ATTACH_URL_SCHEMA, KANBAN_ATTACHMENTS_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_COMMENT_SCHEMA,
-    KANBAN_COMPLETE_SCHEMA, KANBAN_CREATE_SCHEMA, KANBAN_HEARTBEAT_SCHEMA, KANBAN_LINK_SCHEMA,
-    KANBAN_LIST_SCHEMA, KANBAN_REQUEST_CHANGES_SCHEMA, KANBAN_REQUEST_REVIEW_SCHEMA,
-    KANBAN_SHOW_SCHEMA, KANBAN_UNBLOCK_SCHEMA)
+    KANBAN_COMPLETE_SCHEMA, KANBAN_CREATE_SCHEMA, KANBAN_DECOMPOSE_SCHEMA, KANBAN_GRAPH_SCHEMA,
+    KANBAN_HEARTBEAT_SCHEMA, KANBAN_LINK_SCHEMA,
+    KANBAN_LIST_SCHEMA, KANBAN_PROMOTE_SCHEMA, KANBAN_REQUEST_CHANGES_SCHEMA,
+    KANBAN_REQUEST_REVIEW_SCHEMA,
+    KANBAN_SHOW_SCHEMA, KANBAN_UNBLOCK_SCHEMA, KANBAN_UNLINK_SCHEMA)
 
 logger = logging.getLogger(__name__)
 
@@ -798,10 +801,19 @@ def _handle_block(args: dict, **kw) -> str:
                f"{sorted(_GOAL_MODE_BLOCK_ALLOWED_KINDS)} (got {kind!r}). If the task is actually "
                f"finished or cannot proceed for another reason, call kanban_complete instead — "
                f"the completion judge will evaluate it.")
-        ok = kb.block_task(conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id(tid))
-        _check(ok, f"could not block {tid} (unknown id or not in running/ready)")
+        review_before = kb.review_association(conn, tid)
+        ok, why = kb.block_task(
+            conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id(tid),
+            with_reason=True,
+        )
+        _check(ok, why or f"could not block {tid} (unknown id or not in running/ready/review)")
         landed_kind = kb.get_task(conn, tid).block_kind
         extra: dict = {"block_kind": landed_kind}
+        if why:
+            # The card IS blocked, but its worker could not be proven stopped —
+            # or a spawn for it is still in flight and unpublished. Quote the
+            # exact blocker so the later archive refusal is never a surprise.
+            extra["stop_blocker"] = why
         if kind == "dependency" and landed_kind != kind:
             # block_task re-kinds a dependency wait that no open parent can satisfy.
             extra["requested_kind"] = kind
@@ -810,6 +822,7 @@ def _handle_block(args: dict, **kw) -> str:
                 "so this was recorded as needs_input (sticky until a human unblocks) "
                 "instead of parking in todo where the dispatcher would respawn it."
             )
+        extra["review"] = _review_receipt(review_before, kb.review_association(conn, tid))
         return _ok_landed(kb, conn, tid, "blocked", **extra)
 
 
@@ -1183,26 +1196,364 @@ def _handle_unblock(args: dict, **kw) -> str:
 def _handle_link(args: dict, **kw) -> str:
     """Add a parent→child dependency edge after the fact (cycles/self-links/running
     children → ValueError). A worker linking its OWN running card proves ownership
-    with its run id so the dependency-block handoff still works."""
+    with its run id so the dependency-block handoff still works.
+
+    The receipt reports what ACTUALLY happened: ``gated`` is True only when this
+    link really demoted a ``ready`` child back to ``todo``, and the child's
+    resulting status plus any parents still gating it are read back from the
+    board rather than assumed.
+
+    A link mutates the CHILD (edge row + possible demotion + event), so a
+    task-scoped worker may only link edges whose child is its own card —
+    exactly like ``kanban_unlink``. Orchestrators (no ``HERMES_KANBAN_TASK``)
+    route any edge, and the run-id handoff below still proves ownership of a
+    RUNNING own card.
+    """
     _reject_delegated_child_mutation("kanban_link")
     parent_id = args.get("parent_id")
     child_id = args.get("child_id")
     _check(parent_id and child_id, "both parent_id and child_id are required")
+    parent_id, child_id = str(parent_id), str(child_id)
+    # Prompt-injected foreign ids must not let a worker gate (or demote, or
+    # append events to) a sibling's card — _reject_delegated_child_mutation
+    # only covers delegate children, and _worker_run_id(foreign_child) is None
+    # for a non-running foreign task, so the CAS below is NOT the guard.
+    _enforce_worker_task_ownership(child_id)
     with _board(args.get("board")) as (kb, conn):
+        _existing_task(kb, conn, parent_id)
+        previous_status = _existing_task(kb, conn, child_id).status
         gated = kb.link_tasks(
             conn, parent_id=parent_id, child_id=child_id,
-            expected_child_run_id=_worker_run_id(str(child_id)))
-        return _ok(parent_id=parent_id, child_id=child_id, gated=gated,
-                   **({"gated_by": parent_id} if gated else {}))
+            expected_child_run_id=_worker_run_id(child_id))
+        child = kb.get_task(conn, child_id)
+        unsatisfied = _dependency_gates(kb, conn, child_id)
+        return _ok(
+            parent_id=parent_id, child_id=child_id,
+            # True only when a demotion genuinely occurred, never as a claim.
+            gated=gated,
+            gated_by=parent_id if gated else None,
+            previous_status=previous_status,
+            status=child.status if child else previous_status,
+            unsatisfied_parents=unsatisfied,
+            remaining_gates=bool(unsatisfied),
+        )
+
+
+# --- Controlled planning / lifecycle tools ---------------------------------
+
+def _dependency_gates(kb, conn, task_id: str) -> list[dict]:
+    """``[{id, status}]`` for every direct parent still gating ``task_id``."""
+    return [{"id": pid, "status": status} for pid, status in kb.unsatisfied_parents(conn, task_id)]
+
+
+@_kanban_handler("kanban_graph")
+def _handle_graph(args: dict, **kw) -> str:
+    """Read-only direct parent/child graph for one task.
+
+    Deliberately SELECT-only: no ``recompute_ready``, no readiness promotion and
+    no event append ever runs here, so inspecting a graph cannot move a card.
+    """
+    tid = _require_task_id(args)
+    with _board(args.get("board")) as (kb, conn):
+        task = _existing_task(kb, conn, tid)
+        graph = kb.task_graph_context(conn, tid)
+        return json.dumps({
+            "ok": True,
+            "task_id": tid,
+            "task": {"id": task.id, "title": task.title, "status": task.status},
+            "parents": graph["parents"],
+            "children": graph["children"],
+            "read_only": True,
+        })
+
+
+@_kanban_handler("kanban_unlink")
+def _handle_unlink(args: dict, **kw) -> str:
+    """Drop a parent→child edge, mirroring ``kanban_link``'s validation.
+
+    Unlinking can promote the child (releasing its last open parent), which is a
+    lifecycle mutation of that card — so a task-scoped worker may only do it to
+    its own card, never to a sibling's.
+    """
+    _reject_delegated_child_mutation("kanban_unlink")
+    parent_id = args.get("parent_id")
+    child_id = args.get("child_id")
+    _check(parent_id and child_id, "both parent_id and child_id are required")
+    parent_id, child_id = str(parent_id), str(child_id)
+    _check(parent_id != child_id, "a task cannot depend on itself")
+    _enforce_worker_task_ownership(child_id)
+    with _board(args.get("board")) as (kb, conn):
+        _existing_task(kb, conn, parent_id)
+        previous_status = _existing_task(kb, conn, child_id).status
+        # A task-scoped worker may only move its OWN card. unlink_tasks'
+        # board-wide recompute_ready would promote an unrelated
+        # stale-but-eligible sibling (and append its `promoted` event) as a
+        # side effect of this worker's unlink, so scope it to the affected
+        # child. Orchestrators / CLI / dashboard (no HERMES_KANBAN_TASK) keep
+        # the historical board-wide behaviour.
+        removed = kb.unlink_tasks(
+            conn, parent_id, child_id,
+            board_wide_recompute=not _own_task_env(child_id, "HERMES_KANBAN_TASK"))
+        child = kb.get_task(conn, child_id)
+        status = child.status if child else previous_status
+        unsatisfied = _dependency_gates(kb, conn, child_id)
+        return _ok(
+            parent_id=parent_id, child_id=child_id,
+            removed=removed,
+            previous_status=previous_status,
+            status=status,
+            # True only if the removal actually landed the child on 'ready'.
+            promoted=bool(removed and status == "ready" and previous_status != "ready"),
+            gated=bool(unsatisfied),
+            unsatisfied_parents=unsatisfied,
+        )
+
+
+@_kanban_handler("kanban_promote")
+def _handle_promote(args: dict, **kw) -> str:
+    """Promote a triage task into the normal flow, reporting where it landed."""
+    _reject_delegated_child_mutation("kanban_promote")
+    _require_orchestrator_tool("kanban_promote")
+    tid = args.get("task_id")
+    _check(tid, "task_id is required")
+    tid = str(tid)
+    _enforce_worker_task_ownership(tid)
+    reason = _redact_opt(args.get("reason") or None)
+    with _board(args.get("board")) as (kb, conn):
+        _existing_task(kb, conn, tid)
+        ok, err, _landed = kb.promote_triage_task(
+            conn, tid, actor=_persisted_identity(), reason=reason)
+        _check(ok, err)
+        task = kb.get_task(conn, tid)
+        unmet = _dependency_gates(kb, conn, tid)
+        out: dict = {
+            "task_id": tid,
+            "status": task.status if task else None,
+            "ready": bool(task and task.status == "ready"),
+            "unmet_parents": unmet,
+        }
+        if unmet:
+            out["gate_reason"] = "unmet parent gate(s): " + ", ".join(
+                f"{m['id']} ({m['status']})" for m in unmet)
+        return _ok(**out)
+
+
+def _archive_impact_receipt(kb, conn, dependents: list[str], before: dict) -> dict:
+    """Classify each dependent AFTER the archive + readiness recompute.
+
+    Three disjoint questions, answered from the board rather than assumed:
+    ``changed`` — status actually moved (with before/after), ``waiting`` — still
+    held back and why (remaining parent gates, a block hold, or BOTH at once —
+    a blocked dependent is never reduced to one cause), ``ready_followup``
+    — now runnable and needing assignment or dispatch.
+    """
+    changed, waiting, ready_followup = [], [], []
+    for dep_id in dependents:
+        task = kb.get_task(conn, dep_id)
+        if task is None:
+            continue
+        prev = before.get(dep_id)
+        prev_status = prev.status if prev else None
+        if prev_status != task.status:
+            changed.append({
+                "id": task.id, "title": task.title,
+                "before": prev_status, "after": task.status,
+            })
+        gates = _dependency_gates(kb, conn, dep_id)
+        held = task.status == "blocked"
+        if gates or held:
+            # A blocked dependent can be GATED and HELD at the same time (its
+            # block hold plus another parent still open). Expose both causes:
+            # `hold` is reported whenever the card is blocked, and `reason`
+            # names every remaining cause instead of picking the first one.
+            hold_kind = getattr(task, "block_kind", None)
+            causes: list[str] = []
+            if gates:
+                causes.append("waiting on unsatisfied parent dependencies")
+            if held:
+                causes.append(f"held in blocked ({hold_kind or 'unclassified'})")
+            entry = {
+                "id": task.id, "title": task.title, "status": task.status,
+                "unsatisfied_parents": gates,
+                "reason": "; ".join(causes),
+            }
+            if held:
+                entry["hold"] = {"kind": hold_kind}
+            waiting.append(entry)
+        if task.status == "ready":
+            ready_followup.append({
+                "id": task.id, "title": task.title, "assignee": task.assignee,
+                "needs_assignment": not task.assignee,
+                "changed": prev_status != "ready",
+            })
+    return {"changed": changed, "waiting": waiting, "ready_followup": ready_followup}
+
+
+def _review_receipt(before: dict, after: dict) -> dict:
+    """Same-card review evidence for an archive/block receipt.
+
+    The review flow is same-card (``request_review`` + ``claim_review_task``
+    claim THIS card into a reviewer run), so the receipt names the review run
+    the move closed or preserved — nothing is inferred into a second card, and
+    nothing outside this card is stopped on its behalf. What the move affects
+    elsewhere is carried by the ordinary dependency graph
+    (``linked_before``/``linked_after``) plus the archive impact receipt, which
+    report dependents without mutating them.
+    """
+    run = after.get("active_review_run") or before.get("active_review_run")
+    if run:
+        was = ("active before this move and closed by it"
+               if before.get("active_review_run") and not after.get("active_review_run")
+               else "active")
+        note = (f"same-card review run {run['id']} (profile {run['profile']}, "
+                f"outcome {run['outcome']}) identified from its claimed event "
+                f"source_status=review — {was}")
+    elif after.get("review_runs"):
+        ids = ", ".join(str(r["id"]) for r in after["review_runs"])
+        note = f"no active review run; same-card review run(s) {ids} preserved in history"
+    else:
+        note = "no same-card review run"
+    return {
+        "lane": after.get("lane"), "note": note,
+        "reviewer": after.get("reviewer"), "active_review_run": run,
+        "review_runs": after.get("review_runs"),
+        "linked_before": before.get("linked"), "linked_after": after.get("linked"),
+    }
+
+
+def _archive_reason(args: dict) -> str:
+    """Required archive rationale, checked BEFORE the board is opened.
+
+    Missing, non-string, empty and whitespace-only input is rejected here, ahead
+    of ``_board``/``_existing_task``/``archive_task``, so a bad reason can never
+    leave a status flip, an event or a run behind. The text is preserved as the
+    caller sent it — no normalization, no generic stand-in — because the whole
+    point of the field is the agent's own wording in the audit trail.
+    """
+    reason = args.get("reason")
+    if reason is None:
+        raise _Reject(
+            "reason is required — say why this task is being archived; it is "
+            "recorded on the archive event. Nothing changed.")
+    if not isinstance(reason, str):
+        raise _Reject(
+            f"reason must be a string, got {type(reason).__name__}. Nothing changed.")
+    if not reason.strip():
+        raise _Reject(
+            "reason must not be empty or whitespace-only — say why this task is "
+            "being archived. Nothing changed.")
+    return reason
+
+
+# The agent-facing archive runs the ONE shared archive policy (see
+# ``hermes_cli.kanban_db.ARCHIVE_PROTECTED_STATUSES``): ``ready``/``running``/
+# ``review`` are refused with a block/stop-first instruction, everything else —
+# every other valid status AND legacy raw statuses such as ``completed`` —
+# archives directly, and ``archived`` is the already-archived no-op. This tool
+# NEVER blocks a task on the caller's behalf, so a refusal never parks a card.
+# It is also the ONLY surface that supplies a ``reason``, so it is the only one
+# whose ``archived`` event carries a payload.
+@_kanban_handler("kanban_archive")
+def _handle_archive(args: dict, **kw) -> str:
+    """Archive a task under the shared policy, with an impact + review receipt."""
+    _reject_delegated_child_mutation("kanban_archive")
+    _require_orchestrator_tool("kanban_archive")
+    tid = args.get("task_id")
+    _check(tid, "task_id is required")
+    tid = str(tid)
+    # Validated first: an invalid reason must fail with no status/event/run
+    # side effects, so nothing below it may have run yet.
+    reason = _archive_reason(args)
+    _enforce_worker_task_ownership(tid)
+    with _board(args.get("board")) as (kb, conn):
+        task = _existing_task(kb, conn, tid)
+        before_status = task.status
+        if before_status == "archived":
+            raise _Reject(f"{tid} is already archived; nothing changed")
+        # Review association and dependents are snapshotted BEFORE the move so
+        # the receipt reports real before/after instead of assuming it.
+        review_before = kb.review_association(conn, tid)
+        dependents = kb.child_ids(conn, tid)
+        before = {d: kb.get_task(conn, d) for d in dependents}
+        # One shared policy with the CLI/dashboard/DB lifecycle: the refusal
+        # copy (block/stop first, live worker, in-flight spawn) comes from the
+        # same writer that enforces it, and nothing is archived on refusal.
+        # Only this tool hands the writer a payload, so only agent archives
+        # carry provenance; refusals and the already-archived no-op above write
+        # no event at all. ``actor`` is the persisted runtime identity, never a
+        # caller argument (board records feed future workers' prompts).
+        ok, why = kb.archive_task(
+            conn, tid, with_reason=True,
+            event_payload={
+                "source": "kanban_archive",
+                "actor": _persisted_identity(),
+                "reason": reason,
+            },
+        )
+        if not ok:
+            raise _Reject(why or f"kanban_archive refused: {tid} was not archived")
+        receipt = _archive_impact_receipt(kb, conn, dependents, before)
+        return _ok(
+            task_id=tid, status="archived", previous_status=before_status,
+            reason=reason,
+            dependents=receipt,
+            review=_review_receipt(review_before, kb.review_association(conn, tid)),
+        )
+
+
+@_kanban_handler("kanban_decompose")
+def _handle_decompose(args: dict, **kw) -> str:
+    """Apply an agent-authored child graph with no auxiliary/LLM call."""
+    _reject_delegated_child_mutation("kanban_decompose")
+    _require_orchestrator_tool("kanban_decompose")
+    tid = args.get("task_id")
+    _check(tid, "task_id is required")
+    tid = str(tid)
+    _enforce_worker_task_ownership(tid)
+    children = args.get("children")
+    if not isinstance(children, list) or not children:
+        return tool_error("kanban_decompose: children must be a non-empty array of child specs")
+    with _board(args.get("board")) as (kb, conn):
+        _existing_task(kb, conn, tid)
+        from hermes_cli.kanban_decompose import apply_explicit_decomposition
+        # Validation happens before any write and the fan-out is one atomic
+        # transaction, so a bad graph leaves the board byte-for-byte unchanged.
+        child_ids = apply_explicit_decomposition(
+            conn, tid, children=list(children), author=_persisted_identity())
+        root = kb.get_task(conn, tid)
+        kids = [kb.get_task(conn, cid) for cid in child_ids]
+        return _ok(
+            task_id=tid,
+            child_ids=child_ids,
+            status=root.status if root else None,
+            root=_fields(root, ("id", "status", "assignee")) | {
+                # The root waits on every child; these are its parent edges.
+                "parents": kb.parent_ids(conn, tid),
+            },
+            children=[
+                {
+                    "id": k.id, "title": k.title, "status": k.status,
+                    "assignee": k.assignee, "parents": kb.parent_ids(conn, k.id),
+                }
+                for k in kids if k is not None
+            ],
+        )
 
 
 # --- Registration (order preserved: it is the order tools appear in the schema) ---
 
 # kanban_list / kanban_unblock route the board and are hidden from task workers.
-_ORCHESTRATOR_TOOLS = frozenset({"kanban_list", "kanban_unblock"})
+# kanban_archive / kanban_promote / kanban_decompose are likewise board-level
+# lifecycle moves: a task-scoped worker must not archive, promote or fan out a
+# card (its own escape hatch around the complete/review gates, or a sibling's).
+_ORCHESTRATOR_TOOLS = frozenset({
+    "kanban_list", "kanban_unblock",
+    "kanban_archive", "kanban_promote", "kanban_decompose",
+})
 _TOOLS = (
     ("kanban_show", KANBAN_SHOW_SCHEMA, _handle_show, "📋"),
     ("kanban_list", KANBAN_LIST_SCHEMA, _handle_list, "📋"),
+    ("kanban_graph", KANBAN_GRAPH_SCHEMA, _handle_graph, "🕸"),
     ("kanban_complete", KANBAN_COMPLETE_SCHEMA, _handle_complete, "✔"),
     ("kanban_block", KANBAN_BLOCK_SCHEMA, _handle_block, "⏸"),
     ("kanban_request_review", KANBAN_REQUEST_REVIEW_SCHEMA, _handle_request_review, "👀"),
@@ -1213,8 +1564,12 @@ _TOOLS = (
     ("kanban_attach_url", KANBAN_ATTACH_URL_SCHEMA, _handle_attach_url, "📎"),
     ("kanban_attachments", KANBAN_ATTACHMENTS_SCHEMA, _handle_attachments, "📎"),
     ("kanban_create", KANBAN_CREATE_SCHEMA, _handle_create, "➕"),
+    ("kanban_decompose", KANBAN_DECOMPOSE_SCHEMA, _handle_decompose, "🗂"),
+    ("kanban_promote", KANBAN_PROMOTE_SCHEMA, _handle_promote, "⏫"),
     ("kanban_unblock", KANBAN_UNBLOCK_SCHEMA, _handle_unblock, "▶"),
-    ("kanban_link", KANBAN_LINK_SCHEMA, _handle_link, "🔗"))
+    ("kanban_link", KANBAN_LINK_SCHEMA, _handle_link, "🔗"),
+    ("kanban_unlink", KANBAN_UNLINK_SCHEMA, _handle_unlink, "⛓"),
+    ("kanban_archive", KANBAN_ARCHIVE_SCHEMA, _handle_archive, "🗄"))
 
 for _name, _sch, _handler, _emoji in _TOOLS:
     _gate = _check_kanban_orchestrator_mode if _name in _ORCHESTRATOR_TOOLS else _check_kanban_mode

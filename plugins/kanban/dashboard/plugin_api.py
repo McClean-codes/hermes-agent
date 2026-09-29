@@ -627,8 +627,9 @@ def _patch_status(conn, task_id: str, payload: UpdateTaskBody, review_assignee_d
     """PATCH status phase: 400 on a rejected verb, 409 when the transition is refused
     (naming the blocking parent(s) for ``ready``/``done``/``review`` so the UI renders an actionable toast)."""
     s = payload.status
+    why = None
     if s == "archived":
-        ok = kanban_db.archive_task(conn, task_id)
+        ok, why = kanban_db.archive_task(conn, task_id, with_reason=True)
     else:
         with _map_errors(400, _StatusRejected, ValueError):
             ok = _apply_status(conn, task_id, s, payload, f"unknown status: {s}")
@@ -636,6 +637,10 @@ def _patch_status(conn, task_id: str, payload: UpdateTaskBody, review_assignee_d
             ok = kanban_db.assign_task(conn, task_id, None)
     if ok:
         return
+    if why:
+        # Shared archive policy: quote its exact refusal (protected status,
+        # live worker, in-flight spawn) instead of a generic 409.
+        raise _conflict(why)
     blockers = _parents_blocking_ready(conn, task_id) if s == "ready" else []
     if blockers:
         names = ", ".join(f"{p['title']!r} ({p['id']}, status={p['status']})" for p in blockers)
@@ -818,8 +823,12 @@ def delete_link(parent_id: str = Query(...), child_id: str = Query(...), board: 
 def _bulk_apply_one(conn, tid: str, payload: BulkTaskBody, board: Optional[str], entry: dict) -> None:
     """Apply the bulk patch to one task, recording refusals in ``entry`` without aborting the
     remaining ops — except a rejected status verb (``_StatusRejected`` propagates)."""
-    if payload.archive and not kanban_db.archive_task(conn, tid):
-        entry.update(ok=False, error="archive refused")
+    if payload.archive:
+        archived, why = kanban_db.archive_task(conn, tid, with_reason=True)
+        if not archived:
+            # Shared policy refusal (protected status / live worker /
+            # in-flight spawn) is quoted verbatim for the per-id result.
+            entry.update(ok=False, error=why or "archive refused")
     if payload.status is not None and not payload.archive:
         s = payload.status
         if not _apply_status(conn, tid, s, payload, f"unknown status {s!r}"):
@@ -1594,7 +1603,11 @@ def decompose_task_endpoint(task_id: str, payload: DecomposeBody, board: Optiona
     outcome = _run_aux(board, "kanban_decompose", "decompose_task", task_id, payload.author)
     return {
         "ok": bool(outcome.ok), "task_id": outcome.task_id, "reason": outcome.reason,
-        "fanout": bool(outcome.fanout), "child_ids": outcome.child_ids or [], "new_title": outcome.new_title}
+        "fanout": bool(outcome.fanout), "child_ids": outcome.child_ids or [], "new_title": outcome.new_title,
+        # Non-null only when kanban.auto_decompose is off and the prompt was routed to
+        # the single eligible subscriber. The task graph is untouched in that case;
+        # ``reason`` says so explicitly so a no-subscriber / ambiguity result is clear.
+        "routed_to": outcome.routed_to}
 
 
 # --- Orchestration settings (kanban.orchestrator_profile / default_assignee /
