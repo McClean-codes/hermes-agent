@@ -2990,8 +2990,136 @@ class DiscordAdapter(DynamicReactionMixin, DiscordMediaMixin, BasePlatformAdapte
             return False
 
     def _reactions_enabled(self) -> bool:
-        """Reactions enabled via ``extra.reactions`` (YAML, per profile) or ``DISCORD_REACTIONS``."""
-        return self._extra_or_env_flag("reactions", "DISCORD_REACTIONS", "true", truthy=False)
+        """Check if message reactions are enabled via config/env."""
+        # Normalize the profile-scoped env gate fail-closed: only documented tokens enable.
+        raw_env = _scoped_gate_env("DISCORD_REACTIONS", "true")
+        if isinstance(raw_env, str):
+            token = raw_env.strip().lower()
+            if token in ("false", "0", "no", "off"):
+                return False
+            if token not in ("true", "1", "yes", "on", ""):
+                return False
+        # Normalize config.extra.reactions with the same fail-closed rule.
+        extra_val = self.config.extra.get("reactions", None) if isinstance(getattr(self.config, "extra", None), dict) else None
+        if isinstance(extra_val, bool):
+            return extra_val
+        if isinstance(extra_val, str):
+            token = extra_val.strip().lower()
+            if token in ("false", "0", "no", "off"):
+                return False
+            if token in ("true", "1", "yes", "on", ""):
+                return True
+            return False
+        if extra_val is None:
+            return True
+        return False
+
+    def _session_key_from_source(self, source) -> str:
+        """Derive a canonical, participant- and profile-aware session key.
+
+        Uses :func:`gateway.session.build_session_key` so distinct users or
+        multiplex profiles sharing a channel do not collide on
+        ``_session_raw_messages`` / ``_rxn_*`` state. Preserves the stable
+        active message identity across ``on_processing_start``,
+        ``on_tool_call_start`` and ``on_processing_complete`` by returning
+        the same key for the triggering ``MessageEvent`` and the
+        ``SessionSource`` passed to tool callbacks.
+        """
+        # Unwrap MessageEvent -> SessionSource
+        if hasattr(source, "source") and getattr(source, "source", None) is not None:
+            try:
+                # Prefer the adapter's canonical event key when given an event,
+                # so profile multiplexing stays in sync with the agent runner.
+                from gateway.session import build_session_key as _build
+
+                # Try the base-class helper which already handles group/thread
+                # isolation flags and profile namespace.
+                try:
+                    return self._event_session_key(source)  # type: ignore[arg-type]
+                except Exception:
+                    # Fallback to direct build with source.source
+                    src = source.source
+                    extra = getattr(getattr(self, "config", None), "extra", {}) or {}
+                    def _norm_bool(v, default):
+                        if isinstance(v, bool):
+                            return v
+                        if isinstance(v, str):
+                            t = v.strip().lower()
+                            if t in ("1", "true", "yes", "on"):
+                                return True
+                            if t in ("0", "false", "no", "off", ""):
+                                return False
+                            return default
+                        if v is None:
+                            return default
+                        return bool(v)
+                    g = _norm_bool(extra.get("group_sessions_per_user", True), True)
+                    t = _norm_bool(extra.get("thread_sessions_per_user", False), False)
+                    profile = None
+                    try:
+                        profile = self._session_key_profile(src)
+                    except Exception:
+                        profile = getattr(src, "profile", None)
+                    return _build(src, group_sessions_per_user=g, thread_sessions_per_user=t, profile=profile)
+            except Exception:
+                source = source.source
+        # Now ``source`` should be a SessionSource-like
+        try:
+            from gateway.session import build_session_key as _build
+
+            extra = getattr(getattr(self, "config", None), "extra", {}) or {}
+            def _norm_bool2(v, default):
+                if isinstance(v, bool):
+                    return v
+                if isinstance(v, str):
+                    t = v.strip().lower()
+                    if t in ("1", "true", "yes", "on"):
+                        return True
+                    if t in ("0", "false", "no", "off", ""):
+                        return False
+                    return default
+                if v is None:
+                    return default
+                return bool(v)
+            g2 = _norm_bool2(extra.get("group_sessions_per_user", True), True)
+            t2 = _norm_bool2(extra.get("thread_sessions_per_user", False), False)
+            profile2 = None
+            try:
+                profile2 = self._session_key_profile(source)
+            except Exception:
+                profile2 = getattr(source, "profile", None)
+            return _build(source, group_sessions_per_user=g2, thread_sessions_per_user=t2, profile=profile2)
+        except Exception:
+            # Absolute fallback: include participant and profile to avoid collision
+            try:
+                return f"{getattr(source, 'platform', '')}:{getattr(source, 'chat_id', '')}:{getattr(source, 'thread_id', '') or ''}:{getattr(source, 'user_id', '') or ''}:{getattr(source, 'profile', '') or ''}"
+            except Exception:
+                return str(getattr(source, "chat_id", ""))
+
+    async def _reaction_add(self, msg_ref, emoji):
+        """Add an emoji reaction to a Discord message."""
+        return await self._add_reaction(msg_ref, emoji)
+
+    async def _reaction_remove(self, msg_ref, emoji):
+        """Remove the bot's own emoji reaction from a Discord message."""
+        return await self._remove_reaction(msg_ref, emoji)
+
+    def _reaction_resolve_message(self, event):
+        """Resolve a raw Discord message without crossing an identity boundary."""
+        raw = getattr(event, "raw_message", None)
+        if raw and hasattr(raw, "add_reaction"):
+            return raw
+        source = getattr(event, "source", event)
+        key = self._session_key_from_source(source)
+        token = self._rxn_message_token(event)
+        if token is not None:
+            return self._session_raw_messages_by_token.get((key, token))
+        return self._session_raw_messages.get(key)
+
+    def _reaction_msg_key(self, event):
+        """Return a stable participant/profile key for reaction locking."""
+        source = getattr(event, "source", event)
+        return self._session_key_from_source(source)
 
     def _session_key_from_source(self, source) -> str:
         """Derive the chat-level base key from either ``MessageEvent`` or ``SessionSource``."""

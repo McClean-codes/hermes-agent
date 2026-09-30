@@ -1576,6 +1576,17 @@ DEFAULT_CONFIG = {
             "max_attempts": 3,  # lifetime re-dispatch cap for one message, whatever its outcome
         },
         "reactions": True,  # add 👀/✅/❌ reactions to messages during processing
+        # Persona reaction emoji; overrides the global ``persona_emoji`` when set.
+        # Resolved via ``platforms.discord.persona_emoji`` (or ``discord.persona_emoji``)
+        # with precedence over the global default; empty/absent falls back to global or ``👀``.
+        "persona_emoji": "",
+        # Swap reaction per tool call; overrides global ``dynamic_reactions``.
+        # ``false`` (including string ``"false"``) keeps persona only; cooldown still applies as hysteresis.
+        "dynamic_reactions": True,
+        # Heuristic cooldown seconds between reaction swaps (default 1.0s, 4× the documented
+        # Discord 0.25s bucket). This is a local hysteresis to reduce 429s/reflow jitter,
+        # not a provider rate-limit guarantee.
+        "reaction_cooldown": 1.0,
         # Gateway transport health probe: inspects the WebSocket's ready/open/heartbeat state (never
         # REST) as proof events still arrive. Any value 0 disables it.
         "websocket_liveness_interval_seconds": 15,
