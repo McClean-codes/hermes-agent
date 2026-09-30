@@ -233,6 +233,34 @@ def test_discover_reports_a_non_mapping_descriptor_explicitly(board_env):
     assert entry["descriptor"] == {"status": "invalid", "detail": "not-a-mapping"}
 
 
+def test_discover_reports_malformed_metadata_values_as_invalid_without_aborting_the_roster(board_env):
+    """Valid YAML mapping, malformed VALUE: ``role: [setup]`` is unhashable in
+    the canonical loader's ``PROFILE_ROLES`` membership test, which used to
+    raise ``TypeError`` straight out of ``_handle_discover``. It must be
+    reported as an ``invalid`` descriptor — exception class only — and the
+    roster must survive, profiles listed after it included."""
+    _install_profile(board_env, "broken_meta")
+    _install_profile(board_env, "zz_after")  # enumerated after the broken one
+    (board_env / "profiles" / "broken_meta" / "profile.yaml").write_text(
+        "description: 'DescriptorBodyMarker'\n"
+        "display_name: 'MarkerName'\n"
+        "role: [setup]\n",
+        encoding="utf-8")
+
+    for payload in (_discover_raw(), _dispatch("kanban_discover", {})):
+        assert payload["ok"] is True, payload
+        by_name = {p["name"]: p for p in payload["profiles"]}
+        descriptor = by_name["broken_meta"]["descriptor"]
+        assert descriptor["status"] == "invalid", descriptor
+        assert descriptor["detail"] == "TypeError"  # class name, never a message
+        # Not aborted: every profile the roster enumerated still appears.
+        assert set(by_name) == {"default", "broken_meta", "zz_after"}, sorted(by_name)
+        # Neither the parsed document nor an exception message leaks.
+        dumped = json.dumps(payload)
+        assert "DescriptorBodyMarker" not in dumped
+        assert "unhashable" not in dumped
+
+
 def test_discover_reports_an_unreadable_descriptor_without_raising(board_env):
     profile_dir = _install_profile(board_env, "locked")
     descriptor = profile_dir / "profile.yaml"

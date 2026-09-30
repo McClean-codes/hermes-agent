@@ -1619,7 +1619,8 @@ def _profile_descriptor(profile_dir) -> dict:
 
     Status is explicit rather than implied: ``missing`` (no descriptor — a
     perfectly normal profile), ``unreadable`` (present but the filesystem said
-    no), ``invalid`` (present but not a safely-parsed mapping), ``ok``. A
+    no), ``invalid`` (present but not a safely-parsed mapping, or a mapping
+    whose values the canonical loader refuses to normalise), ``ok``. A
     malformed descriptor must be *reported*, never silently downgraded to
     "absent" and never raised: one broken profile must not take discovery (or
     ``hermes profile list``) down with it. Parsing goes through the safe loader
@@ -1656,7 +1657,17 @@ def _profile_descriptor(profile_dir) -> dict:
     # ``list_profiles()`` / the decomposer roster / ``hermes profile list`` use.
     from hermes_cli.profiles import read_profile_meta
 
-    meta = read_profile_meta(profile_dir)
+    try:
+        meta = read_profile_meta(profile_dir)
+    except Exception as exc:  # noqa: BLE001 - a malformed descriptor must not abort the roster
+        # The loader documents itself as never raising, but a syntactically
+        # valid mapping can still carry a value it cannot normalise — a list
+        # where ``role`` must be a scalar raises inside its ``PROFILE_ROLES``
+        # membership test. That is a malformed descriptor, so it is reported as
+        # ``invalid`` with the exception class only: the message may quote the
+        # document it failed on, and one broken profile must not take
+        # discovery down with it.
+        return {"status": "invalid", "detail": type(exc).__name__}
     # Descriptor text is an operator-authored free-text field heading straight
     # to a model, so it crosses the same ``_redact`` boundary as every other
     # agent-visible free text here. (Nothing is written back — this is only the
