@@ -1584,14 +1584,31 @@ def adopt_worker_pid(conn: sqlite3.Connection, task_id: str, run_id: int, pid: i
     and it must exit without working it."""
     started_at = _process_fingerprint(int(pid)) or UNVERIFIED_WORKER_FINGERPRINT
     with _kb.write_txn(conn):
-        row = conn.execute("SELECT status, current_run_id, worker_pid, claim_lock FROM tasks WHERE id = ?",
-                           (task_id,)).fetchone()
+        row = conn.execute(
+            "SELECT status, current_run_id, worker_pid, claim_lock, spawn_fence "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
         if row is None or row["status"] != "running" or row["current_run_id"] != int(run_id):
             return False
         # Liveness checks are host-local: a pid from another host (or pid namespace) proves nothing here.
         if row["worker_pid"] is None and (row["claim_lock"] or "").startswith(_kb._host_prefix()):
-            conn.execute("UPDATE tasks SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
-                         (int(pid), started_at, task_id))
+            # Self-registration is this spawn's PUBLICATION: the in-flight spawn fence
+            # the dispatcher armed before starting this child has served its purpose
+            # (``worker_pid`` is no longer NULL), so settle it here — otherwise a
+            # dispatcher that died mid-spawn would leave the hold armed forever and
+            # the card could never be archived or re-dispatched. Only the fence that
+            # names THIS claim/run may be cleared; a predecessor's unresolved hold
+            # stays exactly as it is.
+            fence = _kb._json_dict(_kb._row_get(row, "spawn_fence")) or None
+            settles_fence = fence is not None and _kb._fence_is_mine(
+                fence, _kb._row_get(row, "claim_lock"), run_id)
+            conn.execute(
+                "UPDATE tasks SET worker_pid = ?, worker_started_at = ?"
+                + (", spawn_fence = NULL" if settles_fence else "")
+                + " WHERE id = ?",
+                (int(pid), started_at, task_id),
+            )
             conn.execute("UPDATE task_runs SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
                          (int(pid), started_at, int(run_id)))
             _kb._append_event(conn, task_id, "worker_registered", {"pid": int(pid), "started_at": started_at},

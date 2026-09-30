@@ -613,7 +613,9 @@ KANBAN_ARCHIVE_SCHEMA = _schema(
         "block it first (kanban_block), then archive. `reason` is REQUIRED and "
         "is stored on the `archived` event as {source, actor, reason} so the "
         "board keeps an audit trail of why an agent archived a card; an "
-        "invalid reason is rejected before anything changes. On success it "
+        "invalid reason is rejected before anything changes, and credential-"
+        "shaped text in it is masked by the same redactor that guards every "
+        "other agent-authored free-text field on this board. On success it "
         "returns an impact receipt: which dependents actually changed status "
         "(before/after each), which are still waiting and why (remaining "
         "parent gates, holds, or both), which are now 'ready' and need "
@@ -625,8 +627,9 @@ KANBAN_ARCHIVE_SCHEMA = _schema(
         "reason": _prop("string", (
             "Required. Why this task is being archived, in one or two "
             "sentences (e.g. 'superseded by t_ab12cd34 — folded into the "
-            "parent card'). Stored verbatim on the `archived` event for "
-            "later audit; must be non-empty after trimming whitespace."
+            "parent card'). Stored on the `archived` event for later audit "
+            "(credential-shaped text is masked first, as everywhere else on "
+            "this board); must be non-empty after trimming whitespace."
         )),
     },
     ["task_id", "reason"],
@@ -699,4 +702,63 @@ KANBAN_DECOMPOSE_SCHEMA = _schema(
         },
     },
     ["children"],
+)
+
+KANBAN_REASSIGN_SCHEMA = _schema(
+    "kanban_reassign",
+    (
+        "Move an existing task to a different profile — the tool form of "
+        "`hermes kanban reassign`. It runs the SAME shared kernel the CLI "
+        "uses (assign/reassign in kanban_db), so the lifecycle guards are "
+        "identical: a card still running under a claim is refused and "
+        "nothing changes, unless `reclaim` is true, which releases the "
+        "claim first (the \"this profile's model is broken\" path). The "
+        "destination must be an installed profile — validated against the "
+        "same enumeration the CLI and the dispatcher's spawn gate use, so a "
+        "typo is refused before the board is opened and no event, status or "
+        "claim is touched. On success the shared `assigned` audit event "
+        "({assignee, from}) is appended and the response reads the card "
+        "back from the board. Board isolation is preserved: only the board "
+        "this call opens is written. Orchestrator-only."
+    ),
+    {
+        "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
+        "assignee": _prop("string", (
+            "Destination profile name. Must be an installed profile "
+            "(see kanban_discover for the roster)."
+        )),
+        "reclaim": _prop("boolean", (
+            "Release the active claim before reassigning, so a card whose "
+            "current profile is broken can still move. Default false: a "
+            "claimed running card is refused instead."
+        )),
+        "reason": _prop("string", (
+            "Optional audit note recorded on the reclaim when `reclaim` "
+            "is true."
+        )),
+    },
+    ["task_id", "assignee"],
+)
+
+KANBAN_DISCOVER_SCHEMA = _schema(
+    "kanban_discover",
+    (
+        "Read-only roster of the profiles this home can spawn work to. "
+        "Returns every installed profile — `default` plus each live named "
+        "profile — with its optional `profile.yaml` descriptor metadata "
+        "(display name, description, role), exactly as the dispatcher's "
+        "roster and `hermes profile list` read them. Profiles without a "
+        "descriptor are still listed, with descriptor status `missing`; an "
+        "unreadable or unparseable descriptor is reported as `unreadable` / "
+        "`invalid` (never silently treated as absent, never an error). "
+        "Nothing is written and no profile is generated: this is the same "
+        "enumeration `kanban_create` and `kanban_reassign` validate "
+        "against, so it is the authoritative list of valid assignees. "
+        "Only descriptor fields are returned — no config, credentials, "
+        "SOUL or prompt contents are read, and every returned string is "
+        "length-bounded. Profiles live under the Hermes home rather than a "
+        "board, so the optional `board` argument does not apply here."
+    ),
+    {},
+    [],
 )

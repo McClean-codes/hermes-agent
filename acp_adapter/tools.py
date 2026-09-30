@@ -52,6 +52,7 @@ _POLISHED_TOOLS = {
     "kanban_block", "kanban_request_review", "kanban_request_changes",
     "kanban_link", "kanban_unlink", "kanban_heartbeat", "kanban_graph",
     "kanban_decompose", "kanban_promote", "kanban_archive",
+    "kanban_reassign", "kanban_discover",
     "yb_query_group_info", "yb_query_group_members", "yb_search_sticker",
     "yb_send_dm", "yb_send_sticker",
 }

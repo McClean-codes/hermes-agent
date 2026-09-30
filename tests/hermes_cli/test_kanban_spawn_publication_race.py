@@ -936,3 +936,85 @@ def test_hold_spawn_fence_is_exclusive_for_every_foreign_fence(board, procs):
         assert released.payload["started_at"] == dead_fingerprint
         assert released.payload["claim"] == lock_a and released.payload["run"] == run_a
         assert released.payload["reason"] and "gone" in released.payload["reason"]
+
+
+# ---------------------------------------------------------------------------
+# 10. worker-side self-registration (upstream ``adopt_worker_pid``) settles the fence
+# ---------------------------------------------------------------------------
+
+
+def _armed_spawn(board, monkeypatch, *, foreign_claim=None):
+    """A ``running`` card whose dispatcher armed an in-flight spawn fence and then
+    died before publishing the PID — the exact upstream scenario
+    ``adopt_worker_pid`` exists for. Returns ``(tid, claim_lock, run_id, pid)``."""
+    host = kb._claimer_id().split(":", 1)[0]
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="self-registered", assignee="worker")
+        kb.claim_task(conn, tid, claimer=f"{host}:worker")
+    with kbc.connect_closing() as conn:
+        task = kb.get_task(conn, tid)
+        claim, run_id = task.claim_lock, int(task.current_run_id)
+        assert claim and claim.startswith(kb._host_prefix())
+        assert kb._hold_spawn_fence(conn, tid, claim, run_id) is True
+        if foreign_claim is not None:
+            # Simulate a predecessor's hold that this spawn must never clobber.
+            conn.execute("UPDATE tasks SET spawn_fence = ? WHERE id = ?",
+                         (kb._spawn_fence_payload(foreign_claim, run_id - 1), tid))
+            conn.commit()
+        assert kb.spawn_fence(conn, tid) is not None
+    # A pid that is definitely not this process and not alive.
+    pid = 2 ** 22 - 1
+    assert not kbd._worker_alive(pid, None)
+    return tid, claim, run_id, pid
+
+
+def test_adopt_worker_pid_settles_its_own_spawn_fence(board, monkeypatch):
+    """Upstream lets a worker register its own PID when the dispatcher died
+    between spawn and ``_set_worker_pid``. That self-registration IS this spawn's
+    publication, so it must also settle the in-flight spawn fence the dispatcher
+    armed before starting the child — otherwise the hold stays armed forever and
+    the card can never be archived or re-dispatched."""
+    tid, claim, run_id, pid = _armed_spawn(board, monkeypatch)
+
+    with kbc.connect_closing() as conn:
+        assert kbd.adopt_worker_pid(conn, tid, run_id, pid) is True
+        row = conn.execute(
+            "SELECT status, worker_pid, spawn_fence FROM tasks WHERE id = ?", (tid,),
+        ).fetchone()
+        assert row["status"] == "running"
+        assert row["worker_pid"] == pid, "the self-registration must still land"
+        assert row["spawn_fence"] is None, "publication settles the in-flight hold"
+        assert _event(conn, tid, "worker_registered") is not None
+        assert kb.spawn_fence(conn, tid) is None
+
+    # The card is no longer held: a later block + archive runs the ordinary path.
+    with kbc.connect_closing() as conn:
+        ok, why = kb.block_task(conn, tid, reason="operator stop", with_reason=True)
+        assert ok is True, why
+        ok, why = kb.archive_task(conn, tid, with_reason=True)
+        assert ok is True, why
+        assert kb.get_task(conn, tid).status == "archived"
+
+
+def test_adopt_worker_pid_never_clears_a_foreign_spawn_fence(board, monkeypatch):
+    """The self-registration only settles a fence naming ITS claim/run: a
+    predecessor's unresolved hold keeps the card unarchivable, exactly as the
+    dispatcher-side rules require."""
+    foreign = "some-other-claim-token"
+    tid, claim, run_id, pid = _armed_spawn(board, monkeypatch, foreign_claim=foreign)
+
+    with kbc.connect_closing() as conn:
+        assert kbd.adopt_worker_pid(conn, tid, run_id, pid) is True
+        fence = kb.spawn_fence(conn, tid)
+        assert fence is not None and fence["claim"] == foreign, fence
+        row = conn.execute(
+            "SELECT worker_pid FROM tasks WHERE id = ?", (tid,)).fetchone()
+        assert row["worker_pid"] == pid
+
+    with kbc.connect_closing() as conn:
+        refused, why = kb.archive_task(conn, tid, with_reason=True)
+        # Status guard first (the card is still ``running``); the foreign hold
+        # itself is what keeps the card held after the worker is stopped.
+        assert refused is False, why
+        assert kb.get_task(conn, tid).status == "running"
+        assert kb.spawn_fence(conn, tid)["claim"] == foreign
