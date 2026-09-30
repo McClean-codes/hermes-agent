@@ -23,9 +23,10 @@ from tools.kanban_tools_schemas import (
     KANBAN_ARCHIVE_SCHEMA,
     KANBAN_ATTACH_SCHEMA,
     KANBAN_ATTACH_URL_SCHEMA, KANBAN_ATTACHMENTS_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_COMMENT_SCHEMA,
-    KANBAN_COMPLETE_SCHEMA, KANBAN_CREATE_SCHEMA, KANBAN_DECOMPOSE_SCHEMA, KANBAN_GRAPH_SCHEMA,
+    KANBAN_COMPLETE_SCHEMA, KANBAN_CREATE_SCHEMA, KANBAN_DECOMPOSE_SCHEMA, KANBAN_DISCOVER_SCHEMA,
+    KANBAN_GRAPH_SCHEMA,
     KANBAN_HEARTBEAT_SCHEMA, KANBAN_LINK_SCHEMA,
-    KANBAN_LIST_SCHEMA, KANBAN_PROMOTE_SCHEMA, KANBAN_REQUEST_CHANGES_SCHEMA,
+    KANBAN_LIST_SCHEMA, KANBAN_PROMOTE_SCHEMA, KANBAN_REASSIGN_SCHEMA, KANBAN_REQUEST_CHANGES_SCHEMA,
     KANBAN_REQUEST_REVIEW_SCHEMA,
     KANBAN_SHOW_SCHEMA, KANBAN_UNBLOCK_SCHEMA, KANBAN_UNLINK_SCHEMA)
 
@@ -337,6 +338,48 @@ def _redact_metadata(metadata: dict) -> Optional[dict]:
         return json.loads(redact_sensitive_text(json.dumps(metadata), force=True))
     except json.JSONDecodeError:
         return None
+
+
+# --- Canonical profile validation / enumeration -------------------------------
+#
+# One kernel for every caller-supplied profile name on this surface
+# (``kanban_create`` assignee, ``kanban_reassign`` destination,
+# ``kanban_request_review`` reviewer) plus the ``kanban_discover`` roster.
+# ``hermes_cli.profiles`` is what the CLI and the dispatcher's spawn gate
+# already use, so tool semantics cannot drift from them: ``default`` resolves
+# through the profile root (HERMES_HOME / env aware, never the current home),
+# and a directory that is tombstoned, marker-less or not a valid profile id
+# never passes.
+
+def _profiles_kernel():
+    """``(profile_exists, list_profile_names)`` from ``hermes_cli.profiles``.
+
+    Imported lazily (same convention as the rest of this module) so a
+    non-Kanban import never pays for it. A failure to import propagates:
+    refusing to validate must never silently widen to "accept anything".
+    """
+    from hermes_cli.profiles import list_profile_names, profile_exists
+
+    return profile_exists, list_profile_names
+
+
+def _require_installed_profile(what: str, value: Any, *, hint: str = "") -> str:
+    """Reject ``value`` unless it names a profile this home can actually spawn.
+
+    Returns the stripped name. Validated BEFORE the board is opened, so a
+    typo'd assignee can never leave a task row, a dependency edge, an event
+    or a workspace behind — the dispatcher would otherwise bucket it as
+    ``skipped_nonspawnable`` forever.
+    """
+    profile_exists, list_profile_names = _profiles_kernel()
+    name = str(value).strip()
+    _check(name, f"{what} must be a non-empty profile name.")
+    if not profile_exists(name):
+        installed = ", ".join(list_profile_names()) or "(none)"
+        raise _Reject(
+            f"{what} profile {name!r} is not installed. Installed profiles: {installed}."
+            + (f" {hint}" if hint else ""))
+    return name
 
 
 def _coerce_str_list(value: Any, name: str, what: str, *, strip: bool = False):
@@ -845,13 +888,10 @@ def _handle_request_review(args: dict, **kw) -> str:
     # Reviewer is model-supplied free text stored durably on the event payload.
     reviewer = _redact_opt(args.get("reviewer") or None)
     if reviewer:
-        from hermes_cli.profiles import list_profile_names, profile_exists
-
         # A non-profile reviewer would park the card in `review` on an assignee
-        # the dispatcher can never spawn (#106163).
-        _check(profile_exists(reviewer),
-               f"reviewer profile {reviewer!r} is not installed. "
-               f"Installed profiles: {', '.join(list_profile_names())}")
+        # the dispatcher can never spawn (#106163). Same kernel as the
+        # kanban_create / kanban_reassign assignee guards.
+        reviewer = _require_installed_profile("reviewer", reviewer)
     with _board(args.get("board")) as (kb, conn):
         _goal_gate("kanban_request_review", kb.get_task(conn, tid), tid, summary)
         try:
@@ -1050,6 +1090,13 @@ def _handle_create(args: dict, **kw) -> str:
     assignee = args.get("assignee")
     _check(assignee, "assignee is required — name the profile that should execute this "
                      "task (the dispatcher will only spawn tasks with an assignee)")
+    # Validated before `_board` is even opened: a profile that does not exist
+    # must not leave a task row, a dependency edge, an event or a workspace
+    # behind — the dispatcher would only ever bucket it as skipped_nonspawnable.
+    assignee = _require_installed_profile(
+        "assignee", assignee,
+        hint="Call kanban_discover for the roster of profiles this home can spawn. "
+             "Nothing changed.")
     # Workspace sharing is always explicit: omitted fields mean a fresh scratch workspace
     # even for a dispatcher-spawned creator (reusing the parent's path would let a child
     # mutate review evidence or race its checkout). Project identity is the one safe thing
@@ -1426,9 +1473,16 @@ def _archive_reason(args: dict) -> str:
 
     Missing, non-string, empty and whitespace-only input is rejected here, ahead
     of ``_board``/``_existing_task``/``archive_task``, so a bad reason can never
-    leave a status flip, an event or a run behind. The text is preserved as the
-    caller sent it — no normalization, no generic stand-in — because the whole
-    point of the field is the agent's own wording in the audit trail.
+    leave a status flip, an event or a run behind.
+
+    The wording is the agent's own (no normalization, no generic stand-in), but
+    it crosses the SAME ``_redact`` boundary every other agent-authored free-text
+    field on this board crosses before it is stored — ``kanban_block`` reason,
+    ``kanban_complete`` summary/result, ``kanban_comment`` body, and this PR's
+    own ``kanban_promote`` reason. The reason is durable (``task_events.payload``)
+    and is echoed back by ``kanban_show``, so an unredacted secret here would be
+    both stored and re-served to the model. Plain prose passes through verbatim;
+    only credential-shaped text is masked.
     """
     reason = args.get("reason")
     if reason is None:
@@ -1442,7 +1496,7 @@ def _archive_reason(args: dict) -> str:
         raise _Reject(
             "reason must not be empty or whitespace-only — say why this task is "
             "being archived. Nothing changed.")
-    return reason
+    return _redact(reason)
 
 
 # The agent-facing archive runs the ONE shared archive policy (see
@@ -1540,19 +1594,181 @@ def _handle_decompose(args: dict, **kw) -> str:
         )
 
 
+# --- Profile routing: reassign + discovery ------------------------------------
+
+# ``profile.yaml`` is the ONLY file discovery reads: it is deliberately tiny
+# metadata ABOUT the profile (see hermes_cli/profiles.py), never config.yaml,
+# .env, auth.json, SOUL.md or any prompt/skill content. The roster consumers
+# (the decomposer prompt, ``hermes profile list``) are bounded, so the strings
+# handed to a model here are bounded too — the describer's own contract caps a
+# description at 280 characters.
+_DESCRIPTOR_DESCRIPTION_MAX = 400
+_DESCRIPTOR_DISPLAY_NAME_MAX = 64  # the writer refuses anything longer
+
+
+def _bounded_text(value: Any, limit: int) -> str:
+    """Single-line, stripped, hard-capped. Never raises."""
+    text = " ".join(str(value or "").split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
+
+
+def _profile_descriptor(profile_dir) -> dict:
+    """``profile.yaml`` status + the fields the roster contract exposes.
+
+    Status is explicit rather than implied: ``missing`` (no descriptor — a
+    perfectly normal profile), ``unreadable`` (present but the filesystem said
+    no), ``invalid`` (present but not a safely-parsed mapping), ``ok``. A
+    malformed descriptor must be *reported*, never silently downgraded to
+    "absent" and never raised: one broken profile must not take discovery (or
+    ``hermes profile list``) down with it. Parsing goes through the safe loader
+    only, and only the exception class name is surfaced — a YAML scanner error
+    is allowed to quote the document it choked on.
+    """
+    path = profile_dir / "profile.yaml"
+    try:
+        path.stat()
+    except FileNotFoundError:
+        return {"status": "missing"}
+    except OSError:
+        # Present for ``stat`` purposes but not readable — reported, never raised.
+        return {"status": "unreadable"}
+    if not path.is_file():
+        # e.g. a directory named profile.yaml: it exists and is not a descriptor.
+        return {"status": "invalid", "detail": "not-a-file"}
+    try:
+        raw = path.read_text(encoding="utf-8-sig")
+    except UnicodeDecodeError:
+        return {"status": "invalid", "detail": "not-utf8"}
+    except OSError:
+        return {"status": "unreadable"}
+    try:
+        import hermes_yaml as yaml
+
+        data = yaml.safe_load(raw)
+    except Exception as exc:  # noqa: BLE001 - every parser failure is "invalid"
+        return {"status": "invalid", "detail": type(exc).__name__}
+    if not isinstance(data, dict):
+        return {"status": "invalid", "detail": "not-a-mapping"}
+
+    # Canonical loader for the OK path: the same normalisation
+    # ``list_profiles()`` / the decomposer roster / ``hermes profile list`` use.
+    from hermes_cli.profiles import read_profile_meta
+
+    meta = read_profile_meta(profile_dir)
+    # Descriptor text is an operator-authored free-text field heading straight
+    # to a model, so it crosses the same ``_redact`` boundary as every other
+    # agent-visible free text here. (Nothing is written back — this is only the
+    # view discovery returns.)
+    return {
+        "status": "ok",
+        "description": _bounded_text(_redact(meta.get("description") or ""),
+                                     _DESCRIPTOR_DESCRIPTION_MAX),
+        "display_name": _bounded_text(_redact(meta.get("display_name") or ""),
+                                      _DESCRIPTOR_DISPLAY_NAME_MAX),
+        "role": meta.get("role"),
+    }
+
+
+@_kanban_handler("kanban_discover")
+def _handle_discover(args: dict, **kw) -> str:
+    """Read-only roster of every profile this home can spawn work to.
+
+    Home-scoped, not board-scoped: no board is opened (opening one can
+    initialize the database, which would be a write), no file is written and
+    no describer is run. The enumeration is ``hermes_cli.profiles``' own, so
+    the roster and the ``kanban_create`` / ``kanban_reassign`` guards can
+    never disagree about what a valid assignee is.
+    """
+    from hermes_cli import profiles as profiles_mod
+
+    names = profiles_mod.list_profile_names()
+    entries = [
+        {
+            "name": name,
+            "is_default": name == "default",
+            "descriptor": _profile_descriptor(profiles_mod.get_profile_dir(name)),
+        }
+        for name in names
+    ]
+    return _ok(count=len(entries), profiles=entries)
+
+
+@_kanban_handler("kanban_reassign")
+def _handle_reassign(args: dict, **kw) -> str:
+    """Hand a card to another profile through the CLI's own assign kernel.
+
+    Deliberately not a second implementation: ``kanban_db.reassign_task`` /
+    ``assign_task`` are what ``hermes kanban reassign`` runs, including its
+    active-worker guard (a card with a live claim is refused inside the write
+    transaction, before any UPDATE) and its ``assigned`` audit event. The
+    destination profile is validated before the board is opened, so a typo
+    changes nothing.
+    """
+    _reject_delegated_child_mutation("kanban_reassign")
+    _require_orchestrator_tool("kanban_reassign")
+    tid = args.get("task_id")
+    _check(tid, "task_id is required")
+    tid = str(tid)
+    assignee = args.get("assignee")
+    _check(assignee and str(assignee).strip(),
+           "assignee is required — name the destination profile. Nothing changed.")
+    assignee = _require_installed_profile(
+        "assignee", assignee,
+        hint="Call kanban_discover for the roster of profiles this home can spawn. "
+             "Nothing changed.")
+    _enforce_worker_task_ownership(tid)
+    reclaim = _parse_bool_arg(args, "reclaim")
+    reason = _redact_opt(args.get("reason") or None)
+    with _board(args.get("board")) as (kb, conn):
+        task = _existing_task(kb, conn, tid)
+        before = _fields(task, ("id", "status", "assignee"))
+        events_before = len(kb.list_events(conn, tid))
+        # Shared machinery: reclaim (optional) + assign, same guards as the CLI.
+        ok = kb.reassign_task(conn, tid, assignee, reclaim_first=reclaim, reason=reason)
+        if not ok:
+            landed = kb.get_task(conn, tid)
+            _check(landed is not None, f"task {tid} not found — nothing changed")
+            _check(False,
+                   f"cannot reassign {tid}: it is still running under a live claim "
+                   f"(status {landed.status}). Set reclaim=true to release the claim "
+                   f"first — the CLI equivalent is "
+                   f"`hermes kanban reassign {tid} {assignee} --reclaim`. Nothing changed.")
+        landed = _existing_task(kb, conn, tid)
+        events = kb.list_events(conn, tid)
+        audit = events[-1] if len(events) > events_before else None
+        _check(audit is not None and audit.kind == "assigned",
+               f"reassigned {tid} but could not read back its audit event")
+        return _ok(
+            task_id=tid,
+            status=landed.status,
+            assignee=landed.assignee,
+            previous_assignee=before["assignee"],
+            claim_reclaimed=reclaim,
+            # Readback, not a restatement of the request: the stored event.
+            audit=_fields(audit, _EVENT_FIELDS),
+        )
+
+
 # --- Registration (order preserved: it is the order tools appear in the schema) ---
 
 # kanban_list / kanban_unblock route the board and are hidden from task workers.
 # kanban_archive / kanban_promote / kanban_decompose are likewise board-level
 # lifecycle moves: a task-scoped worker must not archive, promote or fan out a
 # card (its own escape hatch around the complete/review gates, or a sibling's).
+# kanban_reassign hands a card to a different profile — the same class of move.
+# kanban_discover stays worker-visible: it is read-only (no board, no writes)
+# and a worker that is about to fan out needs the same roster kanban_create
+# validates against.
 _ORCHESTRATOR_TOOLS = frozenset({
     "kanban_list", "kanban_unblock",
-    "kanban_archive", "kanban_promote", "kanban_decompose",
+    "kanban_archive", "kanban_promote", "kanban_decompose", "kanban_reassign",
 })
 _TOOLS = (
     ("kanban_show", KANBAN_SHOW_SCHEMA, _handle_show, "📋"),
     ("kanban_list", KANBAN_LIST_SCHEMA, _handle_list, "📋"),
+    ("kanban_discover", KANBAN_DISCOVER_SCHEMA, _handle_discover, "🔎"),
     ("kanban_graph", KANBAN_GRAPH_SCHEMA, _handle_graph, "🕸"),
     ("kanban_complete", KANBAN_COMPLETE_SCHEMA, _handle_complete, "✔"),
     ("kanban_block", KANBAN_BLOCK_SCHEMA, _handle_block, "⏸"),
@@ -1564,6 +1780,7 @@ _TOOLS = (
     ("kanban_attach_url", KANBAN_ATTACH_URL_SCHEMA, _handle_attach_url, "📎"),
     ("kanban_attachments", KANBAN_ATTACHMENTS_SCHEMA, _handle_attachments, "📎"),
     ("kanban_create", KANBAN_CREATE_SCHEMA, _handle_create, "➕"),
+    ("kanban_reassign", KANBAN_REASSIGN_SCHEMA, _handle_reassign, "🔀"),
     ("kanban_decompose", KANBAN_DECOMPOSE_SCHEMA, _handle_decompose, "🗂"),
     ("kanban_promote", KANBAN_PROMOTE_SCHEMA, _handle_promote, "⏫"),
     ("kanban_unblock", KANBAN_UNBLOCK_SCHEMA, _handle_unblock, "▶"),
