@@ -233,12 +233,17 @@ def test_discover_reports_a_non_mapping_descriptor_explicitly(board_env):
     assert entry["descriptor"] == {"status": "invalid", "detail": "not-a-mapping"}
 
 
-def test_discover_reports_malformed_metadata_values_as_invalid_without_aborting_the_roster(board_env):
+def test_discover_degrades_unhashable_role_to_none_without_aborting_the_roster(board_env):
     """Valid YAML mapping, malformed VALUE: ``role: [setup]`` is unhashable in
     the canonical loader's ``PROFILE_ROLES`` membership test, which used to
-    raise ``TypeError`` straight out of ``_handle_discover``. It must be
-    reported as an ``invalid`` descriptor — exception class only — and the
-    roster must survive, profiles listed after it included."""
+    raise ``TypeError`` straight out of ``_handle_discover``. The approved fix
+    in ``read_profile_meta`` tests the type before the membership check, so the
+    bad VALUE degrades to ``None`` exactly like an unknown scalar: the record is
+    a valid descriptor, the rest of the document still comes through, and the
+    roster survives — profiles listed after it included. The former
+    ``invalid``/``TypeError`` expectation is obsolete with that root fix; the
+    discovery contract it guarded (never abort, never leak exception detail)
+    still holds here."""
     _install_profile(board_env, "broken_meta")
     _install_profile(board_env, "zz_after")  # enumerated after the broken one
     (board_env / "profiles" / "broken_meta" / "profile.yaml").write_text(
@@ -251,13 +256,15 @@ def test_discover_reports_malformed_metadata_values_as_invalid_without_aborting_
         assert payload["ok"] is True, payload
         by_name = {p["name"]: p for p in payload["profiles"]}
         descriptor = by_name["broken_meta"]["descriptor"]
-        assert descriptor["status"] == "invalid", descriptor
-        assert descriptor["detail"] == "TypeError"  # class name, never a message
+        # The guard isolates the bad VALUE: the record is valid, and the rest of
+        # the document still comes through instead of degrading to defaults.
+        assert descriptor == {"status": "ok", "description": "DescriptorBodyMarker",
+                              "display_name": "MarkerName", "role": None}, descriptor
         # Not aborted: every profile the roster enumerated still appears.
         assert set(by_name) == {"default", "broken_meta", "zz_after"}, sorted(by_name)
-        # Neither the parsed document nor an exception message leaks.
+        # No exception detail or message is surfaced for the degraded value.
         dumped = json.dumps(payload)
-        assert "DescriptorBodyMarker" not in dumped
+        assert "TypeError" not in dumped
         assert "unhashable" not in dumped
 
 
