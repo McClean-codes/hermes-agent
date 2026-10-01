@@ -166,8 +166,7 @@ def _expand_external(entry: str, home: Optional[Path]) -> Optional[Path]:
         return path
 
 
-def _external_dirs(home: Optional[Path]) -> list[Path]:
-    cfg = _config_skills_cfg(home)
+def _external_dirs(home: Optional[Path], cfg: dict) -> list[Path]:
     out: list[Path] = []
     for entry in cfg.get("external_dirs") or []:
         if not isinstance(entry, str):
@@ -178,8 +177,7 @@ def _external_dirs(home: Optional[Path]) -> list[Path]:
     return out
 
 
-def _disabled_skill_names(home: Optional[Path]) -> set[str]:
-    cfg = _config_skills_cfg(home)
+def _disabled_skill_names(cfg: dict) -> set[str]:
     names: set[str] = set()
     disabled = cfg.get("disabled")
     if isinstance(disabled, list):
@@ -192,20 +190,20 @@ def _disabled_skill_names(home: Optional[Path]) -> set[str]:
     return names
 
 
-def _create_dir(home: Optional[Path]) -> Optional[Path]:
+def _create_dir(home: Optional[Path], cfg: dict) -> Optional[Path]:
     """``skills.create_dir`` for *home* — the runtime's
     ``get_skill_create_dir`` resolved against THAT profile's home instead of
     the current process's. ``None`` when unset/malformed/nonexistent."""
     if home is None:
         return None
-    entry = _config_skills_cfg(home).get("create_dir")
+    entry = cfg.get("create_dir")
     if not entry or not isinstance(entry, (str, os.PathLike)):
         return None
     path = _expand_external(str(entry), home)
     return path if path is not None and path.is_dir() else None
 
 
-def _skill_dirs(home: Optional[Path]) -> list[Path]:
+def _skill_dirs(home: Optional[Path], cfg: dict) -> list[Path]:
     """Search roots for a profile home — exactly what a worker spawned with
     ``HERMES_HOME=home`` scans (``agent.skill_utils.get_all_skills_dirs`` /
     ``skills_tool._skill_search_dirs``): its own ``skills/`` tree, its
@@ -230,17 +228,17 @@ def _skill_dirs(home: Optional[Path]) -> list[Path]:
     dirs: list[Path] = []
     if home is not None:
         dirs.append(home / "skills")
-        created = _create_dir(home)
+        created = _create_dir(home, cfg)
         if created is not None:
             dirs.append(created)
-        dirs.extend(_external_dirs(home))
+        dirs.extend(_external_dirs(home, cfg))
     else:
         try:
             from hermes_constants import get_default_hermes_root
 
             dirs.append(get_default_hermes_root() / "skills")
         except Exception:
-            pass
+            logger.debug("could not resolve the shared root skills library", exc_info=True)
     seen: set[Path] = set()
     unique: list[Path] = []
     for path in dirs:
@@ -318,7 +316,8 @@ def profile_skill_names(profile: str) -> set[str]:
     from agent.skill_utils import iter_skill_index_files
 
     home = _profile_home(profile)
-    roots = _skill_dirs(home)
+    cfg = _config_skills_cfg(home)
+    roots = _skill_dirs(home, cfg)
     names: set[str] = set()
     for root in roots:
         try:
@@ -329,7 +328,7 @@ def profile_skill_names(profile: str) -> set[str]:
     if not names:
         names |= _bundled_seed_names(home)
     names.update(_plugin_skill_names(profile))
-    names -= _disabled_skill_names(home)
+    names -= _disabled_skill_names(cfg)
     return names
 
 
@@ -406,7 +405,7 @@ def _bundled_seed_names(home: Optional[Path]) -> set[str]:
     return names
 
 
-def require_skills(profile: str, skills: Optional[Iterable[str]], *, what: str = "assignee") -> None:
+def require_skills(profile: str, skills: Optional[Iterable[str]]) -> None:
     """Every explicitly forced skill must resolve in ``profile``'s library.
 
     The whole list is validated as one unit: a mixed valid/missing request is
@@ -425,5 +424,5 @@ def require_skills(profile: str, skills: Optional[Iterable[str]], *, what: str =
 def require_reviewer(review_profile: str, *, what: str = "reviewer") -> str:
     """Reviewer profile that exists *and* carries the dispatcher's review skill."""
     name = require_profile(what, review_profile)
-    require_skills(name, REVIEW_SKILLS, what=what)
+    require_skills(name, REVIEW_SKILLS)
     return name

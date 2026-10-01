@@ -403,7 +403,7 @@ def _require_reviewer_capability(profile: str) -> None:
     from hermes_cli.kanban_validation import REVIEW_SKILLS, require_skills
 
     try:
-        require_skills(profile, REVIEW_SKILLS, what="reviewer")
+        require_skills(profile, REVIEW_SKILLS)
     except ValueError as exc:
         raise _Reject(str(exc)) from None
 
@@ -1362,14 +1362,13 @@ def _handle_graph(args: dict, **kw) -> str:
     with _board(args.get("board")) as (kb, conn):
         task = _existing_task(kb, conn, tid)
         graph = kb.task_graph_context(conn, tid)
-        return json.dumps({
-            "ok": True,
-            "task_id": tid,
-            "task": {"id": task.id, "title": task.title, "status": task.status},
-            "parents": graph["parents"],
-            "children": graph["children"],
-            "read_only": True,
-        })
+        return _ok(
+            task_id=tid,
+            task={"id": task.id, "title": task.title, "status": task.status},
+            parents=graph["parents"],
+            children=graph["children"],
+            read_only=True,
+        )
 
 
 @_kanban_handler("kanban_unlink")

@@ -591,6 +591,49 @@ def test_archive_stores_source_actor_and_reason_and_show_reads_it_back(board_env
     assert archived[0]["payload"] == expected
 
 
+def test_archive_redacts_a_secret_in_the_reason_before_storing_and_readback(board_env):
+    """The required ``reason`` is agent-authored free text, so it must cross the
+    SAME ``_redact`` boundary as ``kanban_block``'s reason (comment #5895467045:
+    it was the one such field that skipped it).
+
+    Checked on the DURABLE payload and on the ``kanban_show`` readback, not just
+    on the response: a leaking implementation passes a round-trip assertion, so
+    the assertion is on the absence of the secret — and no real secret is used,
+    only a syntactically-shaped fake token.
+    """
+    from tools import kanban_tools as kt
+    kb, kbc = _db()
+    tid = _blocked_task(kb, kbc)
+    secret = "ghp_" + "B" * 40
+    reason = f"superseded by t_0badf00d — token was {secret}"
+
+    out = _dispatch("kanban_archive", {"task_id": tid, "reason": reason})
+    assert out["ok"] is True, out
+    assert secret not in out["reason"]
+    # The rationale itself survives: redaction masks credentials, not prose.
+    assert "superseded by t_0badf00d" in out["reason"]
+    assert out["reason"] == kt._redact(reason), "not the established redact boundary"
+
+    with kbc.connect() as conn:
+        payloads = _archived_payloads(conn, tid)
+    assert len(payloads) == 1, payloads
+    stored = payloads[0]
+    assert isinstance(stored, dict), payloads
+    assert stored["source"] == "kanban_archive"
+    assert secret not in json.dumps(stored)
+    assert "superseded by t_0badf00d" in stored["reason"]
+
+    # The board's own read path hands the payload straight back to the model.
+    shown = _dispatch("kanban_show", {"task_id": tid})
+    archived = [e for e in shown["events"] if e["kind"] == "archived"]
+    assert len(archived) == 1
+    assert archived[0]["payload"] == stored
+    assert secret not in json.dumps(shown)
+
+
+
+
+
 def test_archive_refusal_writes_no_provenance_payload(board_env):
     """A refused archive (protected status) with a perfectly valid reason writes
     no ``archived`` event at all, so there is no provenance for a move that did

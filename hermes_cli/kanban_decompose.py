@@ -390,22 +390,26 @@ def profile_has_kanban_toolset(profile: str) -> bool:
         return False
 
 
-def eligible_decompose_subscribers(conn, task_id: str) -> tuple[list[str], dict[str, list[dict]]]:
-    """``(distinct eligible profiles, every sub grouped by profile)``.
+def eligible_decompose_subscribers(
+    conn, task_id: str,
+) -> tuple[list[str], dict[str, list[dict]], list[dict]]:
+    """``(distinct eligible profiles, every sub grouped by profile, every sub)``.
 
     Multiple destinations for the same profile (several chats or threads)
     collapse to that one profile — routing must never fan out. Subscriptions
     without a ``notifier_profile`` stamp cannot name a profile and are never
-    eligible. Read-only.
+    eligible. Read-only. The raw list comes back too so a caller can explain a
+    refusal without querying the same rows a second time.
     """
     from hermes_cli import kanban_db_notify as _kbn
 
+    all_subs = _kbn.list_notify_subs(conn, task_id)
     grouped: dict[str, list[dict]] = {}
-    for sub in _kbn.list_notify_subs(conn, task_id):
+    for sub in all_subs:
         owner = str(sub.get("notifier_profile") or "").strip()
         if owner:
             grouped.setdefault(owner, []).append(sub)
-    return sorted(p for p in grouped if profile_has_kanban_toolset(p)), grouped
+    return sorted(p for p in grouped if profile_has_kanban_toolset(p)), grouped, all_subs
 
 
 def build_decompose_instruction(task_id: str, *, system: str, user: str) -> str:
@@ -551,15 +555,16 @@ def _route_decompose_instruction(task: kb.Task) -> DecomposeOutcome:
     stays unchanged until an explicit ``kanban_decompose`` call either way.
     """
     routing = _load_routing(root_assignee=task.assignee)
+    # One sentence, stated identically in every refusal below so the four
+    # outcomes cannot drift apart.
+    off = "kanban.auto_decompose is disabled and the auxiliary model was NOT called"
     user = _USER_TEMPLATE.format(
         **_task_prompt_fields(task),
         roster=_format_roster(routing.roster),
         default_assignee=routing.default_assignee,
     )
     with kbc.connect_closing() as conn:
-        eligible, grouped = eligible_decompose_subscribers(conn, task.id)
-        from hermes_cli import kanban_db_notify as _kbn
-        all_subs = _kbn.list_notify_subs(conn, task.id)
+        eligible, grouped, all_subs = eligible_decompose_subscribers(conn, task.id)
     # Count subscriptions the eligibility pass dropped, so the refusal can say
     # WHY there is no eligible profile instead of claiming the task is unsubscribed.
     unowned = sum(1 for s in all_subs
@@ -582,8 +587,7 @@ def _route_decompose_instruction(task: kb.Task) -> DecomposeOutcome:
             )
         return DecomposeOutcome(
             task.id, False,
-            f"kanban.auto_decompose is disabled and the auxiliary model was NOT called: "
-            f"no eligible Kanban-toolset-capable subscriber ({detail}). The task stays in "
+            f"{off}: no eligible Kanban-toolset-capable subscriber ({detail}). The task stays in "
             f"triage and the graph is unchanged. Subscribe exactly one Kanban profile "
             f"(`hermes kanban notify-subscribe {task.id} ... --notifier-profile <name>`) "
             f"or enable kanban.auto_decompose.",
@@ -592,8 +596,7 @@ def _route_decompose_instruction(task: kb.Task) -> DecomposeOutcome:
     if len(eligible) > 1:
         return DecomposeOutcome(
             task.id, False,
-            f"kanban.auto_decompose is disabled and the auxiliary model was NOT called: "
-            f"{len(eligible)} distinct eligible Kanban profiles are subscribed "
+            f"{off}: {len(eligible)} distinct eligible Kanban profiles are subscribed "
             f"({', '.join(eligible)}). Refusing to broadcast or to mutate the graph — pick "
             f"one owner and call kanban_decompose explicitly. The task is unchanged.",
         )
@@ -607,16 +610,14 @@ def _route_decompose_instruction(task: kb.Task) -> DecomposeOutcome:
         # that never reached the profile was NOT handed to it.
         return DecomposeOutcome(
             task.id, False,
-            f"kanban.auto_decompose is disabled and the auxiliary model was NOT called. "
-            f"The decomposition prompt for {task.id} could NOT be delivered to the single "
+            f"{off}. The decomposition prompt for {task.id} could NOT be delivered to the single "
             f"eligible subscribed Kanban profile {profile!r}: {detail}. The task stays in "
             f"triage and the graph is unchanged — no wake reached that profile, so retry "
             f"when a gateway is reachable, or hand the prompt off explicitly.",
         )
     return DecomposeOutcome(
         task.id, False,
-        f"kanban.auto_decompose is disabled and the auxiliary model was NOT called. "
-        f"Decomposition prompt for {task.id} handed to the single eligible subscribed "
+        f"{off}. Decomposition prompt for {task.id} handed to the single eligible subscribed "
         f"Kanban profile {profile!r}: {detail}. The task graph is unchanged — only an "
         f"explicit kanban_decompose tool call from that profile creates children or "
         f"promotes the root.",
