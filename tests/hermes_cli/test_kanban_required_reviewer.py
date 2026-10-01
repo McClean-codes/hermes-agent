@@ -94,6 +94,23 @@ def _events(conn, tid, kind=None):
     return [e for e in out if e[0] == kind] if kind else out
 
 
+def _frozen(conn, tid: str) -> dict:
+    """Everything a refused reassignment must leave byte-for-byte alone: the
+    whole task row (status, claim, ``current_run_id``, assignee, failure
+    streak), the run table and the complete ordered event log."""
+    row = conn.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone()
+    return {
+        "task": tuple(row) if row is not None else None,
+        "events": [tuple(r) for r in conn.execute(
+            "SELECT kind, payload, run_id FROM task_events WHERE task_id = ? ORDER BY id",
+            (tid,),
+        )],
+        "runs": [tuple(r) for r in conn.execute(
+            "SELECT * FROM task_runs WHERE task_id = ? ORDER BY id", (tid,),
+        )],
+    }
+
+
 # ---------------------------------------------------------------------------
 # Creation: gate persisted, validated before every side effect
 # ---------------------------------------------------------------------------
@@ -459,6 +476,115 @@ def test_reassign_cannot_move_a_review_phase_card_off_its_reviewer(board: Path) 
             kb.assign_task(conn, tid, "qa")
         assert "required reviewer" in str(excinfo.value)
         assert kb.get_task(conn, tid).assignee == "reviewer"
+
+
+# ---------------------------------------------------------------------------
+# reclaim_first validates BEFORE it reclaims (refusal is a pure read)
+# ---------------------------------------------------------------------------
+
+def test_reassign_with_reclaim_refuses_a_missing_skill_without_dropping_the_claim(
+    board: Path,
+) -> None:
+    """``reclaim_first=True`` used to reclaim FIRST and validate SECOND.
+
+    ``assign_task``'s refusal contract is "a refusal changes nothing", and the
+    CLI's own comment leans on it — but the reclaim that preceded the
+    validation had already released the claim, flipped ``running`` back to
+    ``ready``, closed the run and appended a ``reclaimed`` event. A typo'd or
+    under-skilled destination therefore cost a live worker its run while the
+    error message promised nothing had happened.
+    """
+    with kbc.connect() as conn:
+        tid = kb.create_task(
+            conn, title="specialist work", assignee="worker", skills=["sdlc-review"],
+        )
+        _seed_skill(board, "some-other-skill")  # strict mode from here on
+        assert kb.claim_task(conn, tid) is not None
+        before = _frozen(conn, tid)
+
+        with pytest.raises(kv.MissingSkillsError) as excinfo:
+            kb.reassign_task(conn, tid, "qa", reclaim_first=True)
+        assert "qa" in str(excinfo.value) and "sdlc-review" in str(excinfo.value)
+
+        assert _frozen(conn, tid) == before, "a refused reclaim-reassign mutated the card"
+        task = kb.get_task(conn, tid)
+        assert task.status == "running"
+        assert task.claim_lock is not None
+        assert task.assignee == "worker"
+
+
+def test_reassign_with_reclaim_refuses_moving_a_live_review_run_off_its_reviewer(
+    board: Path,
+) -> None:
+    """Same defect through the reviewer gate, and the harder direction.
+
+    A card whose CURRENT status is ``running`` does not look review-gated at
+    all — the gate only trips on ``status == "review"``. Releasing the claim is
+    exactly what returns the card to ``review`` (``_retry_status_for_run``), so
+    the refusal surfaced only after the reclaim had already mutated the card.
+    Validating against the status the card WILL hold closes that gap.
+    """
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="gated work", assignee="worker", reviewer="reviewer")
+        run = kb.claim_task(conn, tid)
+        assert kb.request_review(
+            conn, tid, summary="ready", expected_run_id=run.current_run_id,
+        )
+        assert kb.claim_review_task(conn, tid) is not None  # live reviewer run
+        before = _frozen(conn, tid)
+
+        with pytest.raises(ValueError) as excinfo:
+            kb.reassign_task(conn, tid, "qa", reclaim_first=True)
+        assert "required reviewer" in str(excinfo.value)
+
+        assert _frozen(conn, tid) == before, "a refused reclaim-reassign mutated the card"
+        task = kb.get_task(conn, tid)
+        assert task.status == "running"
+        assert task.claim_lock is not None
+        assert task.assignee == "reviewer"
+
+
+def test_reassign_with_reclaim_still_recovers_a_valid_destination(board: Path) -> None:
+    """The escape hatch keeps working: a destination that honours the forced
+    skill still reclaims the claim and takes the card over."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(
+            conn, title="specialist work", assignee="worker", skills=["sdlc-review"],
+        )
+        _seed_skill(board, "sdlc-review")  # destination can honour the skill
+        assert kb.claim_task(conn, tid) is not None
+        events_before = len(_frozen(conn, tid)["events"])
+
+        assert kb.reassign_task(conn, tid, "qa", reclaim_first=True) is True
+        task = kb.get_task(conn, tid)
+        assert task.assignee == "qa"
+        assert task.status == "ready"
+        assert task.claim_lock is None
+        kinds = [e[0] for e in _frozen(conn, tid)["events"]]
+        assert kinds[events_before:] == ["reclaimed", "assigned"]
+
+
+def test_reassign_with_reclaim_keeps_a_live_review_run_on_its_own_reviewer(
+    board: Path,
+) -> None:
+    """Positive control for the gate path above: pointing a live review run at
+    its OWN saved reviewer is allowed, reclaim and all."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="gated work", assignee="worker", reviewer="reviewer")
+        run = kb.claim_task(conn, tid)
+        assert kb.request_review(
+            conn, tid, summary="ready", expected_run_id=run.current_run_id,
+        )
+        assert kb.claim_review_task(conn, tid) is not None
+        events_before = len(_frozen(conn, tid)["events"])
+
+        assert kb.reassign_task(conn, tid, "reviewer", reclaim_first=True) is True
+        task = kb.get_task(conn, tid)
+        assert task.assignee == "reviewer"
+        assert task.status == "review"
+        assert task.claim_lock is None
+        kinds = [e[0] for e in _frozen(conn, tid)["events"]]
+        assert kinds[events_before:] == ["reclaimed", "assigned"]
 
 
 # ---------------------------------------------------------------------------
