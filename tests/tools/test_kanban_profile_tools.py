@@ -110,7 +110,10 @@ def test_create_rejects_an_unknown_assignee_before_any_side_effect(board_env):
 
     out = _dispatch("kanban_create", {"title": "typo'd profile", "assignee": "nope"})
     assert out.get("ok") is not True
-    assert "not installed" in out["error"], out
+    # Wording contract: profiles are "not found" (they are not installable
+    # packages) and the refusal always names the roster + the discover tool.
+    assert "profile 'nope' was not found" in out["error"], out
+    assert "not installed" not in out["error"], out
     # The roster is named back, and the fix is pointed at.
     assert "default" in out["error"]
     assert "kanban_discover" in out["error"]
@@ -150,7 +153,8 @@ def test_create_rejects_a_tombstoned_or_markerless_directory(board_env):
     ghost.mkdir(parents=True)
     out = _dispatch("kanban_create", {"title": "ghost card", "assignee": "ghost"})
     assert out.get("ok") is not True
-    assert "not installed" in out["error"]
+    assert "profile 'ghost' was not found" in out["error"]
+    assert "not installed" not in out["error"]
 
 
 def test_every_roster_name_discover_returns_is_accepted_by_create(board_env):

@@ -136,7 +136,9 @@ def test_reassign_refuses_an_unknown_destination_and_changes_nothing(board_env):
 
     out = _dispatch("kanban_reassign", {"task_id": tid, "assignee": "nope"})
     assert out.get("ok") is not True
-    assert "not installed" in out["error"], out
+    # Wording contract: a profile is "not found", never "not installed".
+    assert "profile 'nope' was not found" in out["error"], out
+    assert "not installed" not in out["error"], out
     # The roster is named back so the model can correct itself.
     assert "default" in out["error"] and "peer" in out["error"]
     assert out["error"].endswith("Nothing changed.")

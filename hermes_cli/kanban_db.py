@@ -738,6 +738,13 @@ class Task:
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
     completion_contract: Optional[str] = None
+    # Review gate set at creation: profile every implementation run must hand
+    # off to via request_review. None = ungated (all historical cards).
+    required_reviewer: Optional[str] = None
+    # Not a column: stamped by the dispatcher on the claimed row it spawns, so
+    # the child's env can carry an authoritative run phase ("review" only when
+    # the review lane claimed the card out of the review column).
+    run_phase: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -772,6 +779,7 @@ _TASK_OPTIONAL_COLUMNS = (
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
     "model_override", "provider_override", "reasoning_effort", "goal_max_turns", "block_kind",
+    "required_reviewer",
 )
 
 
@@ -981,7 +989,14 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Optional review gate: the profile every implementation run on this card
+    -- must hand off to before it may close. NULL = ungated (the historical
+    -- behaviour, unchanged for every existing card). Set once at creation from
+    -- kanban_create's ``reviewer`` and never silently rewritten afterwards:
+    -- request_review routes to it, and complete_task refuses an implementation
+    -- run on a gated card so tool hiding is a convenience, not the control.
+    required_reviewer    TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1221,6 +1236,29 @@ def _project_from_source_task(
     return project_obj, project_repo
 
 
+def _require_task_skills(profile: str, skills: Optional[Iterable[str]]) -> None:
+    """Explicit forced skills must resolve in ``profile``'s effective library."""
+    from hermes_cli.kanban_validation import require_skills
+
+    require_skills(profile, skills)
+
+
+def _require_required_reviewer(profile: str) -> str:
+    """A saved reviewer must exist AND carry the dispatcher's review skill."""
+    from hermes_cli.kanban_validation import require_reviewer
+
+    return require_reviewer(profile)
+
+
+def _require_review_phase_skills(profile: str) -> None:
+    """Review routing may only land on a profile that already carries the skill
+    the dispatcher force-loads for a review-lane worker (existence of the
+    profile itself is the checking surface's job — this is capability)."""
+    from hermes_cli.kanban_validation import REVIEW_SKILLS, require_skills
+
+    require_skills(profile, REVIEW_SKILLS, what="reviewer")
+
+
 def _normalize_task_skills(skills: Optional[Iterable[str]]) -> Optional[list[str]]:
     """Strip/dedupe a skills list. Commas are refused (a comma-joined string must
     not land in one argv slot); toolset names are rejected all at once because
@@ -1275,6 +1313,7 @@ def create_task(
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
+    reviewer: Optional[str] = None,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1290,6 +1329,11 @@ def create_task(
     in the active profile's projects.db — see ``_resolve_project_link``.
     ``workspace_kind=None`` (omitted) inherits a project-scoped board's project;
     an explicit ``"scratch"`` or ``project_id=""`` is a request for no project.
+    ``reviewer`` installs a review gate: the profile must exist and carry the
+    dispatcher's review skill, and every explicitly forced ``skills`` entry must
+    resolve in the assignee's effective skill library — both validated before
+    the idempotency probe so a rejected call leaves no task row, edge, event or
+    workspace behind.
     """
     from hermes_cli.kanban_db_graph import initial_task_state, inherit_creator_origin
     from hermes_cli.kanban_pr_acceptance import validate_contract
@@ -1328,6 +1372,21 @@ def create_task(
     )
     parents = tuple(p for p in parents if p)
     skills_list = _normalize_task_skills(skills)
+
+    # --- Validation BEFORE any side effect -------------------------------
+    # Explicit forced skills must resolve in the ASSIGNEE's effective skill
+    # library; a mixed valid/missing list is rejected as one unit so a task
+    # never lands with half its specialist context. Omitted skills keep their
+    # historical behaviour. A reviewer installs the review gate and must both
+    # exist and carry the dispatcher's review skill. Everything below is
+    # read-only: a refusal here leaves no task row, edge, event or workspace.
+    if skills_list and assignee:
+        _require_task_skills(assignee, skills_list)
+    reviewer_gate: Optional[str] = None
+    if reviewer is not None:
+        if not str(reviewer).strip():
+            raise ValueError("reviewer must be a non-empty profile name")
+        reviewer_gate = _require_required_reviewer(reviewer)
 
     # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
     # race may insert twice, the next lookup stabilises on the newest.
@@ -1374,8 +1433,9 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id, completion_contract
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, completion_contract,
+                        required_reviewer
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -1385,6 +1445,7 @@ def create_task(
                         json.dumps(skills_list) if skills_list is not None else None,
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
+                        reviewer_gate,
                     ),
                 )
                 for pid in parents:
@@ -1407,6 +1468,7 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "required_reviewer": reviewer_gate,
                     },
                 )
                 if task_status == "blocked":
@@ -1560,8 +1622,27 @@ def list_tasks(
 
 
 def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
-    """Assign/reassign; raises RuntimeError while the task is running under a claim."""
+    """Assign/reassign; raises RuntimeError while the task is running under a claim.
+
+    Reassignment must preserve what the card already promises its worker: every
+    explicitly forced skill has to resolve for the new assignee, and a card
+    sitting in the review phase keeps the reviewer the gate saved (moving it
+    would strand the gate on a profile that never agreed to it). Both checks are
+    read-only and run before the write transaction, so a refusal changes
+    nothing.
+    """
     profile = _canonical_assignee(profile)
+    existing = get_task(conn, task_id)
+    if existing is None:
+        return False
+    if existing.skills and profile:
+        _require_task_skills(profile, existing.skills)
+    if existing.required_reviewer and existing.status == "review" and profile != existing.required_reviewer:
+        raise ValueError(
+            f"cannot reassign {task_id}: it is in the review phase with required "
+            f"reviewer {existing.required_reviewer!r}, which the gate preserves "
+            f"across retries/resume (got {profile!r}). Nothing changed."
+        )
     with write_txn(conn):
         row = conn.execute(
             "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
@@ -2749,6 +2830,109 @@ class LiveClaimError(ValueError):
         )
 
 
+class ReviewerGateError(ValueError):
+    """``complete_task`` refused: the card carries a required reviewer and the
+    caller is not an approval from the review phase.
+
+    A ``ValueError`` so every surface (tool handler, CLI, dashboard API) treats
+    it as a recoverable, user-facing refusal rather than a crash. Raised before
+    the write transaction, so nothing changed.
+    """
+
+    def __init__(self, task_id: str, required_reviewer: str, *, reason: str):
+        self.task_id = task_id
+        self.required_reviewer = required_reviewer
+        self.reason = reason
+        super().__init__(
+            f"cannot complete {task_id}: it has a required reviewer "
+            f"{required_reviewer!r} ({reason}). Finish with request_review so "
+            f"the saved reviewer is selected automatically, or an operator can "
+            f"override the gate explicitly (CLI: --override-reviewer; API: "
+            f"review_gate_override=true). Nothing changed."
+        )
+
+
+def _required_reviewer_of(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Saved review gate for ``task_id``; None when the card is ungated."""
+    row = conn.execute(
+        "SELECT required_reviewer FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    value = (row["required_reviewer"] or "").strip()
+    return value or None
+
+
+def _live_run_phase(
+    conn: sqlite3.Connection, task_id: str, run_id: int,
+) -> tuple[Optional[str], Optional[str]]:
+    """``(claimed source_status, run profile)`` for a live run — the lifecycle
+    record the dispatcher wrote when it claimed the card, never an env string."""
+    run = get_run(conn, run_id)
+    claimed_event = _latest_event(conn, task_id, "claimed", run_id)
+    payload = _json_dict(_row_get(claimed_event, "payload"))
+    source_status = payload.get("source_status")
+    return (
+        source_status if isinstance(source_status, str) else None,
+        run.profile if run is not None else None,
+    )
+
+
+def _trusted_review_run(
+    conn: sqlite3.Connection, task_id: str, run_id: int, required_reviewer: str,
+) -> bool:
+    """True when the live run IS the review run the dispatcher claimed out of
+    the review column AND belongs to the saved reviewer. A same-profile
+    implementer therefore cannot borrow its own identity — the phase, not the
+    profile string, is what distinguishes the two runs."""
+    source_status, profile = _live_run_phase(conn, task_id, run_id)
+    return source_status == "review" and (profile or "") == required_reviewer
+
+
+def _gate_reviewer_phase(
+    conn: sqlite3.Connection, task_id: str, *, review_gate_override: bool,
+) -> bool:
+    """Refuse an implementation completion on a gated card.
+
+    Returns True when an explicit ``review_gate_override`` was consumed (the
+    caller records the audit event), False otherwise. Raises
+    :class:`ReviewerGateError` when the gate holds.
+
+    The verdict comes from lifecycle/run state — which run is live, where that
+    run was claimed from, and which profile owns it — so neither a spoofed
+    ``expected_run_id`` nor an env/profile string can re-label a phase.
+    """
+    row = conn.execute(
+        "SELECT status, required_reviewer, claim_lock, current_run_id "
+        "FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return False
+    gate = (row["required_reviewer"] or "").strip()
+    if not gate:
+        return False  # ungated card: behaviour unchanged
+    status = row["status"]
+    if status not in ("running", "ready", "blocked", "review"):
+        return False  # not completable anyway; let the transition report it
+
+    live = row["claim_lock"] is not None and row["current_run_id"] is not None
+    reason = "it is not in the review phase"
+    if live:
+        source_status, profile = _live_run_phase(conn, task_id, int(row["current_run_id"]))
+        if source_status == "review":
+            if (profile or "") == gate:
+                return False  # the saved reviewer's own review run
+            reason = "the live run is not the saved reviewer's review run"
+        # An implementation run holds the card: it may not close a gated card.
+    elif status == "review":
+        return False  # unclaimed review column: an explicit approval out of review
+
+    if review_gate_override:
+        return True
+    raise ReviewerGateError(task_id, gate, reason=reason)
+
+
 def _claim_is_live(trow) -> bool:
     """True when a ``running`` task's claim still protects a run: the worker process
     it spawned exists (PID + start-time fingerprint). A claim whose worker is gone,
@@ -2768,6 +2952,7 @@ def complete_task(
     summary: Optional[str] = None, metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None, expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True, force: bool = False,
+    review_gate_override: bool = False,
 ) -> bool:
     """``running|ready|blocked|review -> done``; records ``result``.
 
@@ -2785,8 +2970,21 @@ def complete_task(
     or ``summary``, or a stripped result already stored on the card. Empty or
     whitespace-only evidence raises :class:`EmptyCompletionError` after an
     auditable event. Approving a card out of ``review`` stays exempt.
+
+    ``review_gate_override`` is the ONLY way past a card's required reviewer
+    outside the review phase, and it is deliberately not implied by ``force``
+    (which only governs a live claim): the CLI exposes it as
+    ``--override-reviewer`` and the dashboard API as ``review_gate_override``,
+    so agent-facing surfaces never receive it. A consumed override is recorded
+    as a ``reviewer_gate_overridden`` event.
     """
     now = int(time.time())
+    # Reviewer gate FIRST: on a gated card the phase decision is the most
+    # specific refusal there is, and it must fire before any other pre-check
+    # writes an audit event for a transition that can never happen.
+    gate_overridden = _gate_reviewer_phase(
+        conn, task_id, review_gate_override=review_gate_override,
+    )
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
         return False
@@ -2836,6 +3034,13 @@ def complete_task(
             params = (*params, int(expected_run_id))
         if conn.execute(sql, params).rowcount != 1:
             return False
+        if gate_overridden:
+            # Explicit operator/orchestrator recovery, always auditable: the
+            # gate was bypassed on purpose, so the record must say so.
+            _append_event(
+                conn, task_id, "reviewer_gate_overridden",
+                {"required_reviewer": _required_reviewer_of(conn, task_id)},
+            )
         if isinstance(metadata, dict):
             _stage_completion_artifacts(conn, task_id, metadata, now)
         run_id = _end_run(
@@ -3485,6 +3690,45 @@ def request_review(
 
     summary = redact_review_value(summary)
     metadata = redact_review_value(metadata)
+    # Resolve + validate the reviewer BEFORE the write txn so a refused handoff
+    # is a pure read: a gated card's saved reviewer wins over any caller-supplied
+    # name (review routing can never be silently re-pointed), and whoever lands
+    # in the review lane must already carry the dispatcher's review skill.
+    gate_row = conn.execute(
+        "SELECT status, required_reviewer FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if gate_row is None:
+        return _ret(False, "task not found")
+    saved_reviewer = (gate_row["required_reviewer"] or "").strip()
+    if saved_reviewer:
+        if reviewer is not None:
+            supplied = _canonical_assignee(reviewer)
+            if supplied != saved_reviewer:
+                return _ret(
+                    False,
+                    f"reviewer override is not allowed: {task_id} has required reviewer "
+                    f"{saved_reviewer!r} and it is preserved across retries/resume; drop "
+                    f"reviewer= (got {supplied!r}). Nothing changed.",
+                )
+        reviewer = saved_reviewer
+    elif reviewer is None:
+        reviewer = _prior_reviewer(conn, task_id)
+        if reviewer is False:
+            return _ret(
+                False, "re-review has no durable reviewer provenance (the "
+                "latest changes_requested event is missing or "
+                "malformed); pass reviewer= explicitly",
+            )
+    if reviewer:
+        reviewer = _canonical_assignee(reviewer)
+        # Capability, not just existence: routing review to a profile without
+        # the skill the dispatcher force-loads would spawn a reviewer that
+        # cannot do the job (existence is checked on the surface that accepts
+        # a caller-supplied name).
+        try:
+            _require_review_phase_skills(reviewer)
+        except ValueError as exc:
+            return _ret(False, f"{exc}")
     # Declared (metadata["artifacts"]) and prose-referenced files
     # must be durable BEFORE anything can clean the scratch workspace up: for a
     # review-bound card the reviewer's completion is the cleanup trigger.
@@ -3512,14 +3756,6 @@ def request_review(
                     "(worker ownership) or force=True (explicit operator "
                     "override) instead of clearing the live run's claim",
                 )
-            if reviewer is None:
-                reviewer = _prior_reviewer(conn, task_id)
-                if reviewer is False:
-                    return _ret(
-                        False, "re-review has no durable reviewer provenance (the "
-                        "latest changes_requested event is missing or "
-                        "malformed); pass reviewer= explicitly",
-                    )
             reviewer = _canonical_assignee(reviewer)
             # The actor is the run that did the work. ``assignee`` is the actor
             # only while a worker holds the card; on a never-claimed card it is
@@ -4793,6 +5029,15 @@ def _ctx_header(lines: list[str], task: Task) -> None:
             lines.append(f"Terminal timeout: {effective_terminal_timeout}s")
     if task.branch_name:
         lines.append(f"Branch:   {task.branch_name}")
+    if task.required_reviewer:
+        # One place only — the gate is a property of the card, not of the body,
+        # so it is never duplicated into (or alongside) the task description.
+        lines.append(
+            f"Required reviewer: {task.required_reviewer} — this card is "
+            f"review-gated: finish with kanban_request_review (the saved "
+            f"reviewer is selected automatically); kanban_complete is not "
+            f"available to implementation runs on it."
+        )
     lines.append("")
     if task.body and task.body.strip():
         lines.append("## Body")

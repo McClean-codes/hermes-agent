@@ -839,6 +839,8 @@ _LATER_TASK_COLUMNS = (
     ("worker_started_at", "worker_started_at INTEGER"),
     # In-flight spawn marker (JSON): a worker may exist while worker_pid is still NULL.
     ("spawn_fence", "spawn_fence TEXT"),
+    # Optional review gate: profile every implementation run must hand off to.
+    ("required_reviewer", "required_reviewer TEXT"),
 )
 
 _NOTIFY_SUB_COLUMNS = (
