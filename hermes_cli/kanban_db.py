@@ -1256,7 +1256,7 @@ def _require_review_phase_skills(profile: str) -> None:
     profile itself is the checking surface's job — this is capability)."""
     from hermes_cli.kanban_validation import REVIEW_SKILLS, require_skills
 
-    require_skills(profile, REVIEW_SKILLS, what="reviewer")
+    require_skills(profile, REVIEW_SKILLS)
 
 
 def _normalize_task_skills(skills: Optional[Iterable[str]]) -> Optional[list[str]]:
@@ -2256,17 +2256,15 @@ def recompute_ready(
         failure_limit = DEFAULT_FAILURE_LIMIT
     promoted = 0
     with write_txn(conn):
-        if only_task_id is None:
-            todo_rows = conn.execute(
-                "SELECT id, status, consecutive_failures, max_retries "
-                "FROM tasks WHERE status IN ('todo', 'blocked')"
-            ).fetchall()
-        else:
-            todo_rows = conn.execute(
-                "SELECT id, status, consecutive_failures, max_retries "
-                "FROM tasks WHERE status IN ('todo', 'blocked') AND id = ?",
-                (only_task_id,),
-            ).fetchall()
+        sql = (
+            "SELECT id, status, consecutive_failures, max_retries "
+            "FROM tasks WHERE status IN ('todo', 'blocked')"
+        )
+        params: tuple = ()
+        if only_task_id is not None:
+            sql += " AND id = ?"
+            params = (only_task_id,)
+        todo_rows = conn.execute(sql, params).fetchall()
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
@@ -2876,17 +2874,6 @@ def _live_run_phase(
         source_status if isinstance(source_status, str) else None,
         run.profile if run is not None else None,
     )
-
-
-def _trusted_review_run(
-    conn: sqlite3.Connection, task_id: str, run_id: int, required_reviewer: str,
-) -> bool:
-    """True when the live run IS the review run the dispatcher claimed out of
-    the review column AND belongs to the saved reviewer. A same-profile
-    implementer therefore cannot borrow its own identity — the phase, not the
-    profile string, is what distinguishes the two runs."""
-    source_status, profile = _live_run_phase(conn, task_id, run_id)
-    return source_status == "review" and (profile or "") == required_reviewer
 
 
 def _gate_reviewer_phase(
@@ -4355,6 +4342,21 @@ def _spawn_fence_writable(
     return None, True
 
 
+def _append_spawn_fence_release(conn: sqlite3.Connection, task_id: str, fence: dict) -> None:
+    """Append the ``spawn_fence_released`` event for a settled ``fence``.
+
+    ONE payload builder for both release sites — the dispatcher settling a
+    resolved hold and the archive releasing it inside the guarded flip — so the
+    recorded evidence cannot drift between them. The identity is always
+    reported rather than dropped silently."""
+    release_run = fence.get("run")
+    _append_event(conn, task_id, "spawn_fence_released", {
+        "pid": int(fence["pid"]), "started_at": fence.get("started_at"),
+        "claim": fence.get("claim"), "run": release_run,
+        "reason": "retained worker identity re-probed and proven gone",
+    }, run_id=int(release_run) if release_run else None)
+
+
 def _release_dead_fence(conn: sqlite3.Connection, task_id: str) -> bool:
     """Settle an armed fence whose retained identity can no longer be observed
     alive — INSIDE the caller's write txn.
@@ -4385,12 +4387,7 @@ def _release_dead_fence(conn: sqlite3.Connection, task_id: str) -> bool:
     )
     if cur.rowcount != 1:
         return False
-    release_run = fence.get("run")
-    _append_event(conn, task_id, "spawn_fence_released", {
-        "pid": int(pid), "started_at": fence.get("started_at"),
-        "claim": fence.get("claim"), "run": release_run,
-        "reason": "retained worker identity re-probed and proven gone",
-    }, run_id=int(release_run) if release_run else None)
+    _append_spawn_fence_release(conn, task_id, fence)
     return True
 
 
@@ -4874,13 +4871,7 @@ def archive_task(
         if fence_released is not None:
             # Truthful evidence for the recovery: which identity was held, and
             # that it was re-probed gone rather than silently dropped.
-            release_run = fence_released.get("run")
-            _append_event(conn, task_id, "spawn_fence_released", {
-                "pid": int(fence_released["pid"]),
-                "started_at": fence_released.get("started_at"),
-                "claim": fence_released.get("claim"), "run": release_run,
-                "reason": "retained worker identity re-probed and proven gone",
-            }, run_id=int(release_run) if release_run else None)
+            _append_spawn_fence_release(conn, task_id, fence_released)
         # Leaked run on a non-running card: close it so history isn't orphaned.
         run_id = _end_run(
             conn, task_id, outcome="reclaimed", status="reclaimed",
