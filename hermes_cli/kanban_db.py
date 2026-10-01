@@ -4316,9 +4316,20 @@ def specify_triage_task(
 # a child can be alive before any row records its PID: while the fence is set,
 # ``worker_pid IS NULL`` proves nothing, so a card can neither be archived off a
 # "no worker recorded" reading nor have a late PID welded onto a state its claim
-# no longer owns. A fence that can never be settled (its dispatcher died
-# mid-spawn) deliberately keeps the card unarchivable — refusing to archive an
-# identity we could not prove gone is the specified failure mode, not a bug.
+# no longer owns.
+#
+# A fence left behind by a dispatcher that died mid-spawn settles only on
+# POSITIVE evidence, never on age: the payload carries the spawner's own
+# identity, so a live spawner means "spawn still in flight" (hold — its child
+# may be one that has not started yet), while a dead one is resolved by looking
+# for a live child of that claim on this host — found, its identity is attached
+# to the fence (the hold continues, now naming a probed process); not found, the
+# hold releases with a recorded reason. Where that probe is unavailable (no
+# ``/proc``), or a fence predates spawner identities, absence proves nothing and
+# the hold stays — refusing to release an identity we could not prove gone is
+# the specified failure mode, not a bug. An age threshold can never do this: a
+# young fence may already have a live child, an old one may be a spawn whose
+# child was never started.
 
 
 def _spawn_fence_payload(claim, run, *, at: Optional[int] = None, **extra) -> str:
@@ -4355,7 +4366,9 @@ def _spawn_fence_blocker(task_id: str, fence: dict) -> str:
         f"{task_id} was blocked while its worker was still starting: claim "
         f"{fence.get('claim')!r} / run {fence.get('run')} has not published a PID yet, "
         f"so the work cannot be proven stopped. The card stays unarchivable until that "
-        f"spawn is settled (published then stopped, or its worker stopped and verified)"
+        f"spawn is settled (published then stopped, its worker stopped and verified, or — "
+        f"once the dispatcher that armed it is provably gone — no live child of that spawn "
+        f"is observable on this host)"
     )
 
 
@@ -4395,33 +4408,146 @@ def _spawn_fence_writable(
     return None, True
 
 
-def _append_spawn_fence_release(conn: sqlite3.Connection, task_id: str, fence: dict) -> None:
+def _append_spawn_fence_release(
+    conn: sqlite3.Connection, task_id: str, fence: dict, *, reason: str,
+) -> None:
     """Append the ``spawn_fence_released`` event for a settled ``fence``.
 
     ONE payload builder for both release sites — the dispatcher settling a
     resolved hold and the archive releasing it inside the guarded flip — so the
     recorded evidence cannot drift between them. The identity is always
-    reported rather than dropped silently."""
+    reported rather than dropped silently. A fence released without ever
+    publishing an identity carries the spawner that armed it instead of a
+    ``pid``, so the release still names exactly what was held."""
     release_run = fence.get("run")
-    _append_event(conn, task_id, "spawn_fence_released", {
-        "pid": int(fence["pid"]), "started_at": fence.get("started_at"),
-        "claim": fence.get("claim"), "run": release_run,
-        "reason": "retained worker identity re-probed and proven gone",
-    }, run_id=int(release_run) if release_run else None)
+    payload: dict = {"claim": fence.get("claim"), "run": release_run, "reason": reason}
+    if fence.get("pid"):
+        payload["pid"] = int(fence["pid"])
+        payload["started_at"] = fence.get("started_at")
+    if fence.get("spawned_by"):
+        payload["spawner"] = fence.get("spawned_by")
+    _append_event(conn, task_id, "spawn_fence_released", payload,
+                  run_id=int(release_run) if release_run else None)
 
 
-def _release_dead_fence(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Settle an armed fence whose retained identity can no longer be observed
-    alive — INSIDE the caller's write txn.
+def _spawner_identity() -> dict:
+    """The process arming a spawn fence — this dispatcher.
+
+    Recorded so a fence its owner left behind can be told apart from one whose
+    spawn is still running (see :func:`_identityless_fence_action`): without it
+    "no identity published yet" is indistinguishable from "the dispatcher that
+    was about to publish is gone"."""
+    pid = os.getpid()
+    try:
+        started_at = _process_fingerprint(pid)
+    except Exception:  # pragma: no cover - an unreadable probe must not block arming
+        started_at = None
+    return {"pid": int(pid), "started_at": started_at}
+
+
+def _observe_spawn_child(fence: dict) -> tuple[bool, Optional[tuple[int, Optional[str]]]]:
+    """``(probe available?, live child of this spawn or None)`` for a fence that
+    has published no worker identity yet.
+
+    The dispatcher pins the spawn's identity on the child's environment before
+    ``exec`` (``HERMES_KANBAN_CLAIM_LOCK`` + ``HERMES_KANBAN_RUN_ID``, both set by
+    ``kanban_db_dispatch._default_spawn``), so a child that is alive but has not
+    published — or never will — is still observable on this host. That is the
+    positive evidence separating "no child was ever started" from "a child is
+    alive and unreported", which an age-based expiry cannot give: a young fence
+    may already have a live child, an old one may be a spawn whose child never
+    started.
+
+    BOTH parts of the fence's identity are required. ``claim_lock`` alone is the
+    *claimer* (``host:pid``, see ``_claimer_id``) — every card that process
+    claimed shares it — so only the run distinguishes this spawn's child from a
+    sibling's; without a run there is nothing to match and the probe reports
+    unavailable rather than risk adopting an unrelated child.
+
+    ``False`` for the probe means this host offers no such evidence (no
+    ``/proc``, or this fence carries no claim/run to match): absence then
+    proves nothing and the caller must keep the hold. Entries this process may
+    not read are skipped — a child is spawned with this dispatcher's own
+    credentials, so an unreadable entry cannot be ours."""
+    claim, run = fence.get("claim"), fence.get("run")
+    if not claim or not run or not os.path.isdir("/proc"):
+        return False, None
+    try:
+        names = os.listdir("/proc")
+    except OSError:  # pragma: no cover - /proc vanished under us
+        return False, None
+    # NUL-delimited exact-entry needles: ``bytes.find`` on a padded buffer, NOT a
+    # split+set per process — on a host with hundreds of processes the allocation
+    # dominates the scan (measured 42x slower), and the writer lock must never
+    # wait on it.
+    n_claim = b"\x00" + f"HERMES_KANBAN_CLAIM_LOCK={claim}".encode("utf-8", "surrogateescape") + b"\x00"
+    n_run = b"\x00" + f"HERMES_KANBAN_RUN_ID={run}".encode("utf-8", "surrogateescape") + b"\x00"
+    own_pid = os.getpid()
+    for name in names:
+        if not name.isdigit() or int(name) == own_pid:
+            continue
+        pid = int(name)
+        try:
+            with open(f"/proc/{pid}/environ", "rb") as fh:
+                environ = fh.read()
+        except OSError:
+            continue
+        padded = b"\x00" + environ + b"\x00"
+        if n_claim in padded and n_run in padded:
+            return True, (pid, _process_fingerprint(pid))
+    return True, None
+
+
+def _identityless_fence_action(fence: dict) -> tuple[str, Optional[tuple[int, Optional[str]]]]:
+    """What an armed fence with NO published worker identity may do next:
+    ``("hold", None)``, ``("adopt", (pid, started_at))`` or ``("release", None)``.
+
+    * spawner still alive → ``hold``. Its spawn is in flight, so a child may be
+      started a millisecond from now: this is the "not yet started" case, and
+      settling here would let a successor claim stack a second child on it.
+    * a live child of that spawn is observable → ``adopt``. Its identity goes on
+      the fence, so the hold keeps naming a process that can be re-probed and
+      that settles the fence itself when it registers (``adopt_worker_pid``).
+    * no live child, spawner provably gone, probe available → ``release``.
+      Nothing was started and nothing can be: the process that would start it is
+      gone.
+    * otherwise → ``hold``. Absence of a child is not provable (no probe on this
+      host), or the fence predates spawner identities and who armed it is
+      unknown — fail closed rather than clear a hold we cannot reason about."""
+    spawner = fence.get("spawned_by")
+    spawner = spawner if isinstance(spawner, dict) else {}
+    spawner_pid = spawner.get("pid")
+    if spawner_pid and _worker_alive(int(spawner_pid), spawner.get("started_at")):
+        return "hold", None
+    available, child = _observe_spawn_child(fence)
+    if child is not None:
+        return "adopt", child
+    if not available or not spawner_pid:
+        return "hold", None
+    return "release", None
+
+
+def _release_dead_fence(
+    conn: sqlite3.Connection, task_id: str, *,
+    probed: Optional[tuple[str, tuple]] = None,
+) -> bool:
+    """Settle an armed fence whose hold can be proven over — INSIDE the caller's
+    write txn.
 
     This is the same proof the archive uses (the canonical ``(pid, start
     fingerprint)`` re-probed gone), applied earlier and guarded by the exact
     payload that was read, so a concurrent writer makes this lose the race
-    instead of clearing a hold it did not check. The release is always
-    recorded as ``spawn_fence_released``: an identity is never dropped
-    silently. A fence that carries NO identity is never released here —
-    nothing can be proven about a spawn that never published one (fail closed;
-    only that spawn's own dispatcher can settle it)."""
+    instead of clearing a hold it did not check.
+
+    ``probed`` is the caller's pre-computed ``(fence text, decision)`` for a
+    fence that carries NO published identity: the host probe behind that
+    decision reads every process on the box, so it runs BEFORE this txn — never
+    under SQLite's writer lock — and is reused only for a byte-identical
+    payload. A payload that moved underneath us, or a caller that did not probe,
+    keeps the hold and is re-decided on the next tick.
+
+    Releases are always recorded as ``spawn_fence_released``: an identity is
+    never dropped silently."""
     row = conn.execute(
         "SELECT spawn_fence FROM tasks WHERE id = ?", (task_id,),
     ).fetchone()
@@ -4431,41 +4557,76 @@ def _release_dead_fence(conn: sqlite3.Connection, task_id: str) -> bool:
     fence = _json_dict(fence_text) or None
     if fence is None:
         return False
-    pid = fence.get("pid")
-    if not pid or _worker_alive(int(pid), fence.get("started_at")):
-        return False
+    if fence.get("pid"):
+        if _worker_alive(int(fence["pid"]), fence.get("started_at")):
+            return False
+        reason = "retained worker identity re-probed and proven gone"
+    else:
+        if probed is None or probed[0] != fence_text:
+            # No probe for THIS payload: absence of a child is unproven, so the
+            # hold stays (fail closed) instead of being cleared on a guess.
+            return False
+        action, child = probed[1]
+        if action == "adopt" and child is not None:
+            held = dict(fence)
+            held["pid"], held["started_at"] = int(child[0]), child[1]
+            conn.execute(
+                "UPDATE tasks SET spawn_fence = ? WHERE id = ? AND spawn_fence = ?",
+                (_json_or_null(held), task_id, fence_text),
+            )
+            return False
+        if action != "release":
+            return False
+        reason = (
+            "spawner died before any worker identity was published and no live child of that "
+            f"spawn (claim {fence.get('claim')!r}) is observable on this host"
+        )
     cur = conn.execute(
         "UPDATE tasks SET spawn_fence = NULL WHERE id = ? AND spawn_fence = ?",
         (task_id, fence_text),
     )
     if cur.rowcount != 1:
         return False
-    _append_spawn_fence_release(conn, task_id, fence)
+    _append_spawn_fence_release(conn, task_id, fence, reason=reason)
     return True
 
 
 def _settle_dead_spawn_fence(conn: sqlite3.Connection, task_id: str) -> bool:
     """Dispatcher-side settlement: release ``task_id``'s spawn fence when its
-    retained worker identity is provably gone, so a RESOLVED hold can never
-    wedge the card out of the pool forever. Returns True when a hold was
-    released. An unresolved hold is left exactly as it is — the caller decides
-    not to dispatch based on the fence that is still there.
+    retained worker identity is provably gone — or, for a fence that never
+    published one, when its spawner is provably gone and no live child of that
+    spawn is observable — so a RESOLVED hold can never wedge the card out of the
+    pool forever. Returns True when a hold was released. An unresolved hold is
+    left exactly as it is — the caller decides not to dispatch based on the
+    fence that is still there.
 
-    The read runs OUTSIDE any txn so the ordinary tick (no fence, or a fence
-    that never published an identity) takes no writer lock at all; only a
-    retained identity that looks gone reaches :func:`_release_dead_fence`,
-    which re-reads and re-probes under the write txn before clearing anything."""
+    Everything runs OUTSIDE any txn first: the ordinary tick (no fence, a fence
+    with a live identity, a fence whose spawner is still spawning) takes no
+    writer lock at all, and the host probe behind an identity-less fence — the
+    expensive part — is computed here and handed to :func:`_release_dead_fence`,
+    which applies it under the lock only to the exact payload that was probed."""
     row = conn.execute(
         "SELECT spawn_fence FROM tasks WHERE id = ?", (task_id,),
     ).fetchone()
-    fence = _json_dict(_row_get(row, "spawn_fence")) if row is not None else None
+    if row is None:
+        return False
+    fence_text = _row_get(row, "spawn_fence")
+    fence = _json_dict(fence_text) or None
     if fence is None:
         return False
-    pid = fence.get("pid")
-    if not pid or _worker_alive(int(pid), fence.get("started_at")):
-        return False
+    probed = None
+    if fence.get("pid"):
+        if _worker_alive(int(fence["pid"]), fence.get("started_at")):
+            return False
+    else:
+        decision = _identityless_fence_action(fence)
+        if decision[0] == "hold":
+            # Nothing provable — do not take a writer lock for it every tick.
+            return False
+        # "release" settles below; "adopt" needs the txn to attach the identity.
+        probed = (fence_text, decision)
     with write_txn(conn):
-        return _release_dead_fence(conn, task_id)
+        return _release_dead_fence(conn, task_id, probed=probed)
 
 
 def _release_unarmed_claim(
@@ -4532,8 +4693,28 @@ def _hold_spawn_fence(conn: sqlite3.Connection, task_id: str, claim, run) -> boo
     is exactly as exclusive as one that has: it is never overwritten and a
     second child is never stacked beside it, because its own child may already
     be alive under a NULL ``worker_pid``. The single predecessor this may clear
-    is one whose retained identity is provably gone — settled here and recorded
-    as ``spawn_fence_released``, never dropped silently."""
+    is one whose hold is provably over — a retained identity re-probed gone, or
+    a fence whose spawner died with no live child of that spawn observable —
+    recorded as ``spawn_fence_released``, never dropped silently.
+
+    The payload also carries THIS dispatcher's own identity (``spawned_by``), so
+    a fence left behind by a dispatcher that died between arming and publishing
+    can be settled later while one whose spawner is still alive stays held.
+
+    The host probe behind an identity-less predecessor's fence reads every
+    process on the box, so it is computed BEFORE the writer lock and applied
+    only to a byte-identical payload — a row that moved underneath us keeps the
+    hold and is re-decided on the next tick."""
+    probed = None
+    pre = conn.execute("SELECT spawn_fence FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if pre is not None:
+        pre_text = _row_get(pre, "spawn_fence")
+        pre_fence = _json_dict(pre_text) or None
+        if (pre_fence is not None and not pre_fence.get("pid")
+                and not _fence_is_mine(pre_fence, claim, run)):
+            decision = _identityless_fence_action(pre_fence)
+            if decision[0] != "hold":
+                probed = (pre_text, decision)
     with write_txn(conn):
         row = conn.execute(
             "SELECT claim_lock, spawn_fence FROM tasks WHERE id = ?", (task_id,),
@@ -4542,11 +4723,11 @@ def _hold_spawn_fence(conn: sqlite3.Connection, task_id: str, claim, run) -> boo
             return False
         fence = _json_dict(_row_get(row, "spawn_fence")) or None
         if fence is not None and not _fence_is_mine(fence, claim, run):
-            if not _release_dead_fence(conn, task_id):
+            if not _release_dead_fence(conn, task_id, probed=probed):
                 return False
         cur = conn.execute(
             "UPDATE tasks SET spawn_fence = ? WHERE id = ? AND claim_lock IS ?",
-            (_spawn_fence_payload(claim, run), task_id, claim),
+            (_spawn_fence_payload(claim, run, spawned_by=_spawner_identity()), task_id, claim),
         )
         return cur.rowcount == 1
 
@@ -4814,7 +4995,10 @@ def archive_task(
       retained worker identity releases that hold in the SAME guarded UPDATE
       once its canonical ``(pid, start fingerprint)`` can no longer be observed
       alive (recorded as ``spawn_fence_released``), so a card is never wedged
-      beside a dead process; a fence with no identity yet is never released.
+      beside a dead process; a fence with no identity yet is never released
+      HERE — only its own dispatcher settles one (a dead spawner with no live
+      child of that spawn observable, see ``_settle_dead_spawn_fence``), and the
+      archive keeps refusing until it has.
       Nothing on this card's behalf mutates another card; dependents are
       reported through the archive impact receipt instead.
 
@@ -4924,7 +5108,10 @@ def archive_task(
         if fence_released is not None:
             # Truthful evidence for the recovery: which identity was held, and
             # that it was re-probed gone rather than silently dropped.
-            _append_spawn_fence_release(conn, task_id, fence_released)
+            _append_spawn_fence_release(
+                conn, task_id, fence_released,
+                reason="retained worker identity re-probed and proven gone",
+            )
         # Leaked run on a non-running card: close it so history isn't orphaned.
         run_id = _end_run(
             conn, task_id, outcome="reclaimed", status="reclaimed",
@@ -5524,6 +5711,7 @@ from hermes_cli.kanban_db_dispatch import (  # noqa: E402
     _clear_failure_counter,
     _defer_reclaim_for_live_worker,
     _pid_alive,
+    _process_fingerprint,
     _record_task_failure,
     _terminate_reclaimed_worker,
     _worker_alive,
