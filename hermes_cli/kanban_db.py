@@ -1621,6 +1621,38 @@ def list_tasks(
     return [Task.from_row(r) for r in rows]
 
 
+def _validate_reassign_destination(
+    conn: sqlite3.Connection, task_id: str, profile: Optional[str], *, gate_status: Optional[str] = None,
+) -> bool:
+    """Read-only half of a reassignment: resolve the card, then refuse a
+    destination that cannot honour what the card already promises — every
+    explicitly forced skill must resolve for the new assignee, and a card
+    sitting in the review phase keeps the reviewer the gate saved (moving it
+    would strand the gate on a profile that never agreed to it). Neither check
+    writes, so a refusal changes nothing. Returns False when ``task_id`` does
+    not resolve.
+
+    ``gate_status`` overrides the status the reviewer gate is judged against.
+    It exists for ``reassign_task(reclaim_first=True)``: releasing a claim is
+    precisely what can turn ``running`` back into ``review``, so that caller
+    passes the status the card WILL hold once the reclaim lands and gets the
+    same verdict BEFORE the reclaim mutates anything instead of after.
+    """
+    existing = get_task(conn, task_id)
+    if existing is None:
+        return False
+    status = existing.status if gate_status is None else gate_status
+    if existing.skills and profile:
+        _require_task_skills(profile, existing.skills)
+    if existing.required_reviewer and status == "review" and profile != existing.required_reviewer:
+        raise ValueError(
+            f"cannot reassign {task_id}: it is in the review phase with required "
+            f"reviewer {existing.required_reviewer!r}, which the gate preserves "
+            f"across retries/resume (got {profile!r}). Nothing changed."
+        )
+    return True
+
+
 def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
     """Assign/reassign; raises RuntimeError while the task is running under a claim.
 
@@ -1632,17 +1664,8 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
     nothing.
     """
     profile = _canonical_assignee(profile)
-    existing = get_task(conn, task_id)
-    if existing is None:
+    if not _validate_reassign_destination(conn, task_id, profile):
         return False
-    if existing.skills and profile:
-        _require_task_skills(profile, existing.skills)
-    if existing.required_reviewer and existing.status == "review" and profile != existing.required_reviewer:
-        raise ValueError(
-            f"cannot reassign {task_id}: it is in the review phase with required "
-            f"reviewer {existing.required_reviewer!r}, which the gate preserves "
-            f"across retries/resume (got {profile!r}). Nothing changed."
-        )
     with write_txn(conn):
         row = conn.execute(
             "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
@@ -2713,13 +2736,43 @@ def reclaim_task(
     return True
 
 
+def _post_reclaim_status(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Status the card WILL hold once ``reclaim_task`` releases its claim, or
+    its current status when there is nothing to reclaim (``reclaim_task`` is a
+    documented no-op then). Mirrors ``reclaim_task``'s own "nothing to
+    reclaim" predicate and reuses ``_retry_status_for_run``, so the prediction
+    is the same computation the reclaim itself applies. None for an unknown id.
+    """
+    row = conn.execute(
+        "SELECT status, claim_lock FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    if row["status"] != "running" and row["claim_lock"] is None:
+        return str(row["status"])
+    return _retry_status_for_run(conn, task_id)
+
+
 def reassign_task(
     conn: sqlite3.Connection, task_id: str, profile: Optional[str], *, reclaim_first: bool = False,
     reason: Optional[str] = None,
 ) -> bool:
     """Reassign (None unassigns); a running task is refused unless
-    ``reclaim_first`` releases its claim — the "this profile's model is broken" path."""
+    ``reclaim_first`` releases its claim — the "this profile's model is broken" path.
+
+    With ``reclaim_first`` the destination is validated BEFORE ``reclaim_task``
+    writes anything, judged against the status the card will hold once the
+    reclaim lands. A refusal (unknown forced skill, saved-reviewer gate) is
+    therefore still a pure read: the claim, run, status and event history stay
+    exactly as they were, which is the promise ``assign_task`` and the CLI's
+    own error path make.
+    """
     if reclaim_first:
+        gate_status = _post_reclaim_status(conn, task_id)
+        if gate_status is not None:
+            _validate_reassign_destination(
+                conn, task_id, _canonical_assignee(profile), gate_status=gate_status,
+            )
         # Safe to call even if nothing to reclaim.
         reclaim_task(conn, task_id, reason=reason or "reassign")
     # assign_task handles its own txn + the still-running guard.
