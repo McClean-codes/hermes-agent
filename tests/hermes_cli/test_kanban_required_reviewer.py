@@ -26,11 +26,13 @@ the base commit ``655010d6``):
 
 from __future__ import annotations
 
+import argparse
 import json
 from pathlib import Path
 
 import pytest
 
+from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
@@ -389,6 +391,17 @@ def test_wrong_profile_claiming_review_is_refused(board: Path) -> None:
 
 
 def test_explicit_override_completes_and_is_audited(board: Path) -> None:
+    """The audited operator-recovery contract under the revised trust boundary.
+
+    The backend boolean IS the deliberate manual override: CLI
+    ``--override-reviewer`` and the dashboard's ``review_gate_override`` are
+    operator surfaces, and upstream grants those surfaces no caller-role
+    auth (same as ``--force`` / ``created_by``) — so a caller reaching the
+    backend with the flag is acting as an operator by definition. What must
+    NOT exist is the flag in an AGENT tool payload (schema test +
+    payload-smuggling test below) and every consumption is recorded as
+    exactly ONE ``reviewer_gate_overridden`` event.
+    """
     with kbc.connect() as conn:
         tid = kb.create_task(
             conn, title="gated work", assignee="worker", reviewer="reviewer",
@@ -627,3 +640,367 @@ def test_delegate_child_cannot_close_a_gated_card(
     with kbc.connect() as conn:
         assert kb.get_task(conn, tid).status == "running"
         assert _events(conn, tid) == before
+
+
+# ---------------------------------------------------------------------------
+# Alternate routes: CLI / dashboard API / agent tool (override trust boundary)
+# ---------------------------------------------------------------------------
+#
+# The accepted boundary (upstream trust model audit): the explicit reviewer
+# override is an INTENTIONAL manual recovery on operator surfaces — CLI flag
+# and dashboard field — deliberately absent from every agent tool payload,
+# always audited, and never implied by ``--force``. Ordinary gated completion
+# must be refused from authoritative phase state on every route; what "any
+# caller with the flag" means is "an operator", because upstream grants those
+# surfaces no caller-role auth (same as ``created_by`` / ``--force``).
+
+def _parse_kanban(argv: list) -> argparse.Namespace:
+    """Drive the real ``hermes kanban …`` parser (as run_slash/CLI do)."""
+    root = argparse.ArgumentParser(prog="hermes")
+    kc.build_parser(root.add_subparsers())
+    return root.parse_args(["kanban", *argv])
+
+
+def _live_gated_card(conn) -> tuple[str, int]:
+    """A gated card claimed by a live implementation run; returns (tid, run_id)."""
+    tid = kb.create_task(
+        conn, title="gated work", assignee="worker", reviewer="reviewer",
+    )
+    run = kb.claim_task(conn, tid)
+    assert run is not None and run.current_run_id is not None
+    return tid, int(run.current_run_id)
+
+
+def test_cli_complete_is_refused_even_with_force_and_run_ownership(
+    board: Path, monkeypatch: pytest.MonkeyPatch, capsys,
+) -> None:
+    """``hermes kanban complete`` on a live gated implementation run is refused
+    from authoritative phase state: neither ``--force`` (live-claim guard)
+    nor owning the live run (HERMES_KANBAN_TASK/RUN_ID) implies the reviewer
+    override — and no audit event is written by a refusal."""
+    for var in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID"):
+        monkeypatch.delenv(var, raising=False)
+
+    with kbc.connect() as conn:
+        tid, run_id = _live_gated_card(conn)
+        before = _counts(conn)
+
+    # Plain operator-style completion.
+    capsys.readouterr()
+    rc = kc._cmd_complete(_parse_kanban(["complete", tid, "--summary", "done"]))
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "required reviewer" in err and "Nothing changed." in err
+
+    # --force governs the live-claim guard only; the gate fires first.
+    rc = kc._cmd_complete(
+        _parse_kanban(["complete", tid, "--summary", "done", "--force"]))
+    assert rc == 1
+    assert "required reviewer" in capsys.readouterr().err
+
+    # Run ownership (the worker's own env) does not re-label the phase either.
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    rc = kc._cmd_complete(
+        _parse_kanban(["complete", tid, "--summary", "done", "--force"]))
+    assert rc == 1
+    assert "required reviewer" in capsys.readouterr().err
+
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, tid)
+        assert task.status == "running" and task.completed_at is None
+        assert _counts(conn) == before, "a refused completion wrote to the board"
+        assert _events(conn, tid, "reviewer_gate_overridden") == []
+
+
+def test_cli_override_reviewer_completes_and_audits_once(
+    board: Path, monkeypatch: pytest.MonkeyPatch, capsys,
+) -> None:
+    """The explicit CLI flag is the audited operator recovery: it completes
+    the live gated card and records EXACTLY ONE audit event."""
+    for var in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID"):
+        monkeypatch.delenv(var, raising=False)
+
+    with kbc.connect() as conn:
+        tid, _ = _live_gated_card(conn)
+
+    capsys.readouterr()
+    rc = kc._cmd_complete(
+        _parse_kanban(["complete", tid, "--summary", "operator recovery",
+                       "--override-reviewer"]))
+    assert rc == 0
+    assert f"Completed {tid}" in capsys.readouterr().out
+
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, tid).status == "done"
+        assert len(_events(conn, tid, "reviewer_gate_overridden")) == 1
+
+
+def test_agent_complete_payload_cannot_smuggle_an_override(
+    board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No override in the agent tool payload — two layers deep:
+
+    1. the schema carries no force/override field (schema test above), and
+       the registry rejects smuggled keys as unknown parameters before the
+       handler even runs;
+    2. the clean payload falls through to the ordinary gated refusal with
+       zero writes — ``_handle_complete`` never forwards a force/override
+       flag to the backend.
+    """
+    from tools import kanban_tools as kt
+
+    for var in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID"):
+        monkeypatch.delenv(var, raising=False)
+
+    with kbc.connect() as conn:
+        tid, _ = _live_gated_card(conn)
+        before = _counts(conn)
+
+    out = json.loads(kt._handle_complete({
+        "task_id": tid, "summary": "done",
+        "force": True, "review_gate_override": True,
+    }))
+    assert out.get("ok") is not True
+    assert "unknown parameter(s): force, review_gate_override" in out["error"]
+
+    out = json.loads(kt._handle_complete({"task_id": tid, "summary": "done"}))
+    assert out.get("ok") is not True
+    assert "required reviewer" in out["error"]
+
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, tid).status == "running"
+        assert _counts(conn) == before
+        assert _events(conn, tid, "reviewer_gate_overridden") == []
+
+
+# ---------------------------------------------------------------------------
+# Dashboard API routes (same gate, force hardcoded, explicit flag only)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def client(board: Path):
+    """Dashboard plugin router mounted on a bare FastAPI app over the same
+    isolated board (mirrors tests/plugins/test_kanban_dashboard_plugin.py)."""
+    import importlib.util
+    import sys as _sys
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    plugin_file = Path(__file__).resolve().parents[2] / "plugins" / "kanban" / "dashboard" / "plugin_api.py"
+    spec = importlib.util.spec_from_file_location(
+        "hermes_dashboard_plugin_kanban_gate_test", plugin_file)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    _sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    app = FastAPI()
+    app.include_router(mod.router, prefix="/api/plugins/kanban")
+    return TestClient(app)
+
+
+def test_dashboard_done_is_refused_until_the_explicit_flag_audits_once(
+    board: Path, client,
+) -> None:
+    """The dashboard hardcodes ``force=True`` for ``done`` — the review gate
+    still fires first: PATCH/bulk without ``review_gate_override`` are refused
+    with nothing written; the explicit flag completes and audits exactly once."""
+    with kbc.connect() as conn:
+        tid, _ = _live_gated_card(conn)
+        before = _counts(conn)
+
+    # PATCH done — force is implicit on this route, the override is not.
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{tid}",
+        json={"status": "done", "result": "done", "summary": "done"},
+    )
+    assert r.status_code == 400, r.text
+    assert "required reviewer" in r.json()["detail"]
+    # Bulk route: same gate, refusal quoted per id.
+    r = client.post(
+        "/api/plugins/kanban/tasks/bulk",
+        json={"ids": [tid], "status": "done", "result": "done", "summary": "done"},
+    )
+    assert r.status_code == 200, r.text
+    entry = r.json()["results"][0]
+    assert entry["ok"] is False and "required reviewer" in entry["error"]
+
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, tid).status == "running"
+        assert _counts(conn) == before, "a refused dashboard completion wrote to the board"
+        assert _events(conn, tid, "reviewer_gate_overridden") == []
+
+    # The explicit operator flag completes and audits exactly once.
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{tid}",
+        json={"status": "done", "result": "done", "summary": "operator recovery",
+              "review_gate_override": True},
+    )
+    assert r.status_code == 200, r.text
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, tid).status == "done"
+        assert len(_events(conn, tid, "reviewer_gate_overridden")) == 1
+
+
+def test_api_create_validation_matches_the_backend(
+    board: Path, client,
+) -> None:
+    """Backend/CLI/API validation consistency: a bad reviewer or a missing
+    forced skill is a 400 with the shared wording and ZERO writes."""
+    with kbc.connect() as conn:
+        before = _counts(conn)
+
+    r = client.post("/api/plugins/kanban/tasks", json={
+        "title": "x", "assignee": "worker", "reviewer": "ghost"})
+    assert r.status_code == 400, r.text
+    detail = r.json()["detail"]
+    assert "profile 'ghost' was not found" in detail
+    assert "not installed" not in detail
+    assert detail.rstrip().endswith("Nothing changed.")
+
+    r = client.post("/api/plugins/kanban/tasks", json={
+        "title": "x", "assignee": "worker", "skills": ["definitely-not-a-skill"]})
+    assert r.status_code == 400, r.text
+    assert "worker" in r.json()["detail"] and "definitely-not-a-skill" in r.json()["detail"]
+
+    with kbc.connect() as conn:
+        assert _counts(conn) == before, "a refused API create wrote to the board"
+
+
+def test_cli_create_validation_matches_the_backend(
+    board: Path, capsys,
+) -> None:
+    """Backend/CLI validation consistency (the API twin is above): refusals
+    share the wording and write nothing — while an UNKNOWN ASSIGNEE on the CLI
+    remains the deliberate pre-existing exclusion (the dispatcher buckets it
+    as skipped_nonspawnable; profile-existence validation lives on the agent
+    tool surface and the reviewer path)."""
+    with kbc.connect() as conn:
+        before = _counts(conn)
+
+    rc = kc._cmd_create(_parse_kanban(
+        ["create", "T", "--assignee", "worker", "--reviewer", "ghost"]))
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "profile 'ghost' was not found" in err
+    assert "not installed" not in err
+    assert err.rstrip().endswith("Nothing changed.")
+
+    rc = kc._cmd_create(_parse_kanban(
+        ["create", "T", "--assignee", "worker", "--skill", "definitely-not-a-skill"]))
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "worker" in err and "definitely-not-a-skill" in err
+
+    with kbc.connect() as conn:
+        assert _counts(conn) == before, "a refused CLI create wrote to the board"
+
+    # Deliberate exclusion, pinned so it cannot drift silently.
+    rc = kc._cmd_create(_parse_kanban(["create", "T", "--assignee", "ghost"]))
+    assert rc == 0
+    capsys.readouterr()
+    with kbc.connect() as conn:
+        created = [t for t in kb.list_tasks(conn) if t.title == "T"]
+        assert created and created[-1].assignee == "ghost"
+
+
+# ---------------------------------------------------------------------------
+# Effective-skill resolver: the bundle fallback must match RUNTIME seeding
+# ---------------------------------------------------------------------------
+
+def _write_skill(root: Path, name: str) -> Path:
+    """A minimal SKILL.md at ``root/<name>`` (frontmatter name = dir name)."""
+    skill_dir = root / name
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text(
+        f"---\nname: {name}\ndescription: test double\n---\n\nbody\n",
+        encoding="utf-8",
+    )
+    return skill_dir
+
+
+def _live_profile(board: Path, name: str) -> Path:
+    """A resolvable named profile home (identity marker, unseeded tree)."""
+    home = board / "profiles" / name
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text("{}\n", encoding="utf-8")
+    return home
+
+
+def test_bundle_fallback_honors_no_bundled_skills_marker(board: Path) -> None:
+    """A profile that opted out of bundled skills (.no-bundled-skills) gets
+    ONLY ESSENTIAL_SKILLS seeded at startup — so its empty library must not
+    resolve to the whole checkout bundle: sdlc-review is runtime-absent and
+    must be refused, while the essential skill itself stays available."""
+    home = _live_profile(board, "optout")
+    (home / ".no-bundled-skills").write_text("", encoding="utf-8")
+
+    with pytest.raises(kv.MissingSkillsError) as excinfo:
+        kv.require_skills("optout", ["sdlc-review"])
+    message = str(excinfo.value)
+    assert "optout" in message and "sdlc-review" in message
+
+    # ESSENTIAL_SKILLS ("hermes-agent") is seeded even under the opt-out.
+    kv.require_skills("optout", ["hermes-agent"])
+
+
+def test_bundle_fallback_uses_the_env_bundled_source(
+    board: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Packaged installs seed from HERMES_BUNDLED_SKILLS, not from this
+    checkout: an empty/absent env bundle seeds NOTHING (a checkout-only skill
+    must be refused), and a skill the env bundle carries is what resolves."""
+    env_bundle = tmp_path / "env-bundle"
+    env_bundle.mkdir()
+    monkeypatch.setenv("HERMES_BUNDLED_SKILLS", str(env_bundle))
+    _live_profile(board, "packaged")
+
+    # Empty source → nothing would be seeded → even a checkout skill refused.
+    with pytest.raises(kv.MissingSkillsError):
+        kv.require_skills("packaged", ["sdlc-review"])
+
+    _write_skill(env_bundle, "env-source-skill")
+    kv.require_skills("packaged", ["env-source-skill"])
+    # The checkout is not consulted while the env source rules.
+    with pytest.raises(kv.MissingSkillsError):
+        kv.require_skills("packaged", ["sdlc-review"])
+
+
+def test_bundle_fallback_skips_curator_suppressed_skills(board: Path) -> None:
+    """Curator-pruned built-ins are never (re)seeded by sync_skills — the
+    fallback must not resurrect them from the bundle either."""
+    home = _live_profile(board, "pruned")
+    (home / "skills").mkdir()
+    (home / "skills" / ".curator_suppressed").write_text(
+        "# pruned by the curator\nsdlc-review\n", encoding="utf-8")
+
+    with pytest.raises(kv.MissingSkillsError):
+        kv.require_skills("pruned", ["sdlc-review"])
+    # A non-suppressed bundle skill still seeds.
+    kv.require_skills("pruned", ["hermes-agent"])
+
+
+def test_resolver_scopes_roots_to_the_target_profile(
+    board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A resolvable profile is judged ONLY against what ITS worker scans:
+    its own tree (+ create_dir/external). The shared root library and the
+    validating process's home are other profiles' trees — counting them
+    would accept skills the spawned worker cannot load."""
+    target = _live_profile(board, "targetp")
+    _write_skill(target / "skills", "target-only-skill")
+    # Foreign evidence in both tempting places:
+    _write_skill(board / "skills", "root-only-skill")          # shared root library
+    validator = _live_profile(board, "validator")
+    _write_skill(validator / "skills", "validator-only-skill")  # validating home
+
+    monkeypatch.setenv("HERMES_HOME", str(validator))
+    names = {n.rsplit("/", 1)[-1] for n in kv.profile_skill_names("targetp")}
+    assert "target-only-skill" in names
+    assert "root-only-skill" not in names, "shared root library leaked into a named profile's library"
+    assert "validator-only-skill" not in names, "validating home leaked into another profile's library"
+
+    kv.require_skills("targetp", ["target-only-skill"])
+    with pytest.raises(kv.MissingSkillsError):
+        kv.require_skills("targetp", ["root-only-skill"])
