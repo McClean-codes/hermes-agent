@@ -17,6 +17,7 @@ up with ``assignee=None``.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from dataclasses import dataclass
@@ -742,12 +743,3 @@ def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
     with kbc.connect_closing() as conn:
         rows = kb.list_tasks(conn, status="triage", tenant=tenant, limit=1000)
     return [row.id for row in rows]
-
-
-# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
-# Names external plugins imported from this module before the Sep 2026 decomposition.
-# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
-# The whole block is removed by reverting the commit that added it.
-import json  # noqa: F401,E402
-import os  # noqa: F401,E402
-# ---- END PLUGIN-COMPAT ----
