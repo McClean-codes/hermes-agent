@@ -219,7 +219,11 @@ KANBAN_REQUEST_REVIEW_SCHEMA = _schema(
                 "the whole diff; the reviewer has the board and the PR."
         )),
         "reviewer": _prop("string", (
-                "Optional reviewer profile. When provided, the task is "
+                "Optional reviewer profile. Ignored (and refused) on a "
+                "card that was created with a required reviewer — the "
+                "saved gate wins and is preserved across retries and "
+                "resume. On an ungated card it must exist and carry "
+                "the sdlc-review skill; when provided, the task is "
                 "reassigned to that profile before review dispatch."
         )),
         "metadata": {
@@ -462,10 +466,25 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "automatically; use this to pin a task to a specialist "
                 "context — e.g. ['translation'] for a translation "
                 "task, ['github-code-review'] for a reviewer task. "
-                "The names must match skills installed on the "
-                "assignee's profile."
+                "Every name must resolve in the assignee profile's "
+                "effective skill library (its own skills plus shared/"
+                "bundled/external/plugin skills): one missing name "
+                "rejects the whole request atomically, naming the "
+                "profile and the missing skills, before anything is "
+                "written. Omit the field for default behaviour."
             ),
         },
+        "reviewer": _prop("string", (
+                "Optional review gate: the profile persisted as this "
+                "card's required reviewer. It must exist and already "
+                "carry the sdlc-review skill the dispatcher injects "
+                "for review-phase startup, or the create is refused "
+                "with nothing written. Gated cards cannot be completed "
+                "by an implementation run: they finish with "
+                "kanban_request_review, which selects this reviewer "
+                "automatically and rejects any override. Omit to keep "
+                "the card ungated."
+        )),
         "goal_mode": _prop("boolean", (
                 "Run the dispatched worker in a goal loop. When true, "
                 "after each turn an auxiliary judge checks the worker's "

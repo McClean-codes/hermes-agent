@@ -500,8 +500,8 @@ Dispatcher-owned workers receive their task lifecycle tools automatically.
 | `kanban_list` | List task summaries with filters for `assignee`, `status`, `tenant`, archived visibility, and limit. Intended for orchestrators discovering board work. | — |
 | `kanban_discover` | Read-only roster of the profiles this home can spawn work to — `default` plus every live named profile, with each profile's optional `profile.yaml` descriptor metadata (display name, description, role). Profiles with no descriptor are listed anyway (`descriptor.status: "missing"`); an unreadable or malformed descriptor is reported explicitly as `unreadable` / `invalid` instead of being silently read as absent. No board is opened, nothing is written and no describer runs; only descriptor fields are returned (never config, credentials, `SOUL` or prompt contents) and each string is length-bounded. This is the same enumeration `kanban_create` and `kanban_reassign` validate assignees against. | — |
 | `kanban_graph` | Read-only dependency shape around one task: its direct parents and children with id, title and status. Strictly SELECT-only — it never writes status, events or edges and never recomputes readiness, so inspecting a graph can never move a card. Use `kanban_show` when you need the full record. | — |
-| `kanban_complete` | Finish with `summary` + `metadata` structured handoff. | at least one of `summary` / `result` |
-| `kanban_request_review` | Start same-card review with a durable `summary`, optional `metadata`, and optional reviewer profile. The task moves to `review`; this is not a block. | `summary` |
+| `kanban_complete` | Finish with `summary` + `metadata` structured handoff. On a card with a required reviewer this tool is not offered to an implementation run at all, and the backend refuses the same transition from any other route; close it from the review phase (or an operator overrides explicitly). | at least one of `summary` / `result` |
+| `kanban_request_review` | Start same-card review with a durable `summary`, optional `metadata`, and optional reviewer profile. The task moves to `review`; this is not a block. On a gated card the saved reviewer is selected automatically and any other name is refused (`reviewer override is not allowed`); the reviewer must carry the `sdlc-review` skill the dispatcher injects. | `summary` |
 | `kanban_request_changes` | Reviewer verdict from an active review run. Closes that run, reapplies parent gating, and routes the task to its original implementer without block-loop accounting. | `reason` |
 | `kanban_block` | Stop work and route by why: `kind=dependency` (waits in `todo`, auto-resumes when an incomplete parent finishes; with no open parent it is recorded as `needs_input` instead, since the wait could never be satisfied), `needs_input`/`capability`/`transient` (surface to a human). Repeated same-kind re-blocks auto-escalate to `triage`. | `reason` |
 | `kanban_heartbeat` | Signal liveness during long operations. Pure side-effect. | — |
@@ -509,7 +509,7 @@ Dispatcher-owned workers receive their task lifecycle tools automatically.
 | `kanban_attach` | Attach a file to a task by passing its bytes inline (base64); stored under the task's attachments dir (25 MB cap). | file bytes + name |
 | `kanban_attach_url` | Attach a file to a task by URL. | `url` |
 | `kanban_attachments` | List a task's attachments. | — |
-| `kanban_create` | (Orchestrators) fan out into child tasks with an `assignee`, optional `parents`, `skills`, etc. Returns `gated: true` + `gated_by` when an open parent parked the new card in `todo`. The `assignee` must name an installed profile — checked against `hermes_cli.profiles` (the same enumeration the CLI and the dispatcher's spawn gate use) **before the board is opened**, so a typo'd profile writes no task row, edge, event or workspace. | `title`, `assignee` |
+| `kanban_create` | (Orchestrators) fan out into child tasks with an `assignee`, optional `parents`, `skills`, `reviewer`, etc. Returns `gated: true` + `gated_by` when an open parent parked the new card in `todo`. The `assignee` must name an installed profile — checked against `hermes_cli.profiles` (the same enumeration the CLI and the dispatcher's spawn gate use) **before the board is opened**, so a typo'd profile writes no task row, edge, event or workspace. Every `skills` entry must resolve in that profile's effective skill library, and a `reviewer` must exist *and* carry `sdlc-review`; both are refused atomically before anything is written (see [Required reviewer](#required-reviewer-review-gate)). | `title`, `assignee` |
 | `kanban_reassign` | (Orchestrators) move an existing task to a different profile through the same shared assign/reassign kernel `hermes kanban reassign` runs, so the lifecycle guards are identical: a card still running under a live claim is refused and nothing changes, unless `reclaim: true` releases the claim first. The destination must be an installed profile (validated before the board is opened), only the board this call opens is written, and success appends the shared `assigned` audit event (`{assignee, from}`) and reads the card back. | `task_id`, `assignee` |
 | `kanban_link` | (Orchestrators) add a `parent_id → child_id` dependency edge after the fact. Returns `gated: true` when the child was `ready` and got demoted back to `todo` because the parent is not done — the child will only run after the parent completes. Refused with `child is already running` when the child is already claimed — an edge added after the claim cannot serialise the run (a worker may still link its *own* running card ahead of a `kind=dependency` block). | `parent_id`, `child_id` |
 | `kanban_unblock` | (Orchestrators) restore a blocked task to its source phase (`review` or `ready`), or `todo` while a parent remains open. | `task_id` |
@@ -707,7 +707,34 @@ hermes kanban create "audit auth flow" \
 
 **From the dashboard**, type the skills comma-separated into the **skills** field of the create-task dialog.
 
-The dispatcher emits one `--skills <name>` flag per skill listed, so the worker spawns with all of them loaded on top of the auto-injected kanban guidance. The skill names must match skills that are actually installed on the assignee's profile (run `hermes skills list` to see what's available); there's no runtime install.
+The dispatcher emits one `--skills <name>` flag per skill listed, so the worker spawns with all of them loaded on top of the auto-injected kanban guidance. Every name is validated **before the task is written** against the assignee profile's effective skill library — its own `skills/` tree, the shared root library, the checkout's bundled skills, that profile's `skills.external_dirs` and its plugin skills (run `hermes skills list` to see what's available). One missing name rejects the whole request atomically, naming the profile and the skills it couldn't find (`skill(s) not found for profile '<name>': … Nothing changed.`), so a card never lands with half its specialist context. There's no runtime install — fix the skill or drop the name.
+
+### Required reviewer (review gate)
+
+A card can be created with a **required reviewer**: a profile that must approve it before anything closes it. Omit the field and the card behaves exactly as before.
+
+```bash
+# Human / CLI
+hermes kanban create "harden webhook auth" --assignee coder --reviewer reviewer
+```
+
+```
+# Orchestrator agent
+kanban_create(title="harden webhook auth", assignee="coder", reviewer="reviewer")
+```
+
+```
+# Dashboard: the create-task dialog's reviewer field (POST /api/plugins/kanban/tasks)
+```
+
+What the gate does:
+
+- **Validated up front.** The reviewer must exist *and* already carry the `sdlc-review` skill the dispatcher force-loads for a review-lane worker. A bad profile or a missing skill is refused before any task row, edge, event or workspace is written.
+- **Persisted, not advisory.** The gate lives in `tasks.required_reviewer` and is exposed by `hermes kanban show` (`--json` too), `kanban_show`, the dashboard payload and the `created` event.
+- **Implementation runs cannot finish the card.** `kanban_complete` is not in a gated implementation run's tool schema at all, and the backend refuses the same transition through the CLI, the dashboard API and any other route — the verdict comes from lifecycle/run state (which run is live, where it was claimed from, who owns it), never from a profile string or env var. Finish with `kanban request-review` instead.
+- **The saved reviewer is selected automatically.** `request-review` routes to it and refuses any other name (`reviewer override is not allowed … preserved across retries/resume`), so the gate survives the review → changes-requested → re-review cycle and every retry/resume. The worker's own context is told once, in the task header, not in the body.
+- **Recovery is explicit.** An operator closes a gated card by approving it out of the `review` column, or by overriding on purpose: `hermes kanban complete <id> --override-reviewer` / the API's `review_gate_override: true`. Every override is audited as a `reviewer_gate_overridden` event. `--force` (live-claim guard) does **not** imply a reviewer override.
+- **Reassignment respects the gate.** A card in the review phase cannot be moved off its required reviewer, and a new assignee must already resolve every skill the card forces.
 
 ### Per-task model override
 
