@@ -1018,3 +1018,324 @@ def test_adopt_worker_pid_never_clears_a_foreign_spawn_fence(board, monkeypatch)
         assert refused is False, why
         assert kb.get_task(conn, tid).status == "running"
         assert kb.spawn_fence(conn, tid)["claim"] == foreign
+
+
+# ---------------------------------------------------------------------------
+# 11. the spawner died before it could publish: settle on evidence, not on age
+# ---------------------------------------------------------------------------
+
+_ARM_AND_CLAIM = """
+import sys, time
+from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
+
+tid, ttl = sys.argv[1], int(sys.argv[2])
+with kbc.connect_closing() as conn:
+    claimed = kb.claim_task(conn, tid, ttl_seconds=ttl)
+    if claimed is None:
+        sys.exit("claim failed")
+    if not kb._hold_spawn_fence(conn, tid, claimed.claim_lock, claimed.current_run_id):
+        sys.exit("fence arm failed")
+    print("ARMED %s %s" % (claimed.claim_lock, claimed.current_run_id), flush=True)
+time.sleep(600)
+"""
+
+
+def _arm_fence_then_die(procs: list, tid: str, *, ttl: int = 1) -> tuple[subprocess.Popen, str, int]:
+    """Claim ``tid`` and arm its spawn fence in a REAL child process, then SIGKILL
+    that process exactly where a dispatcher dies: after ``_hold_spawn_fence`` and
+    before any child exists or a PID could be published.
+
+    The claim gets a 1 s TTL so the next real tick reclaims it the way
+    ``release_stale_claims`` does in production — the fence deliberately survives
+    that reclaim, which is the stuck ``ready``-with-an-armed-fence state the
+    recovery has to clear. Returns ``(killed process, claim_lock, run_id)``."""
+    repo_root = Path(__file__).resolve().parents[2]
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(repo_root) + os.pathsep + env.get("PYTHONPATH", "")
+    proc = subprocess.Popen(
+        [sys.executable, "-c", _ARM_AND_CLAIM, tid, str(ttl)],
+        cwd=str(repo_root), env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    procs.append(proc)
+    # ``readline`` blocks; run it on a thread so a child that dies before it
+    # prints (closing the pipe) ends the wait instead of hanging the test.
+    captured: dict = {}
+    reader = threading.Thread(target=lambda: captured.update(line=proc.stdout.readline()), daemon=True)
+    reader.start()
+    reader.join(timeout=60)
+    line = (captured.get("line") or "").strip()
+    if not line.startswith("ARMED "):
+        proc.kill()
+        proc.wait(timeout=30)
+        raise AssertionError(
+            f"the arming child never armed its fence: {line!r} "
+            f"stderr={proc.stderr.read()[:4000]!r}")
+    _, claim, run_id = line.split()
+    proc.kill()
+    proc.wait(timeout=30)
+    assert not _pid_running(proc.pid), "the spawner must be gone"
+    return proc, claim, int(run_id)
+
+
+def _claim_expired(tid: str) -> bool:
+    with kbc.connect_closing() as conn:
+        row = conn.execute(
+            "SELECT claim_expires FROM tasks WHERE id = ?", (tid,)).fetchone()
+    return (
+        row is not None and row["claim_expires"] is not None
+        and int(row["claim_expires"]) < int(time.time())
+    )
+
+
+def _worker_pid_of(tid: str) -> int:
+    with kbc.connect_closing() as conn:
+        row = conn.execute(
+            "SELECT worker_pid FROM tasks WHERE id = ?", (tid,)).fetchone()
+    return int(row["worker_pid"]) if row and row["worker_pid"] else 0
+
+
+def test_identityless_fence_verdicts(board):
+    """The decision an armed fence with NO published identity may take, asserted
+    directly: a live spawner means the spawn is still in flight (hold — its child
+    may not exist yet), a dead spawner with no observable child releases, a dead
+    spawner whose child IS observable adopts that child's identity, and both
+    "this host cannot prove absence" and "this fence predates spawner
+    identities" fail closed. Age is deliberately absent from every branch."""
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="verdicts", assignee="worker")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        assert kb._hold_spawn_fence(conn, tid, claimed.claim_lock, claimed.current_run_id)
+        fence = kb.spawn_fence(conn, tid)
+    assert fence["spawned_by"]["pid"] == os.getpid()
+    assert kb._identityless_fence_action(fence)[0] == "hold", "our own spawn is still in flight"
+
+    dead_pid = 2 ** 22 - 1
+    assert kbd._worker_alive(dead_pid, None) is False
+    dead_spawner = dict(fence, spawned_by={"pid": dead_pid, "started_at": None})
+    assert kb._identityless_fence_action(dead_spawner)[0] == "release", \
+        "no child of a dead spawner exists"
+
+    with pytest.MonkeyPatch.context() as probe_off:
+        probe_off.setattr(kb, "_observe_spawn_child", lambda f: (False, None))
+        assert kb._identityless_fence_action(dead_spawner)[0] == "hold", \
+            "without a probe, absence proves nothing"
+
+    # ``claim_lock`` is the CLAIMER (host:pid) and is shared by every card this
+    # dispatcher claimed: a sibling spawn carrying our claim but another run is
+    # NOT our child and must never be adopted — only the run makes it ours.
+    sibling = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(300)"],
+        env={**os.environ, "HERMES_KANBAN_CLAIM_LOCK": fence["claim"],
+             "HERMES_KANBAN_RUN_ID": str(int(fence["run"]) + 1)})
+    try:
+        assert kb._identityless_fence_action(dead_spawner)[0] == "release", \
+            "a sibling spawn of the same claimer is not this spawn's child"
+    finally:
+        sibling.kill()
+        sibling.wait(timeout=30)
+
+    # A live child of that dead spawner is what keeps the hold and gets adopted.
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(300)"],
+        env={**os.environ, "HERMES_KANBAN_CLAIM_LOCK": fence["claim"],
+             "HERMES_KANBAN_RUN_ID": str(fence["run"])})
+    try:
+        action, found = kb._identityless_fence_action(dead_spawner)
+        assert (action, found[0] if found else None) == ("adopt", child.pid), (action, found)
+    finally:
+        child.kill()
+        child.wait(timeout=30)
+
+    legacy = {"claim": "a-claim-from-before-spawner-identities", "run": 1, "at": int(time.time())}
+    assert kb._identityless_fence_action(legacy)[0] == "hold", \
+        "an unknown spawner is never assumed gone"
+
+    with kbc.connect_closing() as conn:
+        assert kb._release_spawn_fence(conn, tid, claimed.claim_lock, claimed.current_run_id)
+        assert kb.reclaim_task(conn, tid) is True
+        assert kb.block_task(conn, tid, reason="teardown", with_reason=True)[0] is True
+        assert kb.archive_task(conn, tid, with_reason=True)[0] is True
+
+
+def test_a_killed_spawner_releases_its_identityless_fence_and_recovers_one_worker(
+    board, procs,
+):
+    """THE demonstrated liveness defect: the dispatcher SIGKILLed after arming the
+    fence and before publishing a PID used to leave the card permanently ``ready``
+    behind a NULL-PID fence — every later tick reported ``respawn_guarded`` /
+    ``spawn_fence_hold`` and nothing ever settled the hold. Recovery must come
+    from evidence (spawner provably gone, no live child of that spawn) rather
+    than from an age threshold, and must yield exactly ONE worker."""
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="killed before publication", assignee="worker")
+
+    killed, claim, run_id = _arm_fence_then_die(procs, tid, ttl=1)
+
+    with kbc.connect_closing() as conn:
+        row = conn.execute(
+            "SELECT status, worker_pid, spawn_fence FROM tasks WHERE id = ?", (tid,)).fetchone()
+        fence = kb._json_dict(row["spawn_fence"])
+        assert row["status"] == "running" and row["worker_pid"] is None
+        assert fence.get("pid") is None, "the dispatcher died before publishing"
+        assert fence["claim"] == claim and fence["run"] == run_id
+        assert fence["spawned_by"]["pid"] == killed.pid, "the fence names the spawner that armed it"
+        assert kb._identityless_fence_action(fence)[0] == "release"
+
+    spawn_calls: list[str] = []
+    spawner = _child_spawner(procs)
+
+    def spawn(task, workspace, *, board=None):
+        spawn_calls.append(task.id)
+        return spawner(task, workspace, board=board)
+
+    assert _wait_until(lambda: _claim_expired(tid), 30), "the dead spawner's claim never expired"
+    with kbc.connect_closing() as conn:
+        res = kbd.dispatch_once(conn, spawn_fn=spawn)
+
+    assert res.reclaimed >= 1, "the dead spawner's claim must be reclaimed first"
+    assert spawn_calls == [tid], f"the card must dispatch exactly once, got {spawn_calls}"
+    assert [(t, a) for t, a, _ws in res.spawned] == [(tid, "worker")]
+    assert (tid, "spawn_fence_hold") not in res.respawn_guarded, res.respawn_guarded
+    with kbc.connect_closing() as conn:
+        row = conn.execute(
+            "SELECT status, worker_pid, spawn_fence FROM tasks WHERE id = ?", (tid,)).fetchone()
+        assert row["status"] == "running" and row["spawn_fence"] is None
+        assert int(row["worker_pid"]) == procs[-1].pid
+        released = _event(conn, tid, "spawn_fence_released")
+        assert released is not None, "the settlement is recorded, never a silent clear"
+        assert "spawner died" in released.payload["reason"], released.payload
+        assert released.payload["spawner"]["pid"] == killed.pid
+        assert "pid" not in released.payload, "nothing was ever held but the spawner's identity"
+        assert released.payload["claim"] == claim and released.payload["run"] == run_id
+        assert len([e for e in _events(conn, tid) if e.kind == "spawned"]) == 1
+
+    # Later ticks must not start a second worker beside the live one.
+    with kbc.connect_closing() as conn:
+        kbd.dispatch_once(conn, spawn_fn=spawn)
+        kbd.dispatch_once(conn, spawn_fn=spawn)
+    assert spawn_calls == [tid], f"a duplicate worker was spawned: {spawn_calls}"
+    assert _worker_pid_of(tid) == procs[-1].pid
+
+    with kbc.connect_closing() as conn:
+        assert kb.block_task(conn, tid, reason="teardown", with_reason=True)[0] is True
+    assert _wait_until(lambda: all(not _pid_running(p.pid) for p in procs), 30), "workers left running"
+
+
+def test_a_live_unreported_child_keeps_the_hold_and_prevents_a_duplicate_spawn(
+    board, procs,
+):
+    """The other half of the same window: the spawner died AFTER it started a
+    child, which is alive but has not published its PID yet. Age cannot tell that
+    apart from "no child was ever started", so the recovery must look: the child
+    is found on this host, its identity is attached to the fence, and the card
+    keeps holding instead of spawning a second worker beside it. Only once that
+    child is gone may the hold release and exactly one successor dispatch."""
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="live child, dead spawner", assignee="worker")
+
+    killed, claim, run_id = _arm_fence_then_die(procs, tid, ttl=1)
+    # The child this spawn DID start: alive, unreported (never published a PID).
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(300)"],
+        env={**os.environ, "HERMES_KANBAN_CLAIM_LOCK": claim,
+             "HERMES_KANBAN_RUN_ID": str(run_id)},
+    )
+    procs.append(child)
+    assert _pid_running(child.pid)
+
+    with kbc.connect_closing() as conn:
+        fence = kb.spawn_fence(conn, tid)
+        assert fence.get("pid") is None
+    action, found = kb._identityless_fence_action(fence)
+    assert (action, found[0] if found else None) == ("adopt", child.pid), (action, found)
+
+    spawn_calls: list[str] = []
+    spawner = _child_spawner(procs)
+
+    def spawn(task, workspace, *, board=None):
+        spawn_calls.append(task.id)
+        return spawner(task, workspace, board=board)
+
+    assert _wait_until(lambda: _claim_expired(tid), 30), "the dead spawner's claim never expired"
+    with kbc.connect_closing() as conn:
+        res = kbd.dispatch_once(conn, spawn_fn=spawn)
+
+    assert spawn_calls == [], f"a live unreported child must never be spawned beside: {spawn_calls}"
+    assert (tid, "spawn_fence_hold") in res.respawn_guarded
+    with kbc.connect_closing() as conn:
+        fence = kb.spawn_fence(conn, tid)
+        assert fence["pid"] == child.pid, "the live child's identity is now what holds the card"
+        assert fence["started_at"] and fence["claim"] == claim and fence["run"] == run_id
+        assert fence["spawned_by"]["pid"] == killed.pid
+        assert _event(conn, tid, "spawn_fence_released") is None, "nothing was released yet"
+
+    # The unreported child goes away: only now does the hold settle and the card
+    # dispatch — once.
+    child.kill()
+    child.wait(timeout=30)
+    assert _wait_until(lambda: not _pid_running(child.pid), 15)
+    with kbc.connect_closing() as conn:
+        res = kbd.dispatch_once(conn, spawn_fn=spawn)
+    assert spawn_calls == [tid], f"exactly one successor spawn, got {spawn_calls}"
+    assert [(t, a) for t, a, _ws in res.spawned] == [(tid, "worker")]
+    with kbc.connect_closing() as conn:
+        released = _event(conn, tid, "spawn_fence_released")
+        assert released is not None
+        assert released.payload["pid"] == child.pid, released.payload
+        assert released.payload["started_at"] and "gone" in released.payload["reason"]
+        assert _worker_pid_of(tid) == procs[-1].pid
+        assert kb.spawn_fence(conn, tid) is None
+        assert len([e for e in _events(conn, tid) if e.kind == "spawned"]) == 1
+        assert kb.block_task(conn, tid, reason="teardown", with_reason=True)[0] is True
+    assert _wait_until(lambda: all(not _pid_running(p.pid) for p in procs), 30), "workers left running"
+
+
+def test_a_reclaim_alone_never_frees_a_fence_whose_spawner_is_still_alive(
+    board, procs,
+):
+    """The "not yet started child" side: the claim behind an armed fence is
+    reclaimed (or expires) while the dispatcher that armed it is still alive and
+    has not reached its spawn call. Nothing may settle that hold — there is no
+    child to find and the spawn can still create one — so the card stays
+    ``ready`` under ``spawn_fence_hold`` instead of racing a second child onto
+    it; only the owner's own settlement frees the card."""
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="spawner still spawning", assignee="worker")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        assert kb._hold_spawn_fence(conn, tid, claimed.claim_lock, claimed.current_run_id)
+        fence_before = conn.execute(
+            "SELECT spawn_fence FROM tasks WHERE id = ?", (tid,)).fetchone()[0]
+        assert kb._json_dict(fence_before)["spawned_by"]["pid"] == os.getpid()
+        # Reclaim the claim only — the fence deliberately outlives it.
+        assert kb.reclaim_task(conn, tid) is True
+        row = conn.execute(
+            "SELECT status, claim_lock, spawn_fence FROM tasks WHERE id = ?", (tid,)).fetchone()
+        assert row["status"] == "ready" and row["claim_lock"] is None
+        assert row["spawn_fence"] == fence_before, "reclaim must not drop the hold"
+
+    spawn_calls: list[str] = []
+
+    def spawn(task, workspace, *, board=None):
+        spawn_calls.append(task.id)
+        return _child_spawner(procs)(task, workspace, board=board)
+
+    with kbc.connect_closing() as conn:
+        res = kbd.dispatch_once(conn, spawn_fn=spawn)
+    assert spawn_calls == [], f"the spawn in flight must not be raced: {spawn_calls}"
+    assert (tid, "spawn_fence_hold") in res.respawn_guarded
+    with kbc.connect_closing() as conn:
+        row = conn.execute(
+            "SELECT status, spawn_fence FROM tasks WHERE id = ?", (tid,)).fetchone()
+        assert row["status"] == "ready" and row["spawn_fence"] == fence_before
+        # The owner settles its own never-started spawn, then the card dispatches.
+        assert kb._release_spawn_fence(conn, tid, claimed.claim_lock, claimed.current_run_id) is True
+    with kbc.connect_closing() as conn:
+        res = kbd.dispatch_once(conn, spawn_fn=spawn)
+    assert spawn_calls == [tid], f"exactly one spawn after the owner settled: {spawn_calls}"
+    assert [(t, a) for t, a, _ws in res.spawned] == [(tid, "worker")]
+    with kbc.connect_closing() as conn:
+        assert kb.block_task(conn, tid, reason="teardown", with_reason=True)[0] is True
+    assert _wait_until(lambda: all(not _pid_running(p.pid) for p in procs), 30), "workers left running"

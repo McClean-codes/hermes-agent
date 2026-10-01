@@ -1665,10 +1665,13 @@ def check_respawn_guard(
     # 0. An earlier spawn's fence still holds this card. Its child may be alive
     #    while ``worker_pid`` is NULL (the spawn has not published yet), so a
     #    successor claim would overwrite the hold and stack a second untracked
-    #    child on it. The predecessor's own dispatcher settles the fence — or a
-    #    retained identity that is provably gone was already released just
-    #    before this check (``_settle_dead_spawn_fence``). Until then this card
-    #    starts nothing and stays exactly where it is; the next tick re-checks.
+    #    child on it. The predecessor's own dispatcher settles the fence — or,
+    #    once it is provably gone, a hold whose spawner died with no live child
+    #    of that spawn observable is settled first (``_settle_dead_spawn_fence``,
+    #    which also attaches a discovered child's identity instead of releasing),
+    #    and a retained identity that is provably gone is already released just
+    #    before this check. Until then this card starts nothing and stays exactly
+    #    where it is; the next tick re-checks.
     if _kb.spawn_fence(conn, task_id) is not None:
         return "spawn_fence_hold"
 
@@ -2194,13 +2197,15 @@ def _dispatch_lane_task(
             return False
     if not dry_run:
         # Settle a RESOLVED hold before the guard reads it: a fence whose
-        # retained identity is provably gone releases here (recorded as
-        # ``spawn_fence_released``), so a finished predecessor can never wedge
-        # the card out of the pool. Anything still unresolved — no identity
-        # published yet, or one still live — stays armed and the guard below
-        # keeps this card out of the claim entirely: no overwrite, no second
-        # child, no claim left owning nothing. A dry run never writes, so it
-        # sees the hold exactly as it is.
+        # retained identity is provably gone — or whose spawner died without a
+        # live child of that spawn observable — releases here (recorded as
+        # ``spawn_fence_released``), so a finished or abandoned predecessor can
+        # never wedge the card out of the pool. Anything still unresolved — an
+        # identity still live, a spawner still spawning, or a hold this host
+        # cannot prove empty — stays armed and the guard below keeps this card
+        # out of the claim entirely: no overwrite, no second child, no claim
+        # left owning nothing. A dry run never writes, so it sees the hold
+        # exactly as it is.
         _kb._settle_dead_spawn_fence(conn, task_id)
     guard_reason = check_respawn_guard(conn, task_id, lane=lane)
     if guard_reason is not None:
