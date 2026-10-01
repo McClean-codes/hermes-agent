@@ -15,10 +15,13 @@ Two rules the whole surface shares:
   refusal ends with ``Nothing changed`` so a caller can tell a rejected call
   from a partial write.
 * A skill is validated against the *assignee profile's* effective skill
-  library — its own ``skills/`` tree, the shared root library, the bundled
-  checkout skills, that profile's ``skills.external_dirs`` and its plugin
-  skills — never against the caller's home. Missing skills name the profile
-  and the skill; they never suggest installing the profile.
+  library — its own ``skills/`` tree (plus configured ``skills.create_dir``
+  and ``skills.external_dirs``), its plugin skills, and — only while that
+  tree is unseeded — the bundle ``sync_skills`` would install into it. Never
+  the validating process's home and, for a resolvable profile, never the
+  shared root library: workers run profile-scoped and cannot load either.
+  Missing skills name the profile and the skill; they never suggest
+  installing the profile.
 
 Nothing here writes: every entry point raises before the caller opens a write
 transaction.
@@ -189,25 +192,55 @@ def _disabled_skill_names(home: Optional[Path]) -> set[str]:
     return names
 
 
-def _skill_dirs(profile: str) -> list[Path]:
-    """Search roots for ``profile``, most authoritative first, de-duplicated."""
-    home = _profile_home(profile)
+def _create_dir(home: Optional[Path]) -> Optional[Path]:
+    """``skills.create_dir`` for *home* — the runtime's
+    ``get_skill_create_dir`` resolved against THAT profile's home instead of
+    the current process's. ``None`` when unset/malformed/nonexistent."""
+    if home is None:
+        return None
+    entry = _config_skills_cfg(home).get("create_dir")
+    if not entry or not isinstance(entry, (str, os.PathLike)):
+        return None
+    path = _expand_external(str(entry), home)
+    return path if path is not None and path.is_dir() else None
+
+
+def _skill_dirs(home: Optional[Path]) -> list[Path]:
+    """Search roots for a profile home — exactly what a worker spawned with
+    ``HERMES_HOME=home`` scans (``agent.skill_utils.get_all_skills_dirs`` /
+    ``skills_tool._skill_search_dirs``): its own ``skills/`` tree, its
+    ``skills.create_dir`` and its ``skills.external_dirs``.
+
+    ``home=None`` (profile home unresolvable — nonexistent profile or a
+    stubbed roster) falls back to the shared root library: with no profile
+    tree to read it is the only first-party evidence available.
+
+    Deliberately NOT scanned for a resolvable profile:
+
+    * the shared root library — workers run profile-scoped and never load it
+      (only ``external_dirs`` can opt in), so counting it here would accept
+      skills the spawned worker cannot load;
+    * the validating process's home / ``HERMES_BUNDLED_SKILLS`` tree —
+      another profile's tree must never count for this one.
+
+    The bundled checkout tree is not a root either: seeding copies it into
+    the profile tree only while that tree is unseeded — modelled by
+    :func:`_bundled_seed_names` below.
+    """
     dirs: list[Path] = []
     if home is not None:
         dirs.append(home / "skills")
-    try:
-        from hermes_constants import get_default_hermes_root
+        created = _create_dir(home)
+        if created is not None:
+            dirs.append(created)
+        dirs.extend(_external_dirs(home))
+    else:
+        try:
+            from hermes_constants import get_default_hermes_root
 
-        dirs.append(get_default_hermes_root() / "skills")
-    except Exception:
-        pass
-    try:
-        from hermes_constants import get_bundled_skills_dir
-
-        dirs.append(get_bundled_skills_dir())
-    except Exception:
-        pass
-    dirs.extend(_external_dirs(home))
+            dirs.append(get_default_hermes_root() / "skills")
+        except Exception:
+            pass
     seen: set[Path] = set()
     unique: list[Path] = []
     for path in dirs:
@@ -267,21 +300,25 @@ def _recorded_skill_names(skill_md: Path, root: Path) -> list[str]:
 def profile_skill_names(profile: str) -> set[str]:
     """The effective skill library a worker dispatched for ``profile`` can load.
 
-    Profile skills, the shared root library, the checkout's bundled skills,
-    that profile's ``skills.external_dirs`` and plugin skills; skills the
-    profile's config disables are removed. Read-only.
+    Mirrors the runtime scan for that profile's home
+    (:func:`_skill_dirs`): its own ``skills/`` tree (+ configured
+    ``skills.create_dir``), its ``skills.external_dirs`` and plugin skills;
+    skills the profile's config disables are removed. Read-only.
 
-    A library that resolves to nothing (a home whose skill tree was never
-    seeded — ``seed_profile_skills`` does that for every real profile) falls
-    back to the checkout's bundled tree, which is the very source
-    ``seed_profile_skills`` copies from: with no per-profile evidence either
-    way, the bundle is what that profile would carry. A profile that DOES have
-    a skill tree is judged strictly against it, so a removed or disabled
-    review skill is still rejected.
+    A library that resolves to nothing is the UNSEEDED state a worker starts
+    from — ``main.py`` seeds the bundled tree into the profile at startup —
+    so the fallback is exactly what ``sync_skills`` would install:
+    :func:`_bundled_seed_names` resolves the same source the seeder uses
+    (``HERMES_BUNDLED_SKILLS`` else this checkout), honours the profile's
+    ``.no-bundled-skills`` opt-out (essentials only) and skips
+    curator-suppressed names. A profile that DOES have a skill tree is
+    judged strictly against it, so a removed or disabled review skill is
+    still rejected.
     """
     from agent.skill_utils import iter_skill_index_files
 
-    roots = _skill_dirs(profile)
+    home = _profile_home(profile)
+    roots = _skill_dirs(home)
     names: set[str] = set()
     for root in roots:
         try:
@@ -290,15 +327,9 @@ def profile_skill_names(profile: str) -> set[str]:
         except Exception:
             logger.debug("skill scan failed for %s at %s", profile, root, exc_info=True)
     if not names:
-        bundled = _checkout_bundled_skills_dir()
-        if bundled is not None:
-            try:
-                for skill_md in iter_skill_index_files(bundled, "SKILL.md"):
-                    names.update(_recorded_skill_names(skill_md, bundled))
-            except Exception:
-                logger.debug("bundled skill scan failed for %s", profile, exc_info=True)
+        names |= _bundled_seed_names(home)
     names.update(_plugin_skill_names(profile))
-    names -= _disabled_skill_names(_profile_home(profile))
+    names -= _disabled_skill_names(home)
     return names
 
 
@@ -309,6 +340,70 @@ def _checkout_bundled_skills_dir() -> Optional[Path]:
         return path if path.is_dir() else None
     except OSError:
         return None
+
+
+# Mirrors tools.skills_sync.NO_BUNDLED_SKILLS_MARKER / hermes_cli.profiles
+# (kept as a literal so this read-only kernel never imports the seeder).
+_NO_BUNDLED_SKILLS_MARKER = ".no-bundled-skills"
+
+
+def _bundled_seed_source() -> Optional[Path]:
+    """Where ``sync_skills`` seeds from: ``HERMES_BUNDLED_SKILLS`` (packaged
+    installs) else this checkout's ``skills/`` — the exact resolution
+    ``tools.skills_sync._get_bundled_dir()`` performs at worker startup."""
+    env = os.environ.get("HERMES_BUNDLED_SKILLS", "").strip()
+    if env:
+        return Path(env)
+    return _checkout_bundled_skills_dir()
+
+
+def _curator_suppressed_names(home: Optional[Path]) -> set[str]:
+    """Built-ins the curator pruned from *home*'s tree: ``sync_skills`` never
+    (re)seeds them, so they are runtime-absent even though the bundle has
+    them. Read from the TARGET home — ``tools.skill_usage.read_suppressed_names``
+    reads the current process's home, which is the wrong profile here."""
+    if home is None:
+        return set()
+    try:
+        text = (home / "skills" / ".curator_suppressed").read_text(encoding="utf-8-sig")
+    except OSError:
+        return set()
+    return {
+        line.strip() for line in text.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    }
+
+
+def _bundled_seed_names(home: Optional[Path]) -> set[str]:
+    """Names ``sync_skills`` would seed into an UNSEEDED profile tree.
+
+    This is the fallback half of :func:`profile_skill_names`: an empty
+    library is exactly the ``_skills_dir_is_unseeded`` state a worker sees
+    at startup, when ``main.py`` seeds from the bundle. Mirrors the seeder:
+
+    * source = ``HERMES_BUNDLED_SKILLS`` else the checkout tree;
+    * under ``.no-bundled-skills`` only ``ESSENTIAL_SKILLS`` are seeded;
+    * curator-suppressed names are never (re)seeded.
+    """
+    from agent.skill_utils import ESSENTIAL_SKILLS, iter_skill_index_files
+
+    source = _bundled_seed_source()
+    if source is None or not source.is_dir():
+        return set()
+    names: set[str] = set()
+    try:
+        for skill_md in iter_skill_index_files(source, "SKILL.md"):
+            names.update(_recorded_skill_names(skill_md, source))
+    except Exception:
+        logger.debug("bundled skill scan failed at %s", source, exc_info=True)
+        return set()
+    if home is not None and (home / _NO_BUNDLED_SKILLS_MARKER).exists():
+        names = {
+            n for n in names
+            if n in ESSENTIAL_SKILLS or n.rsplit("/", 1)[-1] in ESSENTIAL_SKILLS
+        }
+    names -= _curator_suppressed_names(home)
+    return names
 
 
 def require_skills(profile: str, skills: Optional[Iterable[str]], *, what: str = "assignee") -> None:
