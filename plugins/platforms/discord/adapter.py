@@ -306,6 +306,7 @@ from gateway.platforms.helpers import (
 )
 from gateway.platforms.helpers import cancel_task
 from utils import atomic_json_write, env_float
+from gateway.platforms.reaction_mixin import DynamicReactionMixin, TurnReactionEvent
 from gateway.platforms.base import (
     BasePlatformAdapter, ExecApprovalPrompt, SendResult, unauthorized_action_notice,
     cache_image_from_url, cache_image_from_bytes_async, cache_audio_from_url, cache_audio_from_bytes_async,
@@ -1263,8 +1264,8 @@ from plugins.platforms.discord.adapter_thread_titles import DiscordThreadTitlesM
 from plugins.platforms.discord.adapter_voice_info import DiscordVoiceInfoMixin
 
 
-class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceInfoMixin, DiscordSlashAuthMixin,
-                     BasePlatformAdapter):
+class DiscordAdapter(DynamicReactionMixin, DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceInfoMixin,
+                     DiscordSlashAuthMixin, BasePlatformAdapter):
     """Discord bot adapter: guild/DM messages, threads, slash commands, button approvals, reactions."""
 
     MAX_MESSAGE_LENGTH = 2000
@@ -1388,6 +1389,12 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         # Telegram #58563 fix.
         self._last_overflow_preview: Dict[tuple, str] = {}
         self._warned_fail_closed_default = False
+        # Raw Discord messages are absent from SessionSource callbacks. Keep one live
+        # reference per MESSAGE (chat base + message id) while the turn runs so tool
+        # hooks can react; per-message keys keep concurrent sessions in one channel
+        # from overwriting each other's target.
+        self._session_raw_messages: Dict[str, Any] = {}
+        self._init_reaction_mixin()
 
     def _config_value(self, key: str, default: Any, *, env_key: Optional[str] = None) -> Any:
         """Resolve a liveness value from profile config, legacy env, or default."""
@@ -3225,29 +3232,204 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
             return False
 
     def _reactions_enabled(self) -> bool:
-        """Reactions enabled via ``extra.reactions`` (YAML, per profile) or ``DISCORD_REACTIONS``."""
-        return self._extra_or_env_flag("reactions", "DISCORD_REACTIONS", "true", truthy=False)
+        """Check if message reactions are enabled via config/env."""
+        # Normalize the profile-scoped env gate fail-closed: only documented tokens enable.
+        raw_env = _scoped_gate_env("DISCORD_REACTIONS", "true")
+        if isinstance(raw_env, str):
+            token = raw_env.strip().lower()
+            if token in ("false", "0", "no", "off"):
+                return False
+            if token not in ("true", "1", "yes", "on", ""):
+                return False
+        # Normalize config.extra.reactions with the same fail-closed rule.
+        extra_val = self.config.extra.get("reactions", None) if isinstance(getattr(self.config, "extra", None), dict) else None
+        if isinstance(extra_val, bool):
+            return extra_val
+        if isinstance(extra_val, str):
+            token = extra_val.strip().lower()
+            if token in ("false", "0", "no", "off"):
+                return False
+            if token in ("true", "1", "yes", "on", ""):
+                return True
+            return False
+        if extra_val is None:
+            return True
+        return False
+
+    def _session_key_from_source(self, source) -> str:
+        """Derive a canonical, participant- and profile-aware session key.
+
+        Uses :func:`gateway.session.build_session_key` so distinct users or
+        multiplex profiles sharing a channel do not collide on
+        ``_session_raw_messages`` / ``_rxn_*`` state. Preserves the stable
+        active message identity across ``on_processing_start``,
+        ``on_tool_call_start`` and ``on_processing_complete`` by returning
+        the same key for the triggering ``MessageEvent`` and the
+        ``SessionSource`` passed to tool callbacks.
+        """
+        # Unwrap MessageEvent -> SessionSource
+        if hasattr(source, "source") and getattr(source, "source", None) is not None:
+            try:
+                # Prefer the adapter's canonical event key when given an event,
+                # so profile multiplexing stays in sync with the agent runner.
+                from gateway.session import build_session_key as _build
+
+                # Try the base-class helper which already handles group/thread
+                # isolation flags and profile namespace.
+                try:
+                    return self._event_session_key(source)  # type: ignore[arg-type]
+                except Exception:
+                    # Fallback to direct build with source.source
+                    src = source.source
+                    extra = getattr(getattr(self, "config", None), "extra", {}) or {}
+                    def _norm_bool(v, default):
+                        if isinstance(v, bool):
+                            return v
+                        if isinstance(v, str):
+                            t = v.strip().lower()
+                            if t in ("1", "true", "yes", "on"):
+                                return True
+                            if t in ("0", "false", "no", "off", ""):
+                                return False
+                            return default
+                        if v is None:
+                            return default
+                        return bool(v)
+                    g = _norm_bool(extra.get("group_sessions_per_user", True), True)
+                    t = _norm_bool(extra.get("thread_sessions_per_user", False), False)
+                    profile = None
+                    try:
+                        profile = self._session_key_profile(src)
+                    except Exception:
+                        profile = getattr(src, "profile", None)
+                    return _build(src, group_sessions_per_user=g, thread_sessions_per_user=t, profile=profile)
+            except Exception:
+                source = source.source
+        # Now ``source`` should be a SessionSource-like
+        try:
+            from gateway.session import build_session_key as _build
+
+            extra = getattr(getattr(self, "config", None), "extra", {}) or {}
+            def _norm_bool2(v, default):
+                if isinstance(v, bool):
+                    return v
+                if isinstance(v, str):
+                    t = v.strip().lower()
+                    if t in ("1", "true", "yes", "on"):
+                        return True
+                    if t in ("0", "false", "no", "off", ""):
+                        return False
+                    return default
+                if v is None:
+                    return default
+                return bool(v)
+            g2 = _norm_bool2(extra.get("group_sessions_per_user", True), True)
+            t2 = _norm_bool2(extra.get("thread_sessions_per_user", False), False)
+            profile2 = None
+            try:
+                profile2 = self._session_key_profile(source)
+            except Exception:
+                profile2 = getattr(source, "profile", None)
+            return _build(source, group_sessions_per_user=g2, thread_sessions_per_user=t2, profile=profile2)
+        except Exception:
+            # Absolute fallback: include participant and profile to avoid collision
+            try:
+                return f"{getattr(source, 'platform', '')}:{getattr(source, 'chat_id', '')}:{getattr(source, 'thread_id', '') or ''}:{getattr(source, 'user_id', '') or ''}:{getattr(source, 'profile', '') or ''}"
+            except Exception:
+                return str(getattr(source, "chat_id", ""))
+
+    async def _reaction_add(self, msg_ref, emoji):
+        """Add an emoji reaction to a Discord message."""
+        return await self._add_reaction(msg_ref, emoji)
+
+    async def _reaction_remove(self, msg_ref, emoji):
+        """Remove the bot's own emoji reaction from a Discord message."""
+        return await self._remove_reaction(msg_ref, emoji)
+
+    def _reaction_resolve_message(self, event):
+        """Resolve a raw Discord message without crossing an identity boundary."""
+        raw = getattr(event, "raw_message", None)
+        if raw and hasattr(raw, "add_reaction"):
+            return raw
+        source = getattr(event, "source", event)
+        key = self._session_key_from_source(source)
+        token = self._rxn_message_token(event)
+        if token is not None:
+            return self._session_raw_messages_by_token.get((key, token))
+        return self._session_raw_messages.get(key)
+
+    def _reaction_msg_key(self, event):
+        """Return a stable participant/profile key for reaction locking."""
+        source = getattr(event, "source", event)
+        return self._session_key_from_source(source)
+
+    def _session_key_from_source(self, source) -> str:
+        """Derive the chat-level base key from either ``MessageEvent`` or ``SessionSource``."""
+        if hasattr(source, "source") and source.source is not None:
+            source = source.source
+        platform = getattr(source, "platform", "")
+        platform = getattr(platform, "value", platform)
+        return f"{platform}:{source.chat_id}:{source.thread_id or ''}"
+
+    @staticmethod
+    def _event_message_identity(event) -> Optional[str]:
+        """Stable per-message id carried by *event*: its own ``message_id`` first (the
+        ``MessageEvent`` that opened the turn), else the source's triggering-message id."""
+        message_id = getattr(event, "message_id", None)
+        if not message_id:
+            source = getattr(event, "source", event)
+            message_id = getattr(source, "message_id", None)
+        return str(message_id) if message_id else None
+
+    async def _reaction_add(self, msg_ref, emoji):
+        """Add an emoji reaction through the Discord adapter primitive."""
+        return await self._add_reaction(msg_ref, emoji)
+
+    async def _reaction_remove(self, msg_ref, emoji):
+        """Remove the bot's own emoji reaction through the Discord adapter primitive."""
+        return await self._remove_reaction(msg_ref, emoji)
+
+    def _reaction_resolve_message(self, event):
+        """Resolve the raw Discord message from an event or the live per-message cache."""
+        raw = getattr(event, "raw_message", None)
+        if raw is not None and hasattr(raw, "add_reaction"):
+            return raw
+        return self._session_raw_messages.get(self._reaction_msg_key(event))
+
+    def _reaction_msg_key(self, event):
+        """Per-MESSAGE reaction state key: chat/session base + the turn's message id.
+
+        Two users (or two messages) processed concurrently in one group channel are
+        distinct keys, so neither turn's raw-message cache, active reaction, cooldown
+        nor lock entries can overwrite or clear the other's. Falls back to the bare
+        chat-level key only when the event carries no message identity at all.
+        """
+        base = self._session_key_from_source(getattr(event, "source", event))
+        message_id = self._event_message_identity(event)
+        return f"{base}:{message_id}" if message_id else base
 
     async def on_processing_start(self, event: MessageEvent) -> None:
-        """Add an in-progress reaction and record durable handling state."""
-        message = event.raw_message
-        acked = False
-        if self._reactions_enabled() and hasattr(message, "add_reaction"):
-            acked = await self._add_reaction(message, "👀")
+        """Add persona emoji, cache the raw message per message, and record recovery state."""
+        raw = getattr(event, "raw_message", None)
+        if raw is not None:
+            self._session_raw_messages[self._reaction_msg_key(event)] = raw
+        acked = await self._rxn_on_processing_start(event)
         await asyncio.to_thread(self._record_discord_processing_start, event, emoji_ack=acked)
 
+    async def on_tool_call_start(self, event, tool_name: str, *, turn_identity: Optional[str] = None) -> None:
+        """Swap the active reaction to the current tool's emoji, keyed to THIS turn's message."""
+        if turn_identity and str(getattr(event, "message_id", "") or "") != str(turn_identity):
+            # The runner passes the turn's SessionSource; re-key onto a message-carrying
+            # view so tool swaps, start/complete hooks and the raw-message cache all
+            # resolve the same per-message key.
+            event = TurnReactionEvent(source=getattr(event, "source", event), message_id=str(turn_identity))
+        await self._rxn_on_tool_call_start(event, tool_name)
+
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
-        """Swap the in-progress reaction for final reaction and durable state."""
+        """Swap the active reaction for the final reaction and close recovery state."""
         await asyncio.to_thread(self._record_discord_processing_complete, event, outcome)
-        if not self._reactions_enabled():
-            return
-        message = event.raw_message
-        if hasattr(message, "add_reaction"):
-            await self._remove_reaction(message, "👀")
-            if outcome == ProcessingOutcome.SUCCESS:
-                await self._add_reaction(message, "✅")
-            elif outcome == ProcessingOutcome.FAILURE:
-                await self._add_reaction(message, "❌")
+        await self._rxn_on_processing_complete(event, outcome)
+        self._session_raw_messages.pop(self._reaction_msg_key(event), None)
 
     @staticmethod
     def _message_reference_from_ids(message_id, channel) -> "discord.MessageReference":

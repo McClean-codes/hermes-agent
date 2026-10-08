@@ -93,6 +93,13 @@ _CLONE_ALL_HISTORY_EXCLUDE_ROOT: frozenset[str] = frozenset({
 NO_BUNDLED_SKILLS_MARKER = ".no-bundled-skills"
 SETUP_PROFILE_MARKER = ".setup-profile.json"
 
+# ``profile.yaml`` ``role`` values recognized by ``read_profile_meta``. The setup
+# assistant is a marked, plain profile (``SETUP_PROFILE_MARKER``); ``role`` remains a
+# readable field (existing profiles, kanban profile tools) and malformed values
+# degrade to None under the never-raises read contract.
+SETUP_ROLE = "setup"
+PROFILE_ROLES = frozenset({SETUP_ROLE})
+
 # Header seeded into a profile's empty .env so it owns a credentials file from day one.
 _PLACEHOLDER_ENV = (
     "# Per-profile secrets for this Hermes profile.\n"
@@ -688,6 +695,10 @@ class ProfileInfo:
     # appends here). Lets Bot Mode group chats re-link persisted member
     # descriptors to the renamed live profile (#110200).
     previous_names: List[str] = field(default_factory=list)
+    # ``profile.yaml`` ``role`` value (``SETUP_ROLE`` or None) surfaced by
+    # ``read_profile_meta``; kept readable after the setup flow moved to the
+    # ``SETUP_PROFILE_MARKER`` plain-profile model (kanban tooling reads it).
+    role: Optional[str] = None
 
 
 def _load_yaml_dict(path: Path) -> Optional[dict]:
@@ -938,12 +949,19 @@ def read_profile_meta(profile_dir: Path) -> dict:
             hermes_bots = ui_meta.get("hermes-bots")
             if isinstance(hermes_bots, dict):
                 bot_title = str(hermes_bots.get("title") or "").strip()
+        # A malformed ``role`` VALUE (list/dict) is still parseable YAML, so it reaches
+        # here; hashing it in the frozenset membership test raises TypeError and breaks
+        # the never-raises contract. Only a string can ever equal a PROFILE_ROLES entry,
+        # so test the type first and leave every other shape — unknown scalars included —
+        # resolving to None.
+        role = data.get("role")
         return {
             "description": str(data.get("description") or "").strip(),
             "description_auto": bool(data.get("description_auto", False)),
             "display_name": str(data.get("display_name") or "").strip(),
             "bot_title": bot_title,
             "previous_names": _clean_previous_names(data.get("previous_names")),
+            "role": role if isinstance(role, str) and role in PROFILE_ROLES else None,
         }
 
     # A copy per caller (list included): the cached value is shared, and a caller that mutates

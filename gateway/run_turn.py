@@ -566,7 +566,11 @@ class GatewayTurnMixin:
                     session_info = await asyncio.to_thread(self._reset_notice_session_info, source)
                     if session_info:
                         notice = f"{notice}\n\n{session_info}"
-                await adapter.send(source.chat_id, notice, metadata=self._thread_metadata_for_source(source))
+                from gateway.run import _strict_gateway_egress_text
+                await adapter.send(
+                    source.chat_id, _strict_gateway_egress_text(notice),
+                    metadata=self._thread_metadata_for_source(source),
+                )
         except Exception as e:
             logger.debug("Auto-reset notification failed (non-fatal): %s", e)
 
@@ -1598,7 +1602,7 @@ class GatewayTurnMixin:
     def _hmwa_prepend_reasoning(self, agent_result, response, source, _intentional_silence):
         """Prepend the last reasoning block when show_reasoning is on for this platform. Mattermost
         requires an explicit per-platform opt-in (scratch text, not final-answer content)."""
-        from gateway.run import _load_gateway_config, _platform_config_key, _resolve_gateway_display_bool
+        from gateway.run import _load_gateway_config, _platform_config_key, _resolve_gateway_display_bool, _strict_gateway_egress_text
         try:
             _show_reasoning_effective = _resolve_gateway_display_bool(
                 _load_gateway_config(), _platform_config_key(source.platform), "show_reasoning",
@@ -1609,7 +1613,7 @@ class GatewayTurnMixin:
             _show_reasoning_effective = (
                 False if source.platform == Platform.MATTERMOST else getattr(self, "_show_reasoning", False)
             )
-        last_reasoning = agent_result.get("last_reasoning")
+        last_reasoning = _strict_gateway_egress_text(agent_result.get("last_reasoning") or "")
         if not (_show_reasoning_effective and response and not _intentional_silence and last_reasoning):
             return response
         from gateway.stream_consumer_fences import escape_code_fences_for_display
@@ -2427,6 +2431,7 @@ class GatewayTurnMixin:
             logger.warning("No adapter for platform %s in background task %s", source.platform, task_id)
             return
         _thread_metadata = self._thread_metadata_for_source(source, event_message_id)
+        from gateway.run import _strict_gateway_egress_text
 
         try:
             user_config = _load_gateway_config()
@@ -2498,6 +2503,7 @@ class GatewayTurnMixin:
             # Fresh conversation, so history_offset=0: every message in the run belongs to this turn.
             if response:
                 response = repair_explicit_computer_use_media_paths(response, result.get("messages", []))
+                response = _strict_gateway_egress_text(response)
 
             preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
             header = t("gateway.background.complete_header", preview=preview)
@@ -2507,7 +2513,11 @@ class GatewayTurnMixin:
                 media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
                 images, text_content = adapter.extract_images(response)
             if text_content:
-                await adapter.send(chat_id=source.chat_id, content=header + text_content, metadata=_thread_metadata)
+                await adapter.send(
+                    chat_id=source.chat_id,
+                    content=_strict_gateway_egress_text(header + text_content),
+                    metadata=_thread_metadata,
+                )
             elif not images and not media_files:
                 await adapter.send(
                     chat_id=source.chat_id, content=header + t("gateway.background.no_response"), metadata=_thread_metadata,
@@ -2515,7 +2525,8 @@ class GatewayTurnMixin:
             for image_url, alt_text in (images or []):
                 with suppress(Exception):
                     await adapter.send_image(
-                        chat_id=source.chat_id, image_url=image_url, caption=alt_text, metadata=_thread_metadata,
+                        chat_id=source.chat_id, image_url=_strict_gateway_egress_text(image_url),
+                        caption=_strict_gateway_egress_text(alt_text), metadata=_thread_metadata,
                     )
             # Route each media file by type (voice bubble / video / image / document), as the
             # streaming + kanban paths do.
@@ -2998,16 +3009,30 @@ class GatewayTurnMixin:
                         if kind in {"heartbeat", "waiting", "long_running", "status"}
                         else t("gateway.progress.status_fallback_short"))
 
-        # Webhooks can't edit messages, so tool progress / log mode are off there.
+        # Webhooks can't edit messages, so tool progress / log mode are off.
         is_webhook = source.platform == Platform.WEBHOOK
         tool_progress_enabled = progress_mode not in {"off", "log"} and not is_webhook
+        # Per-tool/category filter: the callback applies exact-tool/category precedence and
+        # re-resolves the effective mode BEFORE every output sink (file log, chat rail,
+        # live-status preview). Only a CHAT-mode entry may keep the progress queue alive
+        # over a global off/log mode: `off` is silent everywhere and `log` is file-only, so
+        # a positive filter must never turn global `log` into chat output.
+        from gateway.display_config import resolve_tool_progress_filter
+        tool_progress_filter = resolve_tool_progress_filter(user_config, platform_key)
+        if not tool_progress_enabled and tool_progress_filter and not is_webhook:
+            if any(mode in {"all", "new", "verbose"} for mode in tool_progress_filter.values()):
+                tool_progress_enabled = True
         # Live status for text-rendering typing indicators (Slack); independent of tool_progress.
         _live_status_mode = resolve_display_setting(user_config, platform_key, "live_status", "full")
         _live_status_adapter = (
             adapter if getattr(adapter, "supports_status_text", False) and _live_status_mode != "off" else None
         )
-        # "log" mode: tool calls go to ~/.hermes/logs/tool_calls.log instead of the chat. Gateway-only.
-        log_mode_enabled = progress_mode == "log" and not is_webhook
+        # "log" mode: tool calls go to ~/.hermes/logs/tool_calls.log instead of the chat.
+        # Gateway-only. A per-tool `log` entry is file-only wherever it appears, so the log
+        # sink must also be allocated when the global mode is not `log`.
+        log_mode_enabled = (
+            progress_mode == "log" or "log" in tool_progress_filter.values()
+        ) and not is_webhook
         # Interim assistant messages and thinking_progress are independent of tool progress (same
         # queue). Mattermost requires a per-platform opt-in: scratch text leaks into public threads.
         interim_assistant_messages_mode = _display_surface_mode(
@@ -3041,8 +3066,8 @@ class GatewayTurnMixin:
             disabled_toolsets=disabled_toolsets, resolve_display_setting=resolve_display_setting,
             progress_mode=progress_mode, progress_grouping=progress_grouping,
             _display_surface_mode=_display_surface_mode,
-            tool_progress_enabled=tool_progress_enabled, _live_status_mode=_live_status_mode,
-            _live_status_adapter=_live_status_adapter, log_mode_enabled=log_mode_enabled,
+            tool_progress_enabled=tool_progress_enabled, tool_progress_filter=tool_progress_filter,
+            _live_status_mode=_live_status_mode, _live_status_adapter=_live_status_adapter, log_mode_enabled=log_mode_enabled,
             log_queue=queue.Queue() if log_mode_enabled else None,
             interim_assistant_messages_enabled=interim_assistant_messages_enabled,
             _thinking_enabled=_thinking_enabled, _native_slack_task_cards=_native_slack_task_cards,
@@ -3053,7 +3078,7 @@ class GatewayTurnMixin:
     # _RunAgentDisplay fields copied verbatim onto the TurnContext.
     _DISPLAY_TO_TURN_CTX = (
         "_live_status_adapter", "_live_status_mode", "_thinking_enabled", "progress_mode",
-        "progress_grouping", "tool_progress_enabled", "log_queue", "resolve_display_setting",
+        "progress_grouping", "tool_progress_enabled", "tool_progress_filter", "log_queue", "resolve_display_setting",
         "user_config", "enabled_toolsets", "disabled_toolsets", "log_mode_enabled",
         "interim_assistant_messages_enabled", "needs_progress_queue", "_native_slack_task_cards",
     )
@@ -3099,6 +3124,10 @@ class GatewayTurnMixin:
             _voice_ack_guild=_voice_ack_guild, _voice_ack_loop=asyncio.get_running_loop(),
             **{name: getattr(disp, name) for name in self._DISPLAY_TO_TURN_CTX}, **turn_params,
         )
+        # Bind lifecycle hooks (reactions, raw-message caches, per-turn locks) to THIS
+        # message: derived from the raw inbound id alone so it always matches the id the
+        # adapter's own MessageEvent carries (start/complete hooks key off that event).
+        turn_ctx.turn_identity = str(turn_ctx.inbound_message_id) if turn_ctx.inbound_message_id else None
         turn_runner = TurnRunner(self, turn_ctx)
         turn_ctx.mute_notification_reply = diagnostic_turn_muted(
             turn_ctx.persist_user_display_metadata, source.platform, turn_ctx.user_config)
@@ -4196,7 +4225,7 @@ class GatewayTurnMixin:
 
         Interval: agent.gateway_notify_interval / HERMES_AGENT_NOTIFY_INTERVAL (default 180s; 0 or
         long_running_notifications=off disables)."""
-        from gateway.run import _float_env, _interim_metadata, _non_conversational_metadata
+        from gateway.run import _float_env, _interim_metadata, _non_conversational_metadata, _strict_gateway_egress_text
         _notify_start = time.time()
         _NOTIFY_INTERVAL = _float_env("HERMES_AGENT_NOTIFY_INTERVAL", 180)
         _long_running_mode = disp._display_surface_mode("long_running_notifications", default=True, allow_generic=True)
@@ -4231,7 +4260,7 @@ class GatewayTurnMixin:
                         _parts.append(str(_action))
                     if _parts:
                         _status_detail = " — " + ", ".join(_parts)
-            _heartbeat_text = (
+            _heartbeat_text = _strict_gateway_egress_text(
                 disp._generic_status_phrase("status")
                 if _long_running_mode == "generic"
                 else t("gateway.progress.working_heartbeat", minutes=_elapsed_mins, detail=_status_detail)
@@ -4326,7 +4355,7 @@ class GatewayTurnMixin:
         # Progress sender drains BOTH tool-progress lines and thinking bubbles (needs_progress_queue).
         spawn = asyncio.create_task
         progress_task = spawn(turn_runner.send_progress_messages()) if disp.needs_progress_queue else None
-        log_task = spawn(self._run_agent_write_tool_log(disp.log_queue)) if disp.log_mode_enabled else None
+        log_task = spawn(self._run_agent_write_tool_log(disp.log_queue)) if disp.log_queue is not None else None
         # The stream consumer is created inside run_sync; this task polls for it.
         stream_task = spawn(self._run_agent_stream_consumer_task(turn_ctx.stream_consumer_holder))
         tracking_task = spawn(self._run_agent_track_agent(turn_ctx))
