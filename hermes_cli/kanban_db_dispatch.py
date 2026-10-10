@@ -3023,6 +3023,9 @@ def review_gate_env(task: Task) -> dict:
     ``complete_task`` re-derives the same verdict from lifecycle/run state, so
     a spoofed or absent env var changes nothing about what the backend accepts.
     """
+    if (getattr(task, "review_policy", None) or "") == "disabled":
+        # Tool visibility only: kb.request_review refuses a disabled card from the row.
+        return {"HERMES_KANBAN_REVIEW_POLICY": "disabled"}
     if not task.required_reviewer:
         return {}
     return {

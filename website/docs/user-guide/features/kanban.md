@@ -745,6 +745,24 @@ What the gate does:
 - **Recovery is explicit.** An operator closes a gated card by approving it out of the `review` column, or by overriding on purpose: `hermes kanban complete <id> --override-reviewer` / the API's `review_gate_override: true`. Every override is audited as a `reviewer_gate_overridden` event. `--force` (live-claim guard) does **not** imply a reviewer override. Neither lever appears in any agent tool payload — `kanban_complete`'s schema carries no force/override field — so an implementation run's only path forward is `request-review`.
 - **Reassignment respects the gate.** A card in the review phase cannot be moved off its required reviewer, and a new assignee must already resolve every skill the card forces.
 
+### Review policy
+
+Every card runs under one of three review policies, set at creation with `review_policy` (`hermes kanban create --review-policy`, `kanban_create(review_policy=...)`, or the dashboard API's `review_policy` field on `POST /api/plugins/kanban/tasks`):
+
+| Policy | Native review | Reviewer | Who closes the card |
+|---|---|---|---|
+| `optional` (default) | Available: the implementer may hand off with `kanban_request_review` | Optional, chosen per handoff | A reviewer approves with `kanban_complete`, or the implementer closes it |
+| `required` | Mandatory gate: the implementer must hand off with `kanban_request_review` | Saved on the card and must carry `sdlc-review` | The saved reviewer approves; `kanban_complete` is refused for the implementer |
+| `disabled` | Forbidden: `kanban_request_review` is refused and hidden from the worker | None | The implementer finishes with `kanban_complete` |
+
+Rules:
+
+- **Defaults and implication.** A card with no policy is `optional`. Passing a `reviewer` without a policy implies `required`, so a saved reviewer keeps gating exactly as before.
+- **Conflicts are refused before anything is written.** `required` needs a valid reviewer. `optional` or `disabled` with a reviewer is a conflict (`review_policy=disabled conflicts with a reviewer`). An unknown value is refused. A refused create leaves no task row, edge, event or workspace.
+- **Existing cards keep their meaning.** A card created before this field reads as `required` when it has a saved reviewer, and as `optional` otherwise. The migration adds the column without touching existing rows.
+- **`disabled` is enforced by the kernel, not the tool list.** The dispatcher tells the worker its policy and `kanban_request_review` is removed from its tool definitions, but `request_review` also refuses a disabled card on every route (agent tool, CLI, dashboard, forced handoff). A refused handoff changes no state, event, claim or assignment. The worker's context and stop-gate nudge describe the normal `kanban_complete` path.
+- **`required` never falls back.** When the saved reviewer can no longer run review (for example, it lost `sdlc-review`), the handoff is refused with no state change, and the message routes the issue to the orchestrator. The card is not completed by the implementer. The implementer's `kanban_request_review` also has no `reviewer` argument, because the saved gate selects the reviewer.
+
 ### Per-task model override
 
 Pin a task's worker to a specific model (and optionally provider), independent of the assignee profile's default:

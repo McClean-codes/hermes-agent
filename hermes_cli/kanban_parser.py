@@ -196,6 +196,9 @@ _SPECS = [
                   "the sdlc-review skill) is persisted as this card's required "
                   "reviewer. Implementation runs then must finish with "
                   "`kanban request-review`, which selects it automatically."),
+        _arg("--review-policy", choices=("optional", "required", "disabled"),
+             help="Review policy: optional (default), required (--reviewer must approve), "
+                  "or disabled (no native review; finish with `hermes kanban complete`)."),
         _arg("--max-retries", type=int, metavar="N",
              help="Per-task override for the consecutive-failure "
                   f"circuit breaker. Trip on the Nth failure — e.g. --max-retries 1 blocks on the "

@@ -426,3 +426,52 @@ def require_reviewer(review_profile: str, *, what: str = "reviewer") -> str:
     name = require_profile(what, review_profile)
     require_skills(name, REVIEW_SKILLS)
     return name
+
+
+# --- Review policy -----------------------------------------------------------
+
+# optional: no gate; native review is available (the historical default).
+# required: a valid saved reviewer gates completion and receives the handoff.
+# disabled: no native review; the implementer finishes with kanban_complete.
+REVIEW_POLICIES: tuple[str, ...] = ("optional", "required", "disabled")
+
+
+def normalize_review_policy(value) -> Optional[str]:
+    """Canonical policy name, or ``None`` when the caller chose none. Anything
+    outside :data:`REVIEW_POLICIES` is refused before any write."""
+    if value is None:
+        return None
+    name = str(value).strip().lower()
+    if not name:
+        return None
+    if name not in REVIEW_POLICIES:
+        raise ValueError(
+            f"review_policy must be one of {', '.join(REVIEW_POLICIES)} (got {value!r}). "
+            f"Nothing changed."
+        )
+    return name
+
+
+def check_review_policy(policy, reviewer) -> str:
+    """Create-time verdict on the RAW inputs, before any profile lookup: the policy
+    to persist. A reviewer without a policy implies ``required`` (the saved-reviewer
+    behaviour); ``required`` needs a reviewer; ``optional``/``disabled`` must not
+    carry one. Pure: a refusal raises ``ValueError`` and nothing is written."""
+    name = normalize_review_policy(policy)
+    has_reviewer = reviewer is not None and str(reviewer).strip() != ""
+    if name is None:
+        return "required" if has_reviewer else "optional"
+    if name == "required":
+        if not has_reviewer:
+            raise ValueError(
+                "review_policy=required needs a reviewer: name a profile that carries "
+                "sdlc-review. Nothing changed."
+            )
+        return "required"
+    if has_reviewer:
+        raise ValueError(
+            f"review_policy={name} conflicts with a reviewer: a reviewer only gates a card "
+            f"under review_policy=required. Drop the reviewer, or use review_policy=required. "
+            f"Nothing changed."
+        )
+    return name
