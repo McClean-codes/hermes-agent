@@ -741,6 +741,10 @@ class Task:
     # Review gate set at creation: profile every implementation run must hand
     # off to via request_review. None = ungated (all historical cards).
     required_reviewer: Optional[str] = None
+    # Review policy: optional | required | disabled. Always effective on read (see
+    # Task.from_row): a legacy NULL row reads ``required`` with a saved reviewer, else
+    # ``optional``.
+    review_policy: Optional[str] = None
     # Not a column: stamped by the dispatcher on the claimed row it spawns, so
     # the child's env can carry an authoritative run phase ("review" only when
     # the review lane claimed the card out of the review column).
@@ -762,6 +766,8 @@ class Task:
             skills=skills_value,
             goal_mode=bool(g("goal_mode")),
             block_recurrences=int(g("block_recurrences") or 0),
+            review_policy=(g("review_policy") or None)
+            or ("required" if (g("required_reviewer") or "").strip() else "optional"),
         )
 
 
@@ -996,7 +1002,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- kanban_create's ``reviewer`` and never silently rewritten afterwards:
     -- request_review routes to it, and complete_task refuses an implementation
     -- run on a gated card so tool hiding is a convenience, not the control.
-    required_reviewer    TEXT
+    required_reviewer    TEXT,
+    -- Review policy: optional | required | disabled. NULL = legacy row, read as
+    -- required with a saved reviewer, else optional (see Task.from_row).
+    review_policy        TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1314,6 +1323,7 @@ def create_task(
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
     reviewer: Optional[str] = None,
+    review_policy: Optional[str] = None,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1382,6 +1392,11 @@ def create_task(
     # read-only: a refusal here leaves no task row, edge, event or workspace.
     if skills_list and assignee:
         _require_task_skills(assignee, skills_list)
+    # Policy verdict on the RAW inputs FIRST: a contradictory request is refused as a
+    # conflict (not as a reviewer-profile error) and before any profile lookup.
+    from hermes_cli.kanban_validation import check_review_policy
+
+    policy_gate = check_review_policy(review_policy, reviewer)
     reviewer_gate: Optional[str] = None
     if reviewer is not None:
         if not str(reviewer).strip():
@@ -1434,8 +1449,8 @@ def create_task(
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id, completion_contract,
-                        required_reviewer
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        required_reviewer, review_policy
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -1445,7 +1460,7 @@ def create_task(
                         json.dumps(skills_list) if skills_list is not None else None,
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
-                        reviewer_gate,
+                        reviewer_gate, policy_gate,
                     ),
                 )
                 for pid in parents:
@@ -1469,6 +1484,7 @@ def create_task(
                         "model_override": model_override,
                         "provider_override": provider_override,
                         "required_reviewer": reviewer_gate,
+                        "review_policy": policy_gate,
                     },
                 )
                 if task_status == "blocked":
@@ -3735,10 +3751,19 @@ def request_review(
     # name (review routing can never be silently re-pointed), and whoever lands
     # in the review lane must already carry the dispatcher's review skill.
     gate_row = conn.execute(
-        "SELECT status, required_reviewer FROM tasks WHERE id = ?", (task_id,),
+        "SELECT status, required_reviewer, review_policy FROM tasks WHERE id = ?", (task_id,),
     ).fetchone()
     if gate_row is None:
         return _ret(False, "task not found")
+    # Refused before any state, event, claim or assignment changes. A disabled card has
+    # no native review. The tool surface also hides kanban_request_review; this check is
+    # the control that holds on every route (tool, CLI, dashboard, forced handoff).
+    if (gate_row["review_policy"] or "").strip() == "disabled":
+        return _ret(
+            False,
+            f"native review is disabled for {task_id} (review_policy=disabled): finish with "
+            f"kanban_complete(summary=...) instead. Nothing changed.",
+        )
     saved_reviewer = (gate_row["required_reviewer"] or "").strip()
     if saved_reviewer:
         if reviewer is not None:
@@ -3766,9 +3791,23 @@ def request_review(
         # cannot do the job (existence is checked on the surface that accepts
         # a caller-supplied name).
         try:
-            _require_review_phase_skills(reviewer)
+            if saved_reviewer:
+                # Required gate: the saved reviewer must EXIST and carry the skill. A
+                # reviewer deleted after creation has no profile home, and the skill
+                # resolver then falls back to the bundled tree, which would wrongly
+                # report sdlc-review as present for a profile that can no longer spawn.
+                from hermes_cli.kanban_validation import require_reviewer
+
+                require_reviewer(reviewer)
+            else:
+                _require_review_phase_skills(reviewer)
         except ValueError as exc:
-            return _ret(False, f"{exc}")
+            hint = (
+                " Routing/capability issue for the orchestrator: the saved reviewer cannot run "
+                "review. The required gate never falls back to completion."
+                if saved_reviewer else ""
+            )
+            return _ret(False, f"{exc}{hint}")
     # Declared (metadata["artifacts"]) and prose-referenced files
     # must be durable BEFORE anything can clean the scratch workspace up: for a
     # review-bound card the reviewer's completion is the cleanup trigger.
@@ -5268,6 +5307,12 @@ def _ctx_header(lines: list[str], task: Task) -> None:
             f"review-gated: finish with kanban_request_review (the saved "
             f"reviewer is selected automatically); kanban_complete is not "
             f"available to implementation runs on it."
+        )
+    elif (task.review_policy or "") == "disabled":
+        lines.append(
+            "Review policy: disabled. This card has no native review. When the work is done, "
+            "finish with kanban_complete(summary=..., artifacts=[...]); kanban_request_review "
+            "is not available on this card."
         )
     lines.append("")
     if task.body and task.body.strip():

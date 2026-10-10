@@ -841,6 +841,8 @@ _LATER_TASK_COLUMNS = (
     ("spawn_fence", "spawn_fence TEXT"),
     # Optional review gate: profile every implementation run must hand off to.
     ("required_reviewer", "required_reviewer TEXT"),
+    # Review policy: optional | required | disabled (NULL = legacy; read via Task.from_row).
+    ("review_policy", "review_policy TEXT"),
 )
 
 _NOTIFY_SUB_COLUMNS = (

@@ -376,6 +376,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 completion_contract=getattr(args, "completion_contract", None),
                 initial_status=getattr(args, "initial_status", "running"),
                 reviewer=getattr(args, "reviewer", None),
+                review_policy=getattr(args, "review_policy", None),
                 creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
                                  if is_dispatcher_owned_worker_context() else None),
             )
@@ -516,6 +517,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
     field("workspace", f"{task.workspace_kind}" + (f" @ {task.workspace_path}" if task.workspace_path else ""))
     if task.branch_name:
         field("branch", task.branch_name)
+    if (task.review_policy or "") == "disabled":
+        field("review policy", "disabled (no native review; finish with kanban complete)")
     if task.skills:
         field("skills", ", ".join(task.skills))
     if task.required_reviewer:

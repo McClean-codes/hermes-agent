@@ -505,6 +505,18 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "automatically and rejects any override. Omit to keep "
                 "the card ungated."
         )),
+        "review_policy": {
+            "type": "string",
+            "enum": ["optional", "required", "disabled"],
+            "description": (
+                "Review policy for this card. optional (default): no gate, native review is "
+                "available. required: a reviewer (below) must approve; the implementer hands off "
+                "with kanban_request_review and the saved reviewer is selected automatically. "
+                "disabled: no native review; the implementer finishes with kanban_complete. A "
+                "reviewer without a policy implies required; optional or disabled with a "
+                "reviewer is refused before anything is written."
+            ),
+        },
         "goal_mode": _prop("boolean", (
                 "Run the dispatched worker in a goal loop. When true, "
                 "after each turn an auxiliary judge checks the worker's "

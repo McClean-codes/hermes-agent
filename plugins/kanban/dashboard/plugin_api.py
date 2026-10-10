@@ -424,6 +424,8 @@ class CreateTaskBody(BaseModel):
     # Review gate: profile persisted as this card's required reviewer (validated
     # before any write — a bad profile/skill is a 400 with nothing persisted).
     reviewer: Optional[str] = None
+    # Review policy (optional | required | disabled); validated before any write.
+    review_policy: Optional[str] = None
 
 
 @router.post("/tasks")

@@ -125,6 +125,22 @@ def _check_kanban_complete_mode() -> bool:
 
 
 @no_cache_check_fn
+def _check_kanban_request_review_mode() -> bool:
+    """``kanban_request_review`` everywhere EXCEPT a worker on a disabled-policy card.
+
+    The dispatcher stamps ``HERMES_KANBAN_REVIEW_POLICY=disabled`` into the worker env.
+    Hiding is a usability control: ``kb.request_review`` refuses the same handoff from
+    the card row, so a stale or spoofed env var cannot widen what is accepted."""
+    if not _check_kanban_mode():
+        return False
+    if os.environ.get("HERMES_KANBAN_TASK") and (
+        os.environ.get("HERMES_KANBAN_REVIEW_POLICY") == "disabled"
+    ):
+        return False
+    return True
+
+
+@no_cache_check_fn
 def _check_kanban_orchestrator_mode() -> bool:
     """Board-routing tools (kanban_list, kanban_unblock): hidden from task workers."""
     return _visible(to_env_worker=False)
@@ -482,11 +498,11 @@ def _opt_int(value: Any, default: Optional[int] = None) -> Optional[int]:
 _TASK_FIELDS = tuple(
     "id title body assignee status tenant priority workspace_kind workspace_path created_by "
     "created_at started_at completed_at result current_run_id model_override "
-    "provider_override completion_contract last_failure_error required_reviewer".split())
+    "provider_override completion_contract last_failure_error required_reviewer review_policy".split())
 _TASK_SUMMARY_FIELDS = tuple(
     "id title assignee status priority tenant workspace_kind workspace_path project_id created_by "
     "created_at started_at completed_at current_run_id model_override provider_override "
-    "required_reviewer".split())
+    "required_reviewer review_policy".split())
 _RUN_FIELDS = tuple("id profile status outcome summary error metadata started_at ended_at".split())
 _COMMENT_FIELDS = ("author", "body", "created_at")
 _EVENT_FIELDS = ("kind", "payload", "created_at", "run_id")
@@ -1165,6 +1181,11 @@ def _handle_create(args: dict, **kw) -> str:
     # must not leave a task row, a dependency edge, an event or a workspace
     # behind — the dispatcher would only ever bucket it as skipped_nonspawnable.
     assignee = _require_installed_profile("assignee", assignee)
+    # Policy conflicts are refused on the raw inputs before any profile lookup or write.
+    from hermes_cli.kanban_validation import check_review_policy
+
+    review_policy = args.get("review_policy") or None
+    check_review_policy(review_policy, args.get("reviewer") or None)
     # Review gate, same zero-side-effect contract: the reviewer must exist AND
     # already carry the skill the dispatcher injects for review-phase startup.
     reviewer = args.get("reviewer") or None
@@ -1222,7 +1243,7 @@ def _handle_create(args: dict, **kw) -> str:
             goal_mode=goal_mode, goal_max_turns=_opt_int(args.get("goal_max_turns")),
             completion_contract=args.get("completion_contract"),
             initial_status=str(args.get("initial_status") or "running"),
-            reviewer=reviewer,
+            reviewer=reviewer, review_policy=review_policy,
             created_by=_persisted_identity(), session_id=session_id)
         landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
         wait = [e for e in kb.list_events(conn, new_tid) if e.kind == "dependency_wait"]
@@ -1856,6 +1877,7 @@ _ORCHESTRATOR_TOOLS = frozenset({
 # everything else is worker-visible).
 _TOOL_GATES = {
     "kanban_complete": _check_kanban_complete_mode,
+    "kanban_request_review": _check_kanban_request_review_mode,
 }
 _TOOLS = (
     ("kanban_show", KANBAN_SHOW_SCHEMA, _handle_show, "📋"),
@@ -1881,8 +1903,26 @@ _TOOLS = (
     ("kanban_unlink", KANBAN_UNLINK_SCHEMA, _handle_unlink, "⛓"),
     ("kanban_archive", KANBAN_ARCHIVE_SCHEMA, _handle_archive, "🗄"))
 
+def _request_review_schema_overrides():
+    """A required-reviewer implementer gets no ``reviewer`` argument: the saved gate
+    selects the reviewer, so the field would only invite a refused override. The env is
+    stamped at spawn and never changes mid-session, so the schema stays stable. The
+    kernel still refuses any other reviewer whatever the schema shows."""
+    if not (os.environ.get("HERMES_KANBAN_TASK") and os.environ.get("HERMES_KANBAN_REQUIRED_REVIEWER")):
+        return None
+    if os.environ.get("HERMES_KANBAN_RUN_PHASE", "implementation") == "review":
+        return None
+    params = KANBAN_REQUEST_REVIEW_SCHEMA["parameters"]
+    properties = {k: v for k, v in params["properties"].items() if k != "reviewer"}
+    return {"parameters": {**params, "properties": properties}}
+
+
+_DYNAMIC_SCHEMA_OVERRIDES = {"kanban_request_review": _request_review_schema_overrides}
+
+
 for _name, _sch, _handler, _emoji in _TOOLS:
     _gate = _TOOL_GATES.get(_name) or (
         _check_kanban_orchestrator_mode if _name in _ORCHESTRATOR_TOOLS else _check_kanban_mode)
     registry.register(name=_name, toolset="kanban", schema=_sch, handler=_handler, emoji=_emoji,
-                      check_fn=_gate)
+                      check_fn=_gate,
+                      dynamic_schema_overrides=_DYNAMIC_SCHEMA_OVERRIDES.get(_name))
