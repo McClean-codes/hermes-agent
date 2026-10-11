@@ -21,7 +21,7 @@ from contextlib import closing, contextmanager
 from dataclasses import asdict
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Iterator, Optional
+from typing import Any, Callable, Iterator, Literal, Optional
 
 from fastapi import (
     APIRouter, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status as http_status)
@@ -425,7 +425,7 @@ class CreateTaskBody(BaseModel):
     # before any write — a bad profile/skill is a 400 with nothing persisted).
     reviewer: Optional[str] = None
     # Review policy (optional | required | disabled); validated before any write.
-    review_policy: Optional[str] = None
+    review_policy: Optional[Literal["optional", "required", "disabled"]] = None
 
 
 @router.post("/tasks")

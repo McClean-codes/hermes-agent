@@ -97,6 +97,8 @@ def test_create_task_appears_on_board(client):
     assert task["status"] == "ready"  # no parents -> immediately ready
     assert task["priority"] == 3
     assert task["tenant"] == "acme"
+    # Omission remains compatible with the domain layer's default policy.
+    assert task["review_policy"] == "optional"
     task_id = task["id"]
 
     # Board now lists it under 'ready'.
@@ -108,6 +110,25 @@ def test_create_task_appears_on_board(client):
     assert ready["tasks"][0]["id"] == task_id
     assert "acme" in data["tenants"]
     assert "researcher" in data["assignees"]
+
+
+def test_create_task_review_policy_is_nullable_enum_in_openapi(client):
+    response = client.get("/openapi.json")
+    assert response.status_code == 200
+    document = response.json()
+    create_task_operation = document["paths"]["/api/plugins/kanban/tasks"]["post"]
+    request_schema = create_task_operation["requestBody"]["content"]["application/json"]["schema"]
+    if "$ref" in request_schema:
+        schema_name = request_schema["$ref"].rsplit("/", 1)[-1]
+        request_schema = document["components"]["schemas"][schema_name]
+
+    policy_schema = request_schema["properties"]["review_policy"]
+    branches = policy_schema.get("anyOf", [policy_schema])
+    enum_schema = next(branch for branch in branches if "enum" in branch)
+    assert enum_schema["enum"] == ["optional", "required", "disabled"]
+    assert any(branch.get("type") == "null" for branch in branches)
+    assert "review_policy" not in request_schema.get("required", [])
+
 
 def test_patch_board_sets_project_directory(client, tmp_path):
     """Board-level default_workdir must be editable after creation."""

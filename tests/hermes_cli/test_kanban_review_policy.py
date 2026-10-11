@@ -25,6 +25,8 @@ import argparse
 import json
 from pathlib import Path
 
+from pydantic import ValidationError
+
 import pytest
 
 from hermes_cli import kanban as kc
@@ -624,6 +626,8 @@ def test_dashboard_review_verb_on_disabled_card_is_refused_with_no_writes(board:
 def test_dashboard_create_body_carries_the_policy(board: Path) -> None:
     from plugins.kanban.dashboard.plugin_api import CreateTaskBody
 
+    assert CreateTaskBody(title="legacy").review_policy is None
+
     with kbc.connect() as conn:
         before = _counts(conn)
         conflict = CreateTaskBody(
@@ -636,3 +640,13 @@ def test_dashboard_create_body_carries_the_policy(board: Path) -> None:
         ok = CreateTaskBody(title="solo", assignee="worker", review_policy="disabled")
         tid = kb.create_task(conn, created_by="dashboard", **ok.model_dump())
         assert kb.get_task(conn, tid).review_policy == "disabled"
+
+
+@pytest.mark.parametrize("review_policy", ["maybe", "", "OPTIONAL"])
+def test_dashboard_create_body_rejects_unknown_review_policy(
+    review_policy: str,
+) -> None:
+    from plugins.kanban.dashboard.plugin_api import CreateTaskBody
+
+    with pytest.raises(ValidationError, match="review_policy"):
+        CreateTaskBody(title="invalid policy", review_policy=review_policy)
