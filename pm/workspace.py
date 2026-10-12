@@ -282,7 +282,12 @@ def _workspace_member(plugin_dir: Path, root: Path, *, identity: Path) -> Path:
                 spec["path"] = (identity / relative).resolve().as_posix()
                 changed = True
         if virtual:
-            document.setdefault("project", {})["name"] = f"hermes-plugin-{key}"
+            project = document.setdefault("project", {})
+            project["name"] = f"hermes-plugin-{key}"
+            # uv requires every workspace member to declare ``project.version`` (or
+            # list it under ``project.dynamic``). A metadata-only member takes the
+            # plugin's manifest version, falling back to a fixed placeholder.
+            project.setdefault("version", str((declaration.manifest or {}).get("version") or "0.0.0"))
         if virtual or changed:
             import tomli_w
 

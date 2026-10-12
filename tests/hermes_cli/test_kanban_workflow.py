@@ -44,8 +44,11 @@ def _all_tool_schemas():
             yield value
 
 
-def test_archive_is_always_a_manual_move():
-    assert all(W.can_move(k, kw.ARCHIVED) for k in W.keys())
+def test_archive_is_a_manual_move_except_in_flight():
+    # Archiving is offered from every settled column; in-flight cards must be
+    # fenced first (the shared archive policy refuses them).
+    assert all(W.can_move(k, kw.ARCHIVED) for k in W.keys() if k not in kw.ARCHIVE_REFUSED_IN_FLIGHT)
+    assert not any(W.can_move(k, kw.ARCHIVED) for k in kw.ARCHIVE_REFUSED_IN_FLIGHT)
     assert not any(W.can_move(k, "running") for k in W.keys())
 
 

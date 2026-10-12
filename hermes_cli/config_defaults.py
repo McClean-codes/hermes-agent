@@ -815,6 +815,13 @@ DEFAULT_CONFIG = {
         "moa_aggregator": _aux(900, reasoning_effort=False),
     },
 
+    # Agent identity emoji shown on message acknowledgment and completion.
+    # Platform-specific values live in each adapter's ``extra`` config.
+    "persona_emoji": "",
+    # Swap the active reaction emoji to reflect the current tool call.
+    # Platform-specific values live in each adapter's ``extra`` config.
+    "dynamic_reactions": True,
+
     "display": {
         "compact": False,
         "personality": "",
@@ -924,6 +931,9 @@ DEFAULT_CONFIG = {
         # updates; false routes it to reasoning (visible only with show_reasoning).
         "show_commentary": True,
         "tool_progress_command": False,  # enable /verbose command in messaging gateway
+        # Per-tool/category progress mode overrides. Exact tool names win over
+        # skills/mcp/plugins categories; per-platform values merge over this map.
+        "tool_progress_filter": {},
         # display.tool_progress_overrides is deprecated (use display.platforms); a user-set value is
         # still honored at runtime and folded into platforms by migration.
         "tool_preview_length": 0,  # max chars for tool call previews (0 = no limit)
@@ -1564,6 +1574,17 @@ DEFAULT_CONFIG = {
             "max_attempts": 3,  # lifetime re-dispatch cap for one message, whatever its outcome
         },
         "reactions": True,  # add 👀/✅/❌ reactions to messages during processing
+        # Persona reaction emoji; overrides the global ``persona_emoji`` when set.
+        # Resolved via ``platforms.discord.persona_emoji`` (or ``discord.persona_emoji``)
+        # with precedence over the global default; empty/absent falls back to global or ``👀``.
+        "persona_emoji": "",
+        # Swap reaction per tool call; overrides global ``dynamic_reactions``.
+        # ``false`` (including string ``"false"``) keeps persona only; cooldown still applies as hysteresis.
+        "dynamic_reactions": True,
+        # Heuristic cooldown seconds between reaction swaps (default 1.0s, 4× the documented
+        # Discord 0.25s bucket). This is a local hysteresis to reduce 429s/reflow jitter,
+        # not a provider rate-limit guarantee.
+        "reaction_cooldown": 1.0,
         # Gateway transport health probe: inspects the WebSocket's ready/open/heartbeat state (never
         # REST) as proof events still arrive. Any value 0 disables it.
         "websocket_liveness_interval_seconds": 15,

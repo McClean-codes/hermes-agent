@@ -63,6 +63,9 @@ def _task_in(client, src: str) -> str:
         elif src == "done":
             assert kb.complete_task(conn, tid, summary="s", force=True)
         elif src == kw.ARCHIVED:
+            # ``ready`` is protected work in flight under the shared archive policy:
+            # park the card first, the documented block-before-archive path.
+            assert kb.block_task(conn, tid, reason="workflow matrix")
             assert kb.archive_task(conn, tid)
         assert kb.get_task(conn, tid).status == src
     return tid

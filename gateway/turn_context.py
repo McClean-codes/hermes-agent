@@ -8,7 +8,7 @@ single-element lists so mutation stays visible to the outer body.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, List, Optional, Set
 
 
 @dataclass
@@ -26,6 +26,12 @@ class TurnContext:
     progress_mode: str = "off"
     progress_grouping: str = "grouped"
     tool_progress_enabled: bool = False
+    tool_progress_filter: Optional[dict] = None
+    # Stable per-message/turn identity (the RAW inbound message id, never the reply
+    # anchor — that may name another message). Lifecycle hooks key reaction,
+    # raw-message, cache and lock state to it so concurrent sessions processed in one
+    # chat can never overwrite each other's state.
+    turn_identity: Optional[str] = None
     progress_queue: Any = None
     log_queue: Any = None
     # mutable single-element containers (shared with the outer body)
@@ -100,3 +106,5 @@ class TurnContext:
     _native_slack_task_cards: bool = False
     native_tool_start_callback: Optional[Callable] = None
     native_tool_complete_callback: Optional[Callable] = None
+    # Hidden native call IDs filtered by tool_progress_filter; a hidden completion cannot resurrect a card
+    _hidden_native_call_ids: Set[str] = field(default_factory=set)
