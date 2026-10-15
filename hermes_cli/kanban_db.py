@@ -4862,10 +4862,10 @@ def _settle_fenced_spawn(
     return released
 
 
-# --- Archive policy (operator ruling, 2026-09-24) ----------------------------
+# --- Archive policy ----------------------------------------------------------
 # Protect exactly the KNOWN work-in-flight statuses; every other status —
 # including legacy/unrecognized raw values such as ``completed`` — archives
-# directly ("don't refuse unknown, just protect the known"). ``VALID_STATUSES``
+# directly (protect the known, do not refuse the unknown). ``VALID_STATUSES``
 # is deliberately NOT the allowlist: it is a write-side enum and legacy rows
 # predate it, so membership would refuse exactly the raw statuses that must
 # keep working.
