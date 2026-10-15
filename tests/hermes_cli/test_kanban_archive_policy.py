@@ -1,7 +1,7 @@
 """Shared Kanban archive policy: protect exactly ``ready``/``running``/``review``.
 
-Operator ruling (Randy, 2026-09-24): "don't refuse unknown, just protect the
-known." A direct archive must succeed for every status outside the protected
+Policy: do not refuse unknown statuses, only protect the known ones. A direct
+archive must succeed for every status outside the protected
 set — legacy/unrecognized raw values such as ``completed`` included — and must
 fail without a single mutation for the protected ones, telling the caller to
 block/stop the task first. This file exercises the operator CLI surface and the
