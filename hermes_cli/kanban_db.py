@@ -233,7 +233,7 @@ def notify_task_updated(
 # DispatchResult counters whose non-zero value means the tick did something.
 _TICK_ACTIVITY_FIELDS = (
     "spawned", "reclaimed", "promoted", "reconciled_orphans", "reaped_terminal_workers", "crashed", "stale",
-    "timed_out", "auto_blocked", "discarded_spawns", "rate_limited", "auto_assigned_default",
+    "timed_out", "auto_blocked", "rate_limited", "auto_assigned_default",
     "respawn_guarded", "skipped_per_profile_capped", "skipped_unassigned",
     "skipped_nonspawnable",
 )
@@ -322,34 +322,6 @@ def _resolve_crash_grace_seconds() -> int:
 def _resolve_rate_limit_cooldown_seconds() -> int:
     """``HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS`` (0 = next tick, for tests) else default."""
     return _env_int("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS)
-
-
-# build_worker_context() caps, sized for a ~100k-char prompt with headroom.
-_CTX_MAX_PRIOR_ATTEMPTS = 10      # most recent N prior runs shown in full
-_CTX_MAX_COMMENTS       = 30      # most recent N comments shown in full
-_CTX_MAX_FIELD_BYTES    = 4 * 1024   # per summary/error/metadata/result
-_CTX_MAX_BODY_BYTES     = 8 * 1024   # per task.body (opening post)
-_CTX_MAX_COMMENT_BYTES  = 2 * 1024   # per comment
-
-
-def _relative_age(ts: Optional[int], now: Optional[int] = None) -> str:
-    """``just now`` / ``18h ago`` / ``3d ago``; "" for a missing/invalid ts. An LLM
-    reads a bare absolute timestamp as current fact — the relative age is what
-    prompts a worker to re-verify stale sibling work."""
-    try:
-        ts = int(ts)
-    except (TypeError, ValueError):
-        return ""
-    if now is None:
-        now = int(time.time())
-    delta = now - ts
-    if delta < 60:  # includes negative = clock skew across machines; never claim "in the future"
-        return "just now"
-    if delta < 3600:
-        return f"{delta // 60}m ago"
-    if delta < 86400:
-        return f"{delta // 3600}h ago"
-    return f"{delta // 86400}d ago"
 
 
 # --- Paths ---
@@ -851,15 +823,6 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- spawn (held while live, never signalled). Column keeps its INTEGER affinity for the
     -- start-time-only integer values older rows carry.
     worker_started_at    INTEGER,
-    -- In-flight spawn marker (JSON: {"claim","run","at"[,"pid","started_at"]}), written by the
-    -- dispatcher AFTER it claims and BEFORE it starts the child, and cleared by whoever resolves
-    -- that spawn (publication, spawn failure, or the fenced-out stop). While it is set a worker may
-    -- exist that no row records yet, so ``worker_pid IS NULL`` is NOT evidence of quiescence:
-    -- archive refuses (see ARCHIVE_PROTECTED_STATUSES guard) and block reports the exact hold
-    -- instead of claiming the work stopped. ``pid``/``started_at`` are added only when a late
-    -- publication had to stop that worker and could not prove it gone — enough identity to recover
-    -- safely. NULL = no spawn in flight.
-    spawn_fence          TEXT,
     -- Short excerpt of the most recent failure's error text.
     last_failure_error   TEXT,
     max_runtime_seconds  INTEGER,
@@ -2536,7 +2499,10 @@ def release_stale_claims(
         "WHERE status = 'running' AND claim_expires IS NOT NULL "
         "  AND claim_expires < ?", (now,),
     ).fetchall()
+    from hermes_cli.kanban_owner_recovery import owner_reclaim_blocked, owner_reclaim_blocked_after_kill
     for row in stale:
+        if owner_reclaim_blocked(conn, row["id"]):
+            continue
         host_local = (row["claim_lock"] or "").startswith(host_prefix)
         hb = _to_epoch(row["last_heartbeat_at"])
         # Backstop: a heartbeat older than the max-stale threshold means no
@@ -2559,6 +2525,10 @@ def release_stale_claims(
             )
             continue
         with write_txn(conn):
+            # Again under the write lock: an interpreter that bound since the check above
+            # changes neither claim_lock nor worker_pid, so the CAS below cannot see it.
+            if owner_reclaim_blocked_after_kill(conn, row["id"], signalled=bool(termination.get("termination_attempted"))):
+                continue
             retry_status = _retry_status_for_run(conn, row["id"])
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
@@ -3468,15 +3438,6 @@ def block_task(
     archive. A ``running -> blocked`` flip alone is never treated as proof the
     work stopped.
 
-    A spawned-but-unpublished worker counts as work in flight too: when
-    ``spawn_fence`` is armed (the dispatcher claimed the card and is starting
-    the child, but has not recorded its PID yet) this transition still lands —
-    the operator asked to stop the card — but it does NOT report the work
-    stopped. The fence stays armed, it is named in the ``blocked`` payload and
-    the closed run's metadata, and it is returned as the blocker so the later
-    archive refusal is never a surprise. The dispatcher settles it: a
-    publication that finds its claim gone is fenced out and that worker is
-    stopped and verified instead of being attached to the new state.
     ``with_reason=True`` returns ``(ok, reason)`` so the caller can quote the
     refusal or the stop blocker.
 
@@ -3497,7 +3458,7 @@ def block_task(
     with write_txn(conn):
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences, claim_lock, worker_pid, "
-            "worker_started_at, spawn_fence FROM tasks WHERE id = ?", (task_id,),
+            "worker_started_at FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if cur_row is None:
             return _ret(False, f"no such task: {task_id}")
@@ -3550,12 +3511,6 @@ def block_task(
         if rekind_reason:
             payload["requested_kind"] = requested_kind
             payload["rekind_reason"] = rekind_reason
-        # Snapshot of the row this caller is about to flip. ``spawn_fence`` is
-        # part of it: a child may already be alive for this claim even though no
-        # PID is recorded yet, and the evidence must survive the flip below.
-        prev_fence = _json_dict(_row_get(cur_row, "spawn_fence")) or None
-        if prev_fence is not None:
-            payload["spawn_fence"] = prev_fence
         sql = f"""
                 UPDATE tasks
                    SET status        = '{new_status}',
@@ -3574,10 +3529,6 @@ def block_task(
         run_id = _end_or_synthesize_run(
             conn, task_id, outcome="blocked", status="blocked", summary=reason,
             synthesize=bool(reason),
-            # Provenance, not a stop claim: this run ended while its worker's
-            # identity was still unpublished, so "no PID recorded" cannot be
-            # read as "nothing was running".
-            metadata=({"spawn_fence": prev_fence} if prev_fence is not None else None),
         )
         _append_event(conn, task_id, event_kind, payload, run_id=run_id)
         blocked_task = get_task(conn, task_id)
@@ -3598,11 +3549,6 @@ def block_task(
             conn, task_id, prev_pid, prev_lock, prev_started, signal_fn=signal_fn)
         if not stop["stopped"]:
             blocker = stop.get("blocker")
-    if prev_fence is not None:
-        # A spawn for this claim is still in flight, so nothing here can prove
-        # the work stopped: say exactly what is unresolved instead. The fence
-        # itself keeps the card unarchivable until the dispatcher settles it.
-        blocker = blocker or _spawn_fence_blocker(task_id, prev_fence)
     return _ret(True, blocker)
 
 
@@ -4280,520 +4226,6 @@ def specify_triage_task(
     return True
 
 
-# --- In-flight spawn fence ---------------------------------------------------
-# ONE writer arms it: the dispatcher, between claiming a card and starting the
-# child. Whoever resolves that spawn (publication, spawn failure, or the
-# fenced-out stop) clears it; block and archive only READ it. It exists because
-# a child can be alive before any row records its PID: while the fence is set,
-# ``worker_pid IS NULL`` proves nothing, so a card can neither be archived off a
-# "no worker recorded" reading nor have a late PID welded onto a state its claim
-# no longer owns.
-#
-# A fence left behind by a dispatcher that died mid-spawn settles only on
-# POSITIVE evidence, never on age: the payload carries the spawner's own
-# identity, so a live spawner means "spawn still in flight" (hold — its child
-# may be one that has not started yet), while a dead one is resolved by looking
-# for a live child of that claim on this host — found, its identity is attached
-# to the fence (the hold continues, now naming a probed process); not found, the
-# hold releases with a recorded reason. Where that probe is unavailable (no
-# ``/proc``), or a fence predates spawner identities, absence proves nothing and
-# the hold stays — refusing to release an identity we could not prove gone is
-# the specified failure mode, not a bug. An age threshold can never do this: a
-# young fence may already have a live child, an old one may be a spawn whose
-# child was never started.
-
-
-def _spawn_fence_payload(claim, run, *, at: Optional[int] = None, **extra) -> str:
-    """JSON text for ``tasks.spawn_fence``; ``claim``/``run`` name the spawn it belongs to."""
-    payload: dict = {"claim": claim, "run": int(run) if run else None,
-                     "at": int(at) if at is not None else int(time.time())}
-    payload.update(extra)
-    return json.dumps(payload, ensure_ascii=False)
-
-
-def spawn_fence(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
-    """The in-flight spawn marker on ``task_id``, or ``None`` when no spawn is pending.
-
-    Read-only evidence for callers that must decide whether "no worker recorded"
-    means "nothing is running" (it does not, while this is set)."""
-    row = conn.execute("SELECT spawn_fence FROM tasks WHERE id = ?", (task_id,)).fetchone()
-    if row is None:
-        return None
-    raw = _row_get(row, "spawn_fence")
-    return _json_dict(raw) if raw else None
-
-
-def _spawn_fence_blocker(task_id: str, fence: dict) -> str:
-    """The precise reason a block cannot claim the work stopped while its spawn is in flight."""
-    pid = fence.get("pid")
-    if pid:
-        return (
-            f"{task_id} has a spawned worker (pid {int(pid)}, start fingerprint "
-            f"{fence.get('started_at')!r}) from claim {fence.get('claim')!r} / run "
-            f"{fence.get('run')} that could not be proven stopped; the card is held "
-            f"until that process is gone"
-        )
-    return (
-        f"{task_id} was blocked while its worker was still starting: claim "
-        f"{fence.get('claim')!r} / run {fence.get('run')} has not published a PID yet, "
-        f"so the work cannot be proven stopped. The card stays unarchivable until that "
-        f"spawn is settled (published then stopped, its worker stopped and verified, or — "
-        f"once the dispatcher that armed it is provably gone — no live child of that spawn "
-        f"is observable on this host)"
-    )
-
-
-def _fence_is_mine(fence: Optional[dict], claim, run) -> bool:
-    """True when ``fence`` names this exact claim/run — or nothing is armed at all,
-    in which case no other spawn contradicts this one."""
-    if not fence:
-        return True
-    try:
-        return fence.get("claim") == claim and int(fence.get("run") or 0) == int(run or 0)
-    except (TypeError, ValueError):
-        return False
-
-
-def _spawn_fence_writable(
-    conn: sqlite3.Connection, task_id: str, claim, run,
-) -> tuple[Optional[dict], bool]:
-    """``(current fence, may this spawn write it?)``.
-
-    The marker on the row decides: a fence naming this claim/run can always be
-    settled (cleared once the worker is proven gone, or kept with its
-    identity), while another spawn's fence is untouchable — a late writer must
-    never clobber a live hold. With no marker left, a row a DIFFERENT claim now
-    owns is off limits too: that claim already published and cleared its own
-    fence, and re-arming ours would hold a card whose spawn is settled."""
-    row = conn.execute(
-        "SELECT claim_lock, spawn_fence FROM tasks WHERE id = ?", (task_id,),
-    ).fetchone()
-    if row is None:
-        return None, False
-    fence = _json_dict(_row_get(row, "spawn_fence")) or None
-    if fence is not None:
-        return fence, _fence_is_mine(fence, claim, run)
-    row_claim = _row_get(row, "claim_lock")
-    if claim is not None and row_claim is not None and row_claim != claim:
-        return None, False
-    return None, True
-
-
-def _append_spawn_fence_release(
-    conn: sqlite3.Connection, task_id: str, fence: dict, *, reason: str,
-) -> None:
-    """Append the ``spawn_fence_released`` event for a settled ``fence``.
-
-    ONE payload builder for both release sites — the dispatcher settling a
-    resolved hold and the archive releasing it inside the guarded flip — so the
-    recorded evidence cannot drift between them. The identity is always
-    reported rather than dropped silently. A fence released without ever
-    publishing an identity carries the spawner that armed it instead of a
-    ``pid``, so the release still names exactly what was held."""
-    release_run = fence.get("run")
-    payload: dict = {"claim": fence.get("claim"), "run": release_run, "reason": reason}
-    if fence.get("pid"):
-        payload["pid"] = int(fence["pid"])
-        payload["started_at"] = fence.get("started_at")
-    if fence.get("spawned_by"):
-        payload["spawner"] = fence.get("spawned_by")
-    _append_event(conn, task_id, "spawn_fence_released", payload,
-                  run_id=int(release_run) if release_run else None)
-
-
-def _spawner_identity() -> dict:
-    """The process arming a spawn fence — this dispatcher.
-
-    Recorded so a fence its owner left behind can be told apart from one whose
-    spawn is still running (see :func:`_identityless_fence_action`): without it
-    "no identity published yet" is indistinguishable from "the dispatcher that
-    was about to publish is gone"."""
-    pid = os.getpid()
-    try:
-        started_at = _process_fingerprint(pid)
-    except Exception:  # pragma: no cover - an unreadable probe must not block arming
-        started_at = None
-    return {"pid": int(pid), "started_at": started_at}
-
-
-def _observe_spawn_child(fence: dict) -> tuple[bool, Optional[tuple[int, Optional[str]]]]:
-    """``(probe available?, live child of this spawn or None)`` for a fence that
-    has published no worker identity yet.
-
-    The dispatcher pins the spawn's identity on the child's environment before
-    ``exec`` (``HERMES_KANBAN_CLAIM_LOCK`` + ``HERMES_KANBAN_RUN_ID``, both set by
-    ``kanban_db_dispatch._default_spawn``), so a child that is alive but has not
-    published — or never will — is still observable on this host. That is the
-    positive evidence separating "no child was ever started" from "a child is
-    alive and unreported", which an age-based expiry cannot give: a young fence
-    may already have a live child, an old one may be a spawn whose child never
-    started.
-
-    BOTH parts of the fence's identity are required. ``claim_lock`` alone is the
-    *claimer* (``host:pid``, see ``_claimer_id``) — every card that process
-    claimed shares it — so only the run distinguishes this spawn's child from a
-    sibling's; without a run there is nothing to match and the probe reports
-    unavailable rather than risk adopting an unrelated child.
-
-    ``False`` for the probe means this host offers no such evidence (no
-    ``/proc``, or this fence carries no claim/run to match): absence then
-    proves nothing and the caller must keep the hold. Entries this process may
-    not read are skipped — a child is spawned with this dispatcher's own
-    credentials, so an unreadable entry cannot be ours."""
-    claim, run = fence.get("claim"), fence.get("run")
-    if not claim or not run or not os.path.isdir("/proc"):
-        return False, None
-    try:
-        names = os.listdir("/proc")
-    except OSError:  # pragma: no cover - /proc vanished under us
-        return False, None
-    # NUL-delimited exact-entry needles: ``bytes.find`` on a padded buffer, NOT a
-    # split+set per process — on a host with hundreds of processes the allocation
-    # dominates the scan (measured 42x slower), and the writer lock must never
-    # wait on it.
-    n_claim = b"\x00" + f"HERMES_KANBAN_CLAIM_LOCK={claim}".encode("utf-8", "surrogateescape") + b"\x00"
-    n_run = b"\x00" + f"HERMES_KANBAN_RUN_ID={run}".encode("utf-8", "surrogateescape") + b"\x00"
-    own_pid = os.getpid()
-    for name in names:
-        if not name.isdigit() or int(name) == own_pid:
-            continue
-        pid = int(name)
-        try:
-            with open(f"/proc/{pid}/environ", "rb") as fh:
-                environ = fh.read()
-        except OSError:
-            continue
-        padded = b"\x00" + environ + b"\x00"
-        if n_claim in padded and n_run in padded:
-            return True, (pid, _process_fingerprint(pid))
-    return True, None
-
-
-def _identityless_fence_action(fence: dict) -> tuple[str, Optional[tuple[int, Optional[str]]]]:
-    """What an armed fence with NO published worker identity may do next:
-    ``("hold", None)``, ``("adopt", (pid, started_at))`` or ``("release", None)``.
-
-    * spawner still alive → ``hold``. Its spawn is in flight, so a child may be
-      started a millisecond from now: this is the "not yet started" case, and
-      settling here would let a successor claim stack a second child on it.
-    * a live child of that spawn is observable → ``adopt``. Its identity goes on
-      the fence, so the hold keeps naming a process that can be re-probed and
-      that settles the fence itself when it registers (``adopt_worker_pid``).
-    * no live child, spawner provably gone, probe available → ``release``.
-      Nothing was started and nothing can be: the process that would start it is
-      gone.
-    * otherwise → ``hold``. Absence of a child is not provable (no probe on this
-      host), or the fence predates spawner identities and who armed it is
-      unknown — fail closed rather than clear a hold we cannot reason about."""
-    spawner = fence.get("spawned_by")
-    spawner = spawner if isinstance(spawner, dict) else {}
-    spawner_pid = spawner.get("pid")
-    if spawner_pid and _worker_alive(int(spawner_pid), spawner.get("started_at")):
-        return "hold", None
-    available, child = _observe_spawn_child(fence)
-    if child is not None:
-        return "adopt", child
-    if not available or not spawner_pid:
-        return "hold", None
-    return "release", None
-
-
-def _release_dead_fence(
-    conn: sqlite3.Connection, task_id: str, *,
-    probed: Optional[tuple[str, tuple]] = None,
-) -> bool:
-    """Settle an armed fence whose hold can be proven over — INSIDE the caller's
-    write txn.
-
-    This is the same proof the archive uses (the canonical ``(pid, start
-    fingerprint)`` re-probed gone), applied earlier and guarded by the exact
-    payload that was read, so a concurrent writer makes this lose the race
-    instead of clearing a hold it did not check.
-
-    ``probed`` is the caller's pre-computed ``(fence text, decision)`` for a
-    fence that carries NO published identity: the host probe behind that
-    decision reads every process on the box, so it runs BEFORE this txn — never
-    under SQLite's writer lock — and is reused only for a byte-identical
-    payload. A payload that moved underneath us, or a caller that did not probe,
-    keeps the hold and is re-decided on the next tick.
-
-    Releases are always recorded as ``spawn_fence_released``: an identity is
-    never dropped silently."""
-    row = conn.execute(
-        "SELECT spawn_fence FROM tasks WHERE id = ?", (task_id,),
-    ).fetchone()
-    if row is None:
-        return False
-    fence_text = _row_get(row, "spawn_fence")
-    fence = _json_dict(fence_text) or None
-    if fence is None:
-        return False
-    if fence.get("pid"):
-        if _worker_alive(int(fence["pid"]), fence.get("started_at")):
-            return False
-        reason = "retained worker identity re-probed and proven gone"
-    else:
-        if probed is None or probed[0] != fence_text:
-            # No probe for THIS payload: absence of a child is unproven, so the
-            # hold stays (fail closed) instead of being cleared on a guess.
-            return False
-        action, child = probed[1]
-        if action == "adopt" and child is not None:
-            held = dict(fence)
-            held["pid"], held["started_at"] = int(child[0]), child[1]
-            conn.execute(
-                "UPDATE tasks SET spawn_fence = ? WHERE id = ? AND spawn_fence = ?",
-                (_json_or_null(held), task_id, fence_text),
-            )
-            return False
-        if action != "release":
-            return False
-        reason = (
-            "spawner died before any worker identity was published and no live child of that "
-            f"spawn (claim {fence.get('claim')!r}) is observable on this host"
-        )
-    cur = conn.execute(
-        "UPDATE tasks SET spawn_fence = NULL WHERE id = ? AND spawn_fence = ?",
-        (task_id, fence_text),
-    )
-    if cur.rowcount != 1:
-        return False
-    _append_spawn_fence_release(conn, task_id, fence, reason=reason)
-    return True
-
-
-def _settle_dead_spawn_fence(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Dispatcher-side settlement: release ``task_id``'s spawn fence when its
-    retained worker identity is provably gone — or, for a fence that never
-    published one, when its spawner is provably gone and no live child of that
-    spawn is observable — so a RESOLVED hold can never wedge the card out of the
-    pool forever. Returns True when a hold was released. An unresolved hold is
-    left exactly as it is — the caller decides not to dispatch based on the
-    fence that is still there.
-
-    Everything runs OUTSIDE any txn first: the ordinary tick (no fence, a fence
-    with a live identity, a fence whose spawner is still spawning) takes no
-    writer lock at all, and the host probe behind an identity-less fence — the
-    expensive part — is computed here and handed to :func:`_release_dead_fence`,
-    which applies it under the lock only to the exact payload that was probed."""
-    row = conn.execute(
-        "SELECT spawn_fence FROM tasks WHERE id = ?", (task_id,),
-    ).fetchone()
-    if row is None:
-        return False
-    fence_text = _row_get(row, "spawn_fence")
-    fence = _json_dict(fence_text) or None
-    if fence is None:
-        return False
-    probed = None
-    if fence.get("pid"):
-        if _worker_alive(int(fence["pid"]), fence.get("started_at")):
-            return False
-    else:
-        decision = _identityless_fence_action(fence)
-        if decision[0] == "hold":
-            # Nothing provable — do not take a writer lock for it every tick.
-            return False
-        # "release" settles below; "adopt" needs the txn to attach the identity.
-        probed = (fence_text, decision)
-    with write_txn(conn):
-        return _release_dead_fence(conn, task_id, probed=probed)
-
-
-def _release_unarmed_claim(
-    conn: sqlite3.Connection, task_id: str, claim, run,
-) -> Optional[str]:
-    """Atomically unwind a claim whose spawn fence could not be armed.
-
-    A successor claim that cannot take the hold (an earlier spawn's fence is
-    still unresolved) must never be left on the row: that reads back as a
-    ``running`` card with no child anywhere. Under THIS claim's own CAS the
-    claim is released, the never-spawned run is closed and the card lands back
-    in the phase it was claimed from (``review`` for a reviewer claim, else
-    ``ready``) — one txn, so a concurrent writer sees either the original claim
-    or the fully unwound card, never a half state. Nothing about the card ran,
-    so the retry budget and ``last_failure_error`` are deliberately untouched.
-
-    Returns the status the card landed in, or ``None`` when this claim was no
-    longer the row's — someone else owns it (or it is already unwound) and
-    there is nothing of ours to release."""
-    with write_txn(conn):
-        row = conn.execute(
-            "SELECT status, claim_lock FROM tasks WHERE id = ?", (task_id,),
-        ).fetchone()
-        if row is None or _row_get(row, "claim_lock") != claim:
-            return None
-        if _row_get(row, "status") != "running":
-            return None
-        retry_status = _retry_status_for_run(conn, task_id, run)
-        cur = conn.execute(
-            "UPDATE tasks SET status = ?, claim_lock = NULL, claim_expires = NULL, "
-            "    worker_pid = NULL, worker_started_at = NULL "
-            "WHERE id = ? AND claim_lock IS ?",
-            (retry_status, task_id, claim),
-        )
-        if cur.rowcount != 1:
-            return None
-        fence = spawn_fence(conn, task_id)
-        if fence is not None:
-            held = (f"an earlier spawn's fence (claim {fence.get('claim')!r}, run "
-                    f"{fence.get('run')}"
-                    + (f", pid {int(fence['pid'])}" if fence.get("pid") else "")
-                    + ") is still unresolved")
-        else:  # pragma: no cover - the hold is the only way we get here
-            held = "its spawn fence could not be armed"
-        error = f"spawn refused: {held}; no child was started for this claim"
-        run_id = _end_run(
-            conn, task_id, outcome="spawn_refused", status="spawn_refused",
-            error=error,
-            metadata={"spawn_fence": fence, "retry_status": retry_status},
-        )
-        _append_event(conn, task_id, "spawn_refused", {
-            "error": error, "spawn_fence": fence, "retry_status": retry_status,
-        }, run_id=run_id)
-        return retry_status
-
-
-def _hold_spawn_fence(conn: sqlite3.Connection, task_id: str, claim, run) -> bool:
-    """Arm the in-flight spawn marker under a claim CAS.
-
-    ``False`` when the card is gone, when its claim has already moved on (a
-    successor owns it, or it was blocked/archived mid-dispatch) — in both cases
-    this dispatcher must not start a child at all — or when an EARLIER spawn's
-    fence is still unresolved. A predecessor that has not published a PID yet
-    is exactly as exclusive as one that has: it is never overwritten and a
-    second child is never stacked beside it, because its own child may already
-    be alive under a NULL ``worker_pid``. The single predecessor this may clear
-    is one whose hold is provably over — a retained identity re-probed gone, or
-    a fence whose spawner died with no live child of that spawn observable —
-    recorded as ``spawn_fence_released``, never dropped silently.
-
-    The payload also carries THIS dispatcher's own identity (``spawned_by``), so
-    a fence left behind by a dispatcher that died between arming and publishing
-    can be settled later while one whose spawner is still alive stays held.
-
-    The host probe behind an identity-less predecessor's fence reads every
-    process on the box, so it is computed BEFORE the writer lock and applied
-    only to a byte-identical payload — a row that moved underneath us keeps the
-    hold and is re-decided on the next tick."""
-    probed = None
-    pre = conn.execute("SELECT spawn_fence FROM tasks WHERE id = ?", (task_id,)).fetchone()
-    if pre is not None:
-        pre_text = _row_get(pre, "spawn_fence")
-        pre_fence = _json_dict(pre_text) or None
-        if (pre_fence is not None and not pre_fence.get("pid")
-                and not _fence_is_mine(pre_fence, claim, run)):
-            decision = _identityless_fence_action(pre_fence)
-            if decision[0] != "hold":
-                probed = (pre_text, decision)
-    with write_txn(conn):
-        row = conn.execute(
-            "SELECT claim_lock, spawn_fence FROM tasks WHERE id = ?", (task_id,),
-        ).fetchone()
-        if row is None or _row_get(row, "claim_lock") != claim:
-            return False
-        fence = _json_dict(_row_get(row, "spawn_fence")) or None
-        if fence is not None and not _fence_is_mine(fence, claim, run):
-            if not _release_dead_fence(conn, task_id, probed=probed):
-                return False
-        cur = conn.execute(
-            "UPDATE tasks SET spawn_fence = ? WHERE id = ? AND claim_lock IS ?",
-            (_spawn_fence_payload(claim, run, spawned_by=_spawner_identity()), task_id, claim),
-        )
-        return cur.rowcount == 1
-
-
-def _release_spawn_fence(conn: sqlite3.Connection, task_id: str, claim, run) -> bool:
-    """Release the marker THIS spawn armed.
-
-    Never releases a fence that already carries a worker identity the stop path
-    could not prove gone — that hold is the only thing keeping the card
-    unarchivable — nor one belonging to a successor claim."""
-    with write_txn(conn):
-        fence, writable = _spawn_fence_writable(conn, task_id, claim, run)
-        if not writable or fence is None or fence.get("pid"):
-            return False
-        conn.execute("UPDATE tasks SET spawn_fence = NULL WHERE id = ?", (task_id,))
-        return True
-
-
-def _arm_spawn_fence_identity(
-    conn: sqlite3.Connection, task_id: str, *, claim, run, pid, started_at,
-) -> bool:
-    """Attach the just-started worker's identity to its spawn fence BEFORE any stop
-    is attempted: from that moment the card is held against a known process, so a
-    failure anywhere in the stop path can never leave a live child behind an
-    archivable card."""
-    with write_txn(conn):
-        fence, writable = _spawn_fence_writable(conn, task_id, claim, run)
-        if not writable:
-            return False
-        held = dict(fence or {})
-        held.update({
-            "claim": claim, "run": int(run) if run else None,
-            "at": held.get("at") or int(time.time()),
-            "pid": int(pid), "started_at": started_at,
-        })
-        conn.execute("UPDATE tasks SET spawn_fence = ? WHERE id = ?",
-                     (_json_or_null(held), task_id))
-        return True
-
-
-def _settle_fenced_spawn(
-    conn: sqlite3.Connection, task_id: str, *, claim, run, pid, started_at, stop: dict,
-) -> bool:
-    """Record a spawn whose publication lost its claim, and settle its fence.
-
-    The child NEVER becomes this row's ``worker_pid``: the claim it belonged to
-    is already blocked/archived/replaced, so attaching it would stamp the new
-    state with a worker that state does not own. Its identity goes to the
-    spawn's OWN run row (historical truth, and what ``reap_terminal_workers``
-    keys on) and — when the stop could not be proven — stays in the fence, which
-    is what keeps the card unarchivable. Returns True only when the hold was
-    released because the worker is proven gone. ``spawn_discarded`` is appended
-    either way so run outcome and event provenance stay truthful.
-    """
-    stopped = bool(stop.get("stopped"))
-    payload: dict = {
-        "pid": int(pid), "started_at": started_at, "claim": claim, "run": run,
-        "stopped": stopped, "reason": "claim lost before the worker PID could be published",
-        "termination_attempted": bool(stop.get("termination_attempted")),
-        "terminated": bool(stop.get("terminated")), "sigkill": bool(stop.get("sigkill")),
-    }
-    if not stopped:
-        payload["blocker"] = stop.get("blocker") or (
-            f"worker pid {pid} (start fingerprint {started_at!r}) survived the stop; "
-            f"its execution cannot be proven stopped"
-        )
-    released = False
-    with write_txn(conn):
-        if conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone() is None:
-            # Hard-deleted while the child was starting: no card left to hold or
-            # to record on (an event row here would be an orphan).
-            return False
-        if run:
-            conn.execute(
-                "UPDATE task_runs SET worker_pid = ?, worker_started_at = ? "
-                "WHERE id = ? AND task_id = ?",
-                (int(pid), started_at, int(run), task_id),
-            )
-        fence, writable = _spawn_fence_writable(conn, task_id, claim, run)
-        if writable:
-            if stopped:
-                conn.execute("UPDATE tasks SET spawn_fence = NULL WHERE id = ?", (task_id,))
-                released = True
-            else:
-                held = dict(fence or {})
-                held.update({"claim": claim, "run": int(run) if run else None,
-                             "at": held.get("at") or int(time.time()),
-                             "pid": int(pid), "started_at": started_at})
-                conn.execute("UPDATE tasks SET spawn_fence = ? WHERE id = ?",
-                             (_json_or_null(held), task_id))
-        _append_event(conn, task_id, "spawn_discarded", payload,
-                      run_id=int(run) if run else None)
-    return released
-
-
 # --- Archive policy ----------------------------------------------------------
 # Protect exactly the KNOWN work-in-flight statuses; every other status —
 # including legacy/unrecognized raw values such as ``completed`` — archives
@@ -4936,8 +4368,7 @@ def _archive_row(conn: sqlite3.Connection, task_id: str):
     lands between this read and the guarded UPDATE makes the archive lose on
     ``rowcount != 1`` instead of archiving from a stale row."""
     return conn.execute(
-        "SELECT status, claim_lock, worker_pid, worker_started_at, spawn_fence "
-        "FROM tasks WHERE id = ?",
+        "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
 
@@ -4960,16 +4391,6 @@ def archive_task(
       deletion, and no second ``archived`` event is written.
     * a live worker identity blocks the archive until that process can be
       proven gone (``worker_pid`` + start-time fingerprint).
-    * ``spawn_fence`` — a claim whose worker has started but has not published
-      its PID yet — blocks the archive for the same reason: while it is armed,
-      ``worker_pid IS NULL`` proves nothing. A fence that already carries a
-      retained worker identity releases that hold in the SAME guarded UPDATE
-      once its canonical ``(pid, start fingerprint)`` can no longer be observed
-      alive (recorded as ``spawn_fence_released``), so a card is never wedged
-      beside a dead process; a fence with no identity yet is never released
-      HERE — only its own dispatcher settles one (a dead spawner with no live
-      child of that spawn observable, see ``_settle_dead_spawn_fence``), and the
-      archive keeps refusing until it has.
       Nothing on this card's behalf mutates another card; dependents are
       reported through the archive impact receipt instead.
 
@@ -5015,50 +4436,10 @@ def archive_task(
                 f"cannot be proven stopped, so nothing was archived. Stop the worker "
                 f"(blocking the card stops it) and retry."
             ))
-        # ...and neither is "no worker recorded": a spawn that has started the
-        # child but not yet published its PID leaves ``worker_pid`` NULL while a
-        # process may already be alive. Refuse with the exact hold; the fence is
-        # settled by the dispatcher that armed it (publish, or fence out and stop
-        # the worker), and only then can this card archive.
-        fence_text = _row_get(row, "spawn_fence")
-        fence = _json_dict(fence_text) or None
-        fence_released: Optional[dict] = None
-        if fence is not None:
-            held_pid = fence.get("pid")
-            if held_pid and not _worker_alive(held_pid, fence.get("started_at")):
-                # Recovery for a hold whose worker has since died: the retained
-                # identity is the canonical ``(pid, start fingerprint)`` and it
-                # can no longer be observed alive, so it IS the proof the stop
-                # path could not record at the time. Released below in the SAME
-                # guarded UPDATE as the flip, so this is never a blind clear.
-                fence_released = fence
-            else:
-                if held_pid:
-                    detail = (f" (pid {int(held_pid)}, start fingerprint "
-                              f"{fence.get('started_at')!r})")
-                    head = (f"{task_id} has a spawned worker{detail} from claim "
-                            f"{fence.get('claim')!r} / run {fence.get('run')}")
-                else:
-                    head = (f"{task_id} has a spawn in flight (claim {fence.get('claim')!r}, run "
-                            f"{fence.get('run')}) that has not published a worker identity yet")
-                return _ret(False, (
-                    f"{head}, so no live worker can be ruled out — nothing was archived. The card "
-                    f"becomes archivable once that spawn is settled and its worker is stopped and "
-                    f"verified."
-                ))
         # The guard lives in the UPDATE predicate itself: the pre-read above is
         # only for diagnostics/refusal copy, never the authority.
-        guard = ("id = ? AND status NOT IN ('ready', 'running', 'review') "
-                 "AND (spawn_fence IS NULL")
+        guard = "id = ? AND status NOT IN ('ready', 'running', 'review')"
         params: list[Any] = [task_id]
-        if fence_released is not None:
-            # The release is atomic with the flip: the predicate still demands
-            # the exact hold we probed, so a writer that touched the fence in
-            # between makes this archive lose instead of archiving over it.
-            guard += " OR spawn_fence = ?)"
-            params.append(fence_text)
-        else:
-            guard += ")"
         if pid:
             # The liveness probe above is authoritative: if the recorded identity
             # moved underneath us, lose the race rather than archive blind.
@@ -5066,8 +4447,7 @@ def archive_task(
             params.append(pid)
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
-            "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
-            "    spawn_fence = NULL "
+            "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
             f"WHERE {guard}",
             tuple(params),
         )
@@ -5076,13 +4456,6 @@ def archive_task(
                 f"{task_id} changed concurrently; nothing was archived — re-read the "
                 f"card and retry"
             ))
-        if fence_released is not None:
-            # Truthful evidence for the recovery: which identity was held, and
-            # that it was re-probed gone rather than silently dropped.
-            _append_spawn_fence_release(
-                conn, task_id, fence_released,
-                reason="retained worker identity re-probed and proven gone",
-            )
         # Leaked run on a non-running card: close it so history isn't orphaned.
         run_id = _end_run(
             conn, task_id, outcome="reclaimed", status="reclaimed",
@@ -5164,6 +4537,10 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     task = get_task(conn, task_id)
     if not task:
         raise ValueError(f"unknown task {task_id}")
+    from hermes_cli.kanban_db_context import (
+        _ctx_attachments, _ctx_comments, _ctx_header, _ctx_parent_results, _ctx_prior_attempts,
+        _ctx_role_history,
+    )
     # One clock reading so every relative age in this rendering agrees.
     now = int(time.time())
     lines: list[str] = []
@@ -5174,213 +4551,6 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     _ctx_role_history(lines, conn, task, now)
     _ctx_comments(lines, list_comments(conn, task_id), now)
     return "\n".join(lines).rstrip() + "\n"
-
-
-def _ctx_cap(s: Optional[str], limit: int = _CTX_MAX_FIELD_BYTES) -> str:
-    """Truncate to ``limit`` chars with a visible ellipsis."""
-    if not s:
-        return ""
-    s = s.strip()
-    if len(s) <= limit:
-        return s
-    return s[:limit] + f"… [truncated, {len(s) - limit} chars omitted]"
-
-
-def _ctx_stamp(ts: int, now: int) -> str:
-    """``YYYY-MM-DD HH:MM`` plus a relative age when one is available."""
-    disp = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
-    age = _relative_age(ts, now)
-    return f"{disp}, {age}" if age else disp
-
-
-def _ctx_metadata_line(metadata: Any) -> Optional[str]:
-    if not metadata:
-        return None
-    try:
-        return f"_metadata_: `{_ctx_cap(json.dumps(metadata, ensure_ascii=False, sort_keys=True))}`"
-    except Exception:
-        return None
-
-
-def _ctx_tail(items: list, cap: int, noun: str) -> tuple[list, Optional[str]]:
-    """Keep the newest ``cap`` items; describe the omitted head, if any."""
-    omitted = max(0, len(items) - cap)
-    if not omitted:
-        return items, None
-    return items[-cap:], (
-        f"_({omitted} earlier {noun}{'s' if omitted != 1 else ''} "
-        f"omitted; showing most recent {cap})_"
-    )
-
-
-def _ctx_header(lines: list[str], task: Task) -> None:
-    lines.append(f"# Kanban task {task.id}: {task.title}")
-    lines.append("")
-    lines.append(f"Assignee: {task.assignee or '(unassigned)'}")
-    lines.append(f"Status:   {task.status}")
-    if task.tenant:
-        lines.append(f"Tenant:   {task.tenant}")
-    lines.append(f"Workspace: {task.workspace_kind} @ {task.workspace_path or '(unresolved)'}")
-    if task.max_runtime_seconds is not None:
-        terminal_timeout = _worker_terminal_timeout_env(
-            task.max_runtime_seconds, os.environ.get("TERMINAL_TIMEOUT"),
-        )
-        effective_terminal_timeout = terminal_timeout or os.environ.get("TERMINAL_TIMEOUT")
-        lines.append(f"Max runtime: {task.max_runtime_seconds}s")
-        if effective_terminal_timeout:
-            lines.append(f"Terminal timeout: {effective_terminal_timeout}s")
-    if task.branch_name:
-        lines.append(f"Branch:   {task.branch_name}")
-    if task.required_reviewer:
-        # One place only — the gate is a property of the card, not of the body,
-        # so it is never duplicated into (or alongside) the task description.
-        lines.append(
-            f"Required reviewer: {task.required_reviewer} — this card is "
-            f"review-gated: finish with kanban_request_review (the saved "
-            f"reviewer is selected automatically); kanban_complete is not "
-            f"available to implementation runs on it."
-        )
-    elif (task.review_policy or "") == "disabled":
-        lines.append(
-            "Review policy: disabled. This card has no native review. When the work is done, "
-            "finish with kanban_complete(summary=..., artifacts=[...]); kanban_request_review "
-            "is not available on this card."
-        )
-    lines.append("")
-    if task.body and task.body.strip():
-        lines.append("## Body")
-        lines.append(_ctx_cap(task.body, _CTX_MAX_BODY_BYTES))
-        lines.append("")
-
-
-def _ctx_attachments(lines: list[str], attachments: list[Attachment]) -> None:
-    """Absolute on-disk paths so the worker's file tools read them directly
-    (remote terminal backends need the attachments dir mounted)."""
-    if not attachments:
-        return
-    lines.append("## Attachments")
-    lines.append(
-        "Files attached to this task. Read them with the file/terminal "
-        "tools at the absolute paths below:"
-    )
-    for att in attachments:
-        size_kb = max(1, (att.size + 1023) // 1024) if att.size else 0
-        size_str = f", {size_kb} KB" if size_kb else ""
-        ctype = f", {att.content_type}" if att.content_type else ""
-        lines.append(f"- `{att.filename}`{ctype}{size_str} → `{att.stored_path}`")
-    lines.append("")
-
-
-def _ctx_prior_attempts(lines: list[str], conn: sqlite3.Connection, task_id: str, now: int) -> None:
-    """Closed runs on this task (the active run is this worker), newest
-    ``_CTX_MAX_PRIOR_ATTEMPTS`` in full, older ones as a one-line marker."""
-    all_prior = [r for r in list_runs(conn, task_id) if r.ended_at is not None]
-    shown, omitted_note = _ctx_tail(all_prior, _CTX_MAX_PRIOR_ATTEMPTS, "attempt")
-    if not shown:
-        return
-    first_shown_idx = len(all_prior) - len(shown) + 1
-    lines.append("## Prior attempts on this task")
-    if omitted_note:
-        lines.append(omitted_note)
-    for offset, run in enumerate(shown):
-        profile = run.profile or "(unknown)"
-        outcome = run.outcome or run.status
-        lines.append(
-            f"### Attempt {first_shown_idx + offset} — {outcome} ({profile}, {_ctx_stamp(run.started_at, now)})"
-        )
-        if run.summary and run.summary.strip():
-            lines.append(_ctx_cap(run.summary))
-        if run.error and run.error.strip():
-            lines.append(f"_error_: {_ctx_cap(run.error)}")
-        meta_line = _ctx_metadata_line(run.metadata)
-        if meta_line:
-            lines.append(meta_line)
-        lines.append("")
-
-
-def _ctx_parent_results(lines: list[str], conn: sqlite3.Connection, task_id: str, now: int) -> None:
-    """Done-parent handoffs: newest ``completed`` run's summary+metadata,
-    falling back to ``task.result`` for pre-runs-table data. Stamped with a
-    relative age so the worker re-verifies stale upstream results."""
-    parent_rows = conn.execute(
-        "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id", (task_id,),
-    ).fetchall()
-    wrote_header = False
-    for pid in (r["parent_id"] for r in parent_rows):
-        pt = get_task(conn, pid)
-        if not pt or pt.status != "done":
-            continue
-        runs = [r for r in list_runs(conn, pid) if r.outcome == "completed"]
-        runs.sort(key=lambda r: r.started_at, reverse=True)
-        run = runs[0] if runs else None
-        if not wrote_header:
-            lines.append("## Parent task results")
-            lines.append(
-                "_Handoffs from upstream tasks, captured when each parent "
-                "completed (see age below). These are point-in-time "
-                "snapshots, not live state — if a result drives your "
-                "current work and it's not recent, re-verify against the "
-                "source before acting on it as current._"
-            )
-            wrote_header = True
-        done_ts = run.ended_at if run is not None and run.ended_at else (pt.completed_at or None)
-        age = _relative_age(done_ts, now)
-        lines.append(f"### {pid}" + (f" (completed {age})" if age else ""))
-        if run is not None and run.summary and run.summary.strip():
-            lines.append(_ctx_cap(run.summary))
-        elif pt.result:
-            lines.append(_ctx_cap(pt.result))
-        else:
-            lines.append("(no result recorded)")
-        meta_line = _ctx_metadata_line(run.metadata) if run is not None else None
-        if meta_line:
-            lines.append(meta_line)
-        lines.append("")
-
-
-def _ctx_role_history(lines: list[str], conn: sqlite3.Connection, task: Task, now: int) -> None:
-    """The assignee's 5 most recent completed runs on OTHER tasks — implicit
-    role continuity without wiring anything into SOUL.md / MEMORY.md."""
-    if not task.assignee:
-        return
-    role_rows = conn.execute(
-        "SELECT t.id, t.title, r.summary, r.ended_at "
-        "FROM task_runs r JOIN tasks t ON r.task_id = t.id "
-        "WHERE r.profile = ? AND r.task_id != ? "
-        "  AND r.outcome = 'completed' "
-        "ORDER BY r.ended_at DESC LIMIT 5", (task.assignee, task.id),
-    ).fetchall()
-    if not role_rows:
-        return
-    lines.append(f"## Recent work by @{task.assignee}")
-    for row in role_rows:
-        first = _first_line(row["summary"], 200) or "(no summary)"
-        lines.append(
-            f"- {row['id']} — {row['title']} ({_ctx_stamp(_to_epoch(row['ended_at']) or 0, now)}): {first}"
-        )
-    lines.append("")
-
-
-def _ctx_comments(lines: list[str], comments: list[Comment], now: int) -> None:
-    """Newest ``_CTX_MAX_COMMENTS`` comments. The explicit "comment from
-    worker" framing stops an operator-controlled HERMES_PROFILE like
-    "hermes-system" being read as a system directive above an
-    attacker-influenceable body (defense-in-depth)."""
-    shown, omitted_note = _ctx_tail(comments, _CTX_MAX_COMMENTS, "comment")
-    if not shown:
-        return
-    lines.append("## Comment thread")
-    if omitted_note:
-        lines.append(omitted_note)
-    for c in shown:
-        # Render author with explicit "comment from worker" framing so operator-controlled HERMES_PROFILE
-        # values like "hermes-system" or "operator" can't be misread by the next worker as a system
-        # directive above the (attacker-influenceable) comment body. Defense-in-depth — the LLM-controlled
-        # author-forgery surface was already closed in #22435. See #22452.
-        safe_author = (c.author or "").replace("`", "")
-        lines.append(f"comment from worker `{safe_author}` at {_ctx_stamp(c.created_at, now)}:")
-        lines.append(_ctx_cap(c.body, _CTX_MAX_COMMENT_BYTES))
-        lines.append("")
 
 
 # --- Stats + SLA helpers ---
