@@ -357,8 +357,8 @@ def test_terminal_scratch_parent_still_swept_after_last_child(
         kb.link_tasks(conn, parent, child)
         assert kb.complete_task(conn, parent, summary="parent done")
         assert ws.is_dir()  # live child still needs the handoff files
-        # ``ready`` is protected work in flight under the shared archive policy:
-        # park the card first, which is the documented block-before-archive path.
-        kb.block_task(conn, child, reason="scratch sweep probe")
+        # The child is ready (unarchivable while in flight): block it first, the stop-first
+        # path the archive refusal names. Its scratch is then swept by the archive.
+        assert kb.block_task(conn, child, reason="stop before archive")
         assert kb.archive_task(conn, child)
     assert not ws.exists()

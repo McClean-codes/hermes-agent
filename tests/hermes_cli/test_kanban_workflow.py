@@ -44,11 +44,10 @@ def _all_tool_schemas():
             yield value
 
 
-def test_archive_is_a_manual_move_except_in_flight():
-    # Archiving is offered from every settled column; in-flight cards must be
-    # fenced first (the shared archive policy refuses them).
-    assert all(W.can_move(k, kw.ARCHIVED) for k in W.keys() if k not in kw.ARCHIVE_REFUSED_IN_FLIGHT)
-    assert not any(W.can_move(k, kw.ARCHIVED) for k in kw.ARCHIVE_REFUSED_IN_FLIGHT)
+def test_archive_is_a_manual_move_except_for_work_in_flight():
+    # Archiving is open from every column except the work-in-flight ones, which the
+    # archive policy refuses (block first). The server enforces the same refusal.
+    assert all(W.can_move(k, kw.ARCHIVED) == (k not in kw.ARCHIVE_PROTECTED_STATUSES) for k in W.keys())
     assert not any(W.can_move(k, "running") for k in W.keys())
 
 

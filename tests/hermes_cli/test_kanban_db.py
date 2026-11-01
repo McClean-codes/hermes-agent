@@ -9,8 +9,8 @@ import subprocess
 import sys
 import time
 import types
-from typing import cast
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -2311,8 +2311,7 @@ def test_archive_task_guarded_update_beats_a_stale_pre_read(kanban_home):
                 self._real = real
 
             def fetchone(self):
-                return {"status": "blocked", "claim_lock": None,
-                        "worker_pid": None, "worker_started_at": None}
+                return {"status": "blocked", "worker_pid": None, "worker_started_at": None}
 
             def __getattr__(self, name):
                 return getattr(self._real, name)
@@ -2321,8 +2320,7 @@ def test_archive_task_guarded_update_beats_a_stale_pre_read(kanban_home):
             """Connection proxy whose ONLY lie is the archive status pre-read."""
 
             _PRE_READ = (
-                "SELECT status, claim_lock, worker_pid, worker_started_at "
-                "FROM tasks WHERE id = ?"
+                "SELECT status, worker_pid, worker_started_at FROM tasks WHERE id = ?"
             )
 
             def __init__(self, real):

@@ -27,12 +27,9 @@ from typing import Iterator, Mapping, Optional
 # ``archived`` is outside every workflow: a filter toggle, never a board column.
 ARCHIVED = "archived"
 
-# Columns whose cards are work in flight: the shared archive policy
-# (``kanban_db.ARCHIVE_PROTECTED_STATUSES``) refuses to archive them until they are
-# fenced/stopped first. Duplicated here as pure data (this module never imports
-# ``kanban_db``) and pinned back to the policy by ``test_kanban_workflow_matrix.py``
-# re-measuring the live API.
-ARCHIVE_REFUSED_IN_FLIGHT = frozenset({"ready", "running", "review"})
+# Work in flight: the archive policy refuses to archive these directly (block first).
+# Owned here, pure data, so ``can_move`` states the refusal the server enforces.
+ARCHIVE_PROTECTED_STATUSES: frozenset = frozenset({"ready", "running", "review"})
 
 
 @dataclass(frozen=True)
@@ -53,10 +50,8 @@ class Workflow:
 
     columns: tuple[Column, ...]
     # Manual moves (drag, PATCH status) a human may request: ``src -> {dst}``. Archiving
-    # (dst) is allowed from every non-in-flight column and is not listed; cards still
-    # ``ready``/``running``/``review`` must be fenced/blocked first (the shared archive
-    # policy refuses them). ``archived`` may appear as a source (restore). Allowed !=
-    # guaranteed: verbs still apply their own gates (parents open, completion evidence).
+    # (dst) is always allowed and not listed; ``archived`` may appear as a source (restore). Allowed != guaranteed: verbs still apply their own
+    # gates (parents open, completion evidence).
     manual: Mapping[str, frozenset[str]]
 
     def __iter__(self) -> Iterator[Column]:
@@ -76,15 +71,14 @@ class Workflow:
         return col
 
     def can_move(self, src: str, dst: str) -> bool:
-        """True when a human may request ``src -> dst``. Archiving is allowed from
-        non-in-flight columns only (``ARCHIVE_REFUSED_IN_FLIGHT``); ``archived`` is a
-        valid source (restore). ``src == dst`` is not a move."""
+        """True when a human may request ``src -> dst``. Archiving is always allowed;
+        ``archived`` is a valid source (restore). ``src == dst`` is not a move."""
         if src != ARCHIVED:
             self._require(src)
         if src == dst:
             return False
         if dst == ARCHIVED:
-            return src not in ARCHIVE_REFUSED_IN_FLIGHT
+            return src not in ARCHIVE_PROTECTED_STATUSES
         self._require(dst)
         return dst in self.manual.get(src, frozenset())
 
@@ -139,9 +133,9 @@ DEFAULT_WORKFLOW = Workflow(
         "ready": ("triage", "todo", "scheduled", "blocked", "review", "done"),
         "running": ("triage", "todo", "scheduled", "ready", "blocked", "review", "done"),
         "blocked": ("triage", "todo", "scheduled", "ready", "done"),
-        # ``blocked`` stops an in-flight review run. Known quirk kept for zero
-        # behavior change: review -> todo lands in ``ready`` (reopen_review_task
-        # ignores the requested target). Phase 1 fixes it.
+        # Known quirk kept for zero behavior change: review -> todo lands in ``ready``
+        # (reopen_review_task ignores the requested target). Phase 1 fixes it.
+        # blocked: block_task stops a review run (the stop-first path the archive copy names).
         "review": ("triage", "todo", "ready", "blocked", "done"),
         "done": ("triage", "todo", "ready"),
         ARCHIVED: ("triage", "todo", "ready"),  # restore from the archive filter

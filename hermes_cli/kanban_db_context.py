@@ -103,8 +103,7 @@ def _ctx_header(lines: list[str], task: Task) -> None:
     if task.branch_name:
         lines.append(f"Branch:   {task.branch_name}")
     if task.required_reviewer:
-        # One place only — the gate is a property of the card, not of the body,
-        # so it is never duplicated into (or alongside) the task description.
+        # One place only: the gate is a property of the card, not of the body.
         lines.append(
             f"Required reviewer: {task.required_reviewer} — this card is "
             f"review-gated: finish with kanban_request_review (the saved "

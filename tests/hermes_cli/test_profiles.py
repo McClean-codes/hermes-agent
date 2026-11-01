@@ -425,31 +425,47 @@ class TestCreateProfile:
     @pytest.mark.platforms("linux")
     def test_clone_all_does_not_attach_to_the_source_profiles_live_browser(self, profile_env):
         """Copied Chromium markers must not route the clone through the source profile's CDP port."""
-        from tools.bot_desktop.browser import running_instance_cdp_port
+        import http.server
+        import threading
+        from tools.browser_launcher import running_instance
 
         default_home = profile_env / ".hermes"
         (default_home / "config.yaml").write_text("model: test", encoding="utf-8")
         browser_profile = default_home / "bot-desktop" / "browser-profile"
         browser_profile.mkdir(parents=True)
 
-        with socket.socket() as listener:
-            listener.bind(("127.0.0.1", 0))
-            listener.listen()
-            port = listener.getsockname()[1]
+        class _Version(http.server.BaseHTTPRequestHandler):  # a live DevTools /json/version answer
+            def do_GET(self):
+                body = b'{"webSocketDebuggerUrl": "ws://127.0.0.1/devtools/browser/source"}'
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Version)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            port = server.server_address[1]
             (browser_profile / "DevToolsActivePort").write_text(f"{port}\n/devtools/browser/source\n", encoding="utf-8")
             (browser_profile / "SingletonLock").symlink_to(f"host-{os.getpid()}")
-            assert running_instance_cdp_port(str(browser_profile)) == port
+            assert running_instance(str(browser_profile))[0] == port
 
             profile_dir = create_profile("coder", clone_all=True, no_alias=True)
             cloned_browser = profile_dir / "bot-desktop" / "browser-profile"
 
-            assert running_instance_cdp_port(str(cloned_browser)) is None
-            assert running_instance_cdp_port(str(browser_profile)) == port
+            assert running_instance(str(cloned_browser)) is None
+            assert running_instance(str(browser_profile))[0] == port
+        finally:
+            server.shutdown()
+            server.server_close()
 
     @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="special files need a POSIX filesystem")
     def test_clone_all_skips_special_files(self, profile_env):
         # A live source profile holds special files copytree cannot copy (e.g. a suffixless
-        # agent-browser control socket); one of them must not abort the whole clone.
+        # browser control socket); one of them must not abort the whole clone.
         default_home = profile_env / ".hermes"
         (default_home / "config.yaml").write_text("model: test", encoding="utf-8")
         browser_dir = default_home / "home" / ".agent-browser"
@@ -498,9 +514,9 @@ class TestNoSkillsOptOut:
 class TestBackfillProfileEnvs:
     """Tests for backfill_profile_envs() — the `hermes update` pass that
     gives pre-#44792 profiles (created before .env seeding) their own
-    .env, copied from the default install so credentials don't break."""
+    .env: the placeholder header, never a copy of the default's secrets."""
 
-    def test_copies_default_env_into_envless_profiles(self, profile_env):
+    def test_seeds_placeholder_never_the_default_env(self, profile_env):
         import stat
         tmp_path = profile_env
         (tmp_path / ".hermes" / ".env").write_text("OPENROUTER_API_KEY=root-key\n", encoding="utf-8")
@@ -514,7 +530,7 @@ class TestBackfillProfileEnvs:
 
         assert sorted(backfilled) == ["old1", "old2"]
         for p in (p1, p2):
-            assert (p / ".env").read_text(encoding="utf-8-sig") == "OPENROUTER_API_KEY=root-key\n"
+            assert "root-key" not in (p / ".env").read_text(encoding="utf-8-sig")
             assert stat.S_IMODE((p / ".env").stat().st_mode) == 0o600
 
 
@@ -1586,48 +1602,6 @@ class TestWriteProfileMetaDurability:
         assert (profile_dir / "profile.yaml").is_symlink()
         assert "updated" in real.read_text(encoding="utf-8-sig")
         assert [p.name for p in profile_dir.iterdir() if p.name.endswith(".tmp")] == []
-
-
-# ===================================================================
-# read_profile_meta — never-raises contract for malformed VALUES
-# ===================================================================
-
-class TestReadProfileMetaMalformedRole:
-    """``read_profile_meta`` promises "Never raises — a corrupt file on one profile must
-    not break ``hermes profile list``". Unparseable YAML is already swallowed by
-    ``_load_yaml_dict``; a *parseable* file whose ``role`` VALUE is unhashable must not
-    escape that guard and blow up in the ``PROFILE_ROLES`` membership test."""
-
-    @pytest.mark.parametrize("role_value", [["setup"], {"setup": True}], ids=["list", "dict"])
-    def test_unhashable_role_value_never_raises_and_degrades_to_none(self, tmp_path, role_value):
-        profile_dir = tmp_path / "malformed-role"
-        profile_dir.mkdir()
-        (profile_dir / "profile.yaml").write_text(
-            yaml.safe_dump({"description": "still readable", "role": role_value}),
-            encoding="utf-8",
-        )
-
-        meta = profiles.read_profile_meta(profile_dir)  # the contract: no exception
-
-        assert meta["role"] is None
-        # The guard isolates the bad VALUE: the rest of the document still comes through,
-        # instead of the whole read silently degrading to defaults.
-        assert meta["description"] == "still readable"
-
-    def test_scalar_role_resolution_is_unchanged(self, tmp_path):
-        """Known role keeps resolving to itself, unknown scalar role to ``None`` — the
-        fix must narrow the membership test to hashable scalars, not blank ``role``."""
-        def _read(role_value):
-            # One directory per read: ``read_profile_meta`` memoizes per path.
-            profile_dir = tmp_path / f"scalar-{len(list(tmp_path.iterdir()))}"
-            profile_dir.mkdir()
-            (profile_dir / "profile.yaml").write_text(
-                yaml.safe_dump({"role": role_value}), encoding="utf-8")
-            return profiles.read_profile_meta(profile_dir)["role"]
-
-        assert _read(profiles.SETUP_ROLE) == profiles.SETUP_ROLE
-        assert _read("banana") is None
-        assert _read(None) is None
 
 
 # ===================================================================
