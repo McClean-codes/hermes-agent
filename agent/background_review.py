@@ -234,7 +234,10 @@ def load_background_review_settings() -> tuple[bool, dict[str, Any]]:
     # A finite gateway turn (`chat -q` / `-z`) is one-shot like the in-process run, whose exit
     # takes the daemon review thread with it; the long-lived gateway would otherwise fork a
     # ~30K-token review after the viewer has already gone.
-    if safe_worker_enabled() or finite_turn_required() is True:
+    # Kanban workers are finite too, but the one-shot exit waits for their review
+    # (cli_shutdown._wait_for_background_review), so they keep automatic reviews.
+    kanban_worker = bool(os.environ.get("HERMES_KANBAN_TASK"))
+    if safe_worker_enabled() or (finite_turn_required() is True and not kanban_worker):
         return False, {}
     try:
         from hermes_cli.config import load_config_readonly
