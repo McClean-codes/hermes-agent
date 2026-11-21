@@ -372,7 +372,12 @@ def discover_profile_mcp(policy):
 def retire_agent(agent):
     """A settled admission is a turn boundary, not the end of the session: the owner's
     in-process agent keeps its background processes, sandbox and browser between turns
-    (release_clients), so the worker must too. Only memory extraction is turn-final work."""
+    (release_clients), so the worker must too. Only memory extraction is turn-final work.
+    A Kanban worker is one-shot: its post-turn review is a daemon thread the exit would kill
+    mid-write, so the worker waits (bounded) for it first."""
+    from agent.background_review import REVIEW_TEARDOWN_WAIT_SECONDS, kanban_worker_turn, wait_for_background_review
+    if kanban_worker_turn():
+        wait_for_background_review(agent, timeout=REVIEW_TEARDOWN_WAIT_SECONDS)
     # A boundary task queued this turn (LLM-bound extraction) would be cancelled by the
     # provider shutdown's short drain; give it the same bounded head start cli_shutdown does.
     manager = getattr(agent, '_memory_manager', None)
@@ -432,6 +437,10 @@ def execute(frame, channel):
     os.environ['HERMES_GATEWAY_SESSION'] = '1'
     from gateway.session_worker_construct import checkpoint_agent_kwargs, construct_kwargs, routing_agent_kwargs
     construct = {'ephemeral_system_prompt': policy.skills_prompt, **construct_kwargs(frame)}
+    from agent.background_review import kanban_worker_turn
+    # A Kanban turn keeps the post-turn review (the card's native skill/memory improvement); the
+    # worker waits for it in retire_agent before the one-shot process exits.
+    kanban_turn = kanban_worker_turn()
     controls = WorkerControls(channel, frame['route'])
     register_gateway_notify(frame['route'], controls.approval)
     agent = None
@@ -448,7 +457,7 @@ def execute(frame, channel):
                 platform=policy.platform if policy.source in ('tool', 'oneshot') else policy.source,
                 gateway_session_key=frame['route'], user_id=frame['user_id'], chat_id=frame['chat_id'],
                 skip_context_files=policy.ignore_rules, load_soul_identity=not policy.ignore_rules,
-                skip_memory=policy.ignore_rules, skip_background_review=True, quiet_mode=True,
+                skip_memory=policy.ignore_rules, skip_background_review=not kanban_turn, quiet_mode=True,
                 pass_session_id=policy.pass_session_id,
                 **checkpoint_agent_kwargs(policy.config()), **construct,
                 **routing_agent_kwargs(policy.config(), policy.model, policy.provider, policy.base_url),

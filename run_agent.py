@@ -171,8 +171,14 @@ def _positive_int(value: Any) -> Optional[int]:
 
 
 def _review_should_defer(agent: Any, task_cfg: Optional[dict[str, Any]]) -> bool:
-    """True when an automatic background review targets the managed local runtime under ``defer: auto``."""
+    """True when an automatic background review targets the managed local runtime under ``defer: auto``.
+
+    Never for a Kanban worker: its one-shot process would exit with the deferred review still in the
+    process-local idle queue, so the review is dropped; it spawns now and the worker waits for it."""
+    from agent.background_review import kanban_worker_turn
     from agent.review_idle_queue import defer_mode, review_targets_managed_local
+    if kanban_worker_turn():
+        return False
     return defer_mode(task_cfg) == "auto" and review_targets_managed_local(agent, task_cfg)
 
 

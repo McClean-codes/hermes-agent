@@ -333,6 +333,30 @@ def _wait_for_oneshot_background_completions(cli) -> None:
         )
 
 
+_KANBAN_REVIEW_WAIT_SECONDS = 180.0
+
+
+def _wait_for_background_review(cli) -> None:
+    """Kanban workers only: let the post-turn skill/memory review finish before the hard exit.
+
+    The review runs on a daemon thread, and the one-shot exit (``os._exit``) would kill it
+    mid-write. Bounded so a stuck review can never pin the worker; the timeout is logged.
+    """
+    if not os.environ.get("HERMES_KANBAN_TASK"):
+        return
+    agent, task_id = _oneshot_agent_and_session(cli)
+    run = getattr(agent, "_background_review_run", None)
+    if run is None:
+        return
+    if run.request_done.wait(timeout=_KANBAN_REVIEW_WAIT_SECONDS):
+        logger.info("One-shot background review finished for session %s", task_id or "<unknown>")
+    else:
+        logger.warning(
+            "One-shot background review for session %s still running after %.0fs; exiting",
+            task_id or "<unknown>", _KANBAN_REVIEW_WAIT_SECONDS,
+        )
+
+
 def _finalize_single_query(cli) -> None:
     """Settle the session, then release its lease, then linger as a bystander.
 
@@ -391,4 +415,8 @@ def _finalize_single_query(cli) -> None:
         _wait_for_oneshot_background_completions(cli)
     except Exception:
         logger.debug("one-shot background completion wait failed", exc_info=True)
+    try:
+        _wait_for_background_review(cli)
+    except Exception:
+        logger.debug("one-shot background review wait failed", exc_info=True)
     _run_cleanup(notify_session_finalize=False)

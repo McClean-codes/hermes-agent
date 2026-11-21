@@ -30,7 +30,7 @@ checkpoint; their iteration warning remains opt-in.
 
 The board has two front doors, both backed by the same `~/.hermes/kanban.db`:
 
-- **Agents drive the board through a dedicated `kanban_*` toolset** — `kanban_show`, `kanban_list`, `kanban_complete`, `kanban_request_review`, `kanban_request_changes`, `kanban_block`, `kanban_heartbeat`, `kanban_comment`, `kanban_attach`, `kanban_attach_url`, `kanban_attachments`, `kanban_create`, `kanban_link`, `kanban_unblock`. The dispatcher spawns each worker with these tools already in its schema; orchestrator profiles can also enable the `kanban` toolset explicitly. The model reads and routes tasks by calling tools directly, *not* by shelling out to `hermes kanban`. See [How workers interact with the board](#how-workers-interact-with-the-board) below.
+- **Agents drive the board through a dedicated `kanban_*` toolset** — `kanban_show`, `kanban_list`, `kanban_discover`, `kanban_graph`, `kanban_complete`, `kanban_request_review`, `kanban_request_changes`, `kanban_block`, `kanban_heartbeat`, `kanban_comment`, `kanban_attach`, `kanban_attach_url`, `kanban_attachments`, `kanban_create`, `kanban_reassign`, `kanban_decompose`, `kanban_promote`, `kanban_link`, `kanban_unlink`, `kanban_unblock`, `kanban_archive`. The dispatcher spawns each worker with these tools already in its schema; orchestrator profiles can also enable the `kanban` toolset explicitly. The model reads and routes tasks by calling tools directly, *not* by shelling out to `hermes kanban`. See [How workers interact with the board](#how-workers-interact-with-the-board) below.
 - **You (and scripts, and cron) drive the board through `hermes kanban …`** on the CLI, `/kanban …` as a slash command, or the dashboard. These are for humans and automation — the places without a tool-calling model behind them.
 
 Both surfaces route through the same `kanban_db` layer, so reads see a consistent view and writes can't drift. The rest of this page shows CLI examples because they're easy to copy-paste, but every CLI verb has a tool-call equivalent the model uses.
@@ -411,6 +411,28 @@ hermes kanban unblock  t_abc t_def
 hermes kanban block    t_abc "need input" --ids t_def t_hij
 ```
 
+:::note What `archive` accepts
+`archive` protects exactly the work-in-flight statuses **`ready`**, **`running`** and
+**`review`**: a direct attempt on one of them changes nothing and tells you to block it
+first (`hermes kanban block <id> <reason>`, then archive). Every other status archives
+directly — including legacy raw values such as `completed` — and archiving an already
+`archived` card is a no-op (archive is not deletion). Blocking a `running` card stops
+its worker by `worker_pid` + start-time fingerprint and only lets the archive through
+once that process is provably gone; a survivor keeps its identity on the row and the
+archive quotes the blocker. The dashboard and the
+`kanban_archive` tool run the same policy, so no surface can bypass it. The tool
+also takes a **required `reason`** — one or two sentences saying why the card is
+being archived — which is validated before anything changes (missing, non-string
+or blank input fails with no side effects) and then stored on the `archived`
+event as `{"source": "kanban_archive", "actor": <profile>, "reason": "<yours>"}`
+so the board keeps an audit trail of who archived what and why. The CLI `archive`
+verb and the dashboard archive without one, exactly as before.
+
+Review is same-card throughout: blocking the reviewed work stops its own reviewer run, and what
+that affects elsewhere is reported through the dependency graph and the archive impact
+receipt — other cards are never blocked or mutated on this card's behalf.
+:::
+
 :::note Where an unblocked task lands
 `unblock` restores the safe source phase: **`review`** for reviewer-origin work
 whose parents are complete, **`ready`** for implementation work whose parents
@@ -462,8 +484,10 @@ Dispatcher-owned workers receive their task lifecycle tools automatically.
 |---|---|---|
 | `kanban_show` | Read the current task (title, body, prior attempts, parent handoffs, comments, full pre-formatted `worker_context`). Defaults to the env's task id. | — |
 | `kanban_list` | List task summaries with filters for `assignee`, `status`, `tenant`, archived visibility, and limit. Intended for orchestrators discovering board work. | — |
-| `kanban_complete` | Finish with `summary` + `metadata` structured handoff. | at least one of `summary` / `result` |
-| `kanban_request_review` | Start same-card review with a durable `summary`, optional `metadata`, and optional reviewer profile. The task moves to `review`; this is not a block. | `summary` |
+| `kanban_discover` | Read-only roster of the profiles this home can spawn work to — `default` plus every live named profile, with each profile's optional `profile.yaml` descriptor metadata (display name, description, role). Profiles with no descriptor are listed anyway (`descriptor.status: "missing"`); an unreadable or malformed descriptor is reported explicitly as `unreadable` / `invalid` instead of being silently read as absent. No board is opened, nothing is written and no describer runs; only descriptor fields are returned (never config, credentials, `SOUL` or prompt contents) and each string is length-bounded. This is the same enumeration `kanban_create` and `kanban_reassign` validate assignees against. | — |
+| `kanban_graph` | Read-only dependency shape around one task: its direct parents and children with id, title and status. Strictly SELECT-only — it never writes status, events or edges and never recomputes readiness, so inspecting a graph can never move a card. Use `kanban_show` when you need the full record. | — |
+| `kanban_complete` | Finish with `summary` + `metadata` structured handoff. On a card with a required reviewer this tool is not offered to an implementation run at all, and the backend refuses the same transition from any other route; close it from the review phase (or an operator overrides explicitly). | at least one of `summary` / `result` |
+| `kanban_request_review` | Start same-card review with a durable `summary`, optional `metadata`, and optional reviewer profile. The task moves to `review`; this is not a block. On a gated card the saved reviewer is selected automatically and any other name is refused (`reviewer override is not allowed`); the reviewer must carry the `sdlc-review` skill the dispatcher injects. | `summary` |
 | `kanban_request_changes` | Reviewer verdict from an active review run. Closes that run, reapplies parent gating, and routes the task to its original implementer without block-loop accounting. | `reason` |
 | `kanban_block` | Stop work and route by why: `kind=dependency` (waits in `todo`, auto-resumes when an incomplete parent finishes; with no open parent it is recorded as `needs_input` instead, since the wait could never be satisfied), `needs_input`/`capability`/`transient` (surface to a human). Repeated same-kind re-blocks auto-escalate to `triage`. | `reason` |
 | `kanban_heartbeat` | Signal liveness during long operations. Pure side-effect. | — |
@@ -471,9 +495,14 @@ Dispatcher-owned workers receive their task lifecycle tools automatically.
 | `kanban_attach` | Attach a file to a task by passing its bytes inline (base64); stored under the task's attachments dir (25 MB cap). | file bytes + name |
 | `kanban_attach_url` | Attach a file to a task by URL. | `url` |
 | `kanban_attachments` | List a task's attachments. | — |
-| `kanban_create` | (Orchestrators) fan out into child tasks with an `assignee`, optional `parents`, `skills`, etc. Returns `gated: true` + `gated_by` when an open parent parked the new card in `todo`. | `title`, `assignee` |
+| `kanban_create` | (Orchestrators) fan out into child tasks with an `assignee`, optional `parents`, `skills`, `reviewer`, etc. Returns `gated: true` + `gated_by` when an open parent parked the new card in `todo`. The `assignee` must name an installed profile — checked against `hermes_cli.profiles` (the same enumeration the CLI and the dispatcher's spawn gate use) **before the board is opened**, so a typo'd profile writes no task row, edge, event or workspace. Every `skills` entry must resolve in that profile's effective skill library, and a `reviewer` must exist *and* carry `sdlc-review`; both are refused atomically before anything is written (see [Required reviewer](#required-reviewer-review-gate)). | `title`, `assignee` |
+| `kanban_reassign` | (Orchestrators) move an existing task to a different profile through the same shared assign/reassign kernel `hermes kanban reassign` runs, so the lifecycle guards are identical: a card still running under a live claim is refused and nothing changes, unless `reclaim: true` releases the claim first. The destination must be an installed profile (validated before the board is opened), only the board this call opens is written, and success appends the shared `assigned` audit event (`{assignee, from}`) and reads the card back. | `task_id`, `assignee` |
 | `kanban_link` | (Orchestrators) add a `parent_id → child_id` dependency edge after the fact. Returns `gated: true` when the child was `ready` and got demoted back to `todo` because the parent is not done — the child will only run after the parent completes. Refused with `child is already running` when the child is already claimed — an edge added after the claim cannot serialise the run (a worker may still link its *own* running card ahead of a `kind=dependency` block). | `parent_id`, `child_id` |
 | `kanban_unblock` | (Orchestrators) restore a blocked task to its source phase (`review` or `ready`), or `todo` while a parent remains open. | `task_id` |
+| `kanban_unlink` | Drop an existing `parent_id → child_id` edge and report the child's *actual* resulting status, whether the removal promoted it, and any parents still gating it — no transition is claimed unless it really happened. Removing the last open parent re-evaluates the child immediately instead of leaving it parked until the next dispatcher tick. A task-scoped worker may only release an edge whose child is its own card. | `parent_id`, `child_id` |
+| `kanban_promote` | (Orchestrators) promote a `triage` task into the normal flow and only that: `ready` when every parent is already terminal, otherwise `todo` with the unmet gate(s) named back. A single guarded update, so a concurrent board change cannot be overwritten; there is no arbitrary status setter. | `task_id` |
+| `kanban_decompose` | (Orchestrators) apply an **agent-authored** decomposition of a `triage` task into a graph of child tasks — see [Manual orchestration](#auto-vs-manual-orchestration). Validates the whole graph first and applies it in one transaction, so an invalid graph writes nothing. | `children` |
+| `kanban_archive` | (Orchestrators) archive a task under the shared archive policy (`ready` / `running` / `review` refused), with a **required `reason`** stored on the `archived` event as `{source, actor, reason}` — the reason crosses the same redaction boundary as every other agent-authored free-text field on the board before it is stored or echoed back. Returns the dependent-impact receipt plus the same-card review association. | `task_id`, `reason` |
 
 A typical worker turn looks like:
 
@@ -510,7 +539,7 @@ kanban_create(
 kanban_complete(summary="decomposed into 2 research tasks + 1 writer; linked dependencies")
 ```
 
-The "(Orchestrators)" tools — `kanban_list`, `kanban_create`, `kanban_link`, `kanban_unblock`, and `kanban_comment` on foreign tasks — are available through the same toolset; the convention (encoded in the auto-injected kanban guidance) is that worker profiles don't fan out or route unrelated work, and orchestrator profiles don't execute implementation work. Dispatcher-spawned workers are still task-scoped for destructive lifecycle operations and cannot mutate unrelated tasks.
+The "(Orchestrators)" tools — `kanban_list`, `kanban_create`, `kanban_reassign`, `kanban_link`, `kanban_unlink`, `kanban_promote`, `kanban_decompose`, `kanban_archive`, `kanban_unblock`, and `kanban_comment` on foreign tasks — are available through the same toolset; the convention (encoded in the auto-injected kanban guidance) is that worker profiles don't fan out or route unrelated work, and orchestrator profiles don't execute implementation work. Dispatcher-spawned workers are still task-scoped for destructive lifecycle operations and cannot mutate unrelated tasks. `kanban_discover` is deliberately *not* in that list: it is read-only and every profile name it returns is one `kanban_create` will accept.
 
 ### Why tools instead of shelling to `hermes kanban`
 
@@ -664,7 +693,52 @@ hermes kanban create "audit auth flow" \
 
 **From the dashboard**, type the skills comma-separated into the **skills** field of the create-task dialog.
 
-The dispatcher emits one `--skills <name>` flag per skill listed, so the worker spawns with all of them loaded on top of the auto-injected kanban guidance. The skill names must match skills that are actually installed on the assignee's profile (run `hermes skills list` to see what's available); there's no runtime install.
+The dispatcher emits one `--skills <name>` flag per skill listed, so the worker spawns with all of them loaded on top of the auto-injected kanban guidance. Every name is validated **before the task is written** against the assignee profile's effective skill library — its own `skills/` tree, the shared root library, the checkout's bundled skills, that profile's `skills.external_dirs` and its plugin skills (run `hermes skills list` to see what's available). One missing name rejects the whole request atomically, naming the profile and the skills it couldn't find (`skill(s) not found for profile '<name>': … Nothing changed.`), so a card never lands with half its specialist context. There's no runtime install — fix the skill or drop the name.
+
+### Required reviewer (review gate)
+
+A card can be created with a **required reviewer**: a profile that must approve it before anything closes it. Omit the field and the card behaves exactly as before.
+
+```bash
+# Human / CLI
+hermes kanban create "harden webhook auth" --assignee coder --reviewer reviewer
+```
+
+```
+# Orchestrator agent
+kanban_create(title="harden webhook auth", assignee="coder", reviewer="reviewer")
+```
+
+```
+# Dashboard: the create-task dialog's reviewer field (POST /api/plugins/kanban/tasks)
+```
+
+What the gate does:
+
+- **Validated up front.** The reviewer must exist *and* already carry the `sdlc-review` skill the dispatcher force-loads for a review-lane worker. A bad profile or a missing skill is refused before any task row, edge, event or workspace is written.
+- **Persisted, not advisory.** The gate lives in `tasks.required_reviewer` and is exposed by `hermes kanban show` (`--json` too), `kanban_show`, the dashboard payload and the `created` event.
+- **Implementation runs cannot finish the card.** `kanban_complete` is not in a gated implementation run's tool schema at all, and the backend refuses the same transition through the CLI, the dashboard API and any other route — the verdict comes from lifecycle/run state (which run is live, where it was claimed from, who owns it), never from a profile string or env var. Finish with `kanban request-review` instead.
+- **The saved reviewer is selected automatically.** `request-review` routes to it and refuses any other name (`reviewer override is not allowed … preserved across retries/resume`), so the gate survives the review → changes-requested → re-review cycle and every retry/resume. The worker's own context is told once, in the task header, not in the body.
+- **Recovery is explicit.** An operator closes a gated card by approving it out of the `review` column, or by overriding on purpose: `hermes kanban complete <id> --override-reviewer` / the API's `review_gate_override: true`. Every override is audited as a `reviewer_gate_overridden` event. `--force` (live-claim guard) does **not** imply a reviewer override. Neither lever appears in any agent tool payload — `kanban_complete`'s schema carries no force/override field — so an implementation run's only path forward is `request-review`.
+- **Reassignment respects the gate.** A card in the review phase cannot be moved off its required reviewer, and a new assignee must already resolve every skill the card forces.
+
+### Review policy
+
+Every card runs under one of three review policies, set at creation with `review_policy` (`hermes kanban create --review-policy`, `kanban_create(review_policy=...)`, or the dashboard API's `review_policy` field on `POST /api/plugins/kanban/tasks`):
+
+| Policy | Native review | Reviewer | Who closes the card |
+|---|---|---|---|
+| `optional` (default) | Available: the implementer may hand off with `kanban_request_review` | Optional, chosen per handoff | A reviewer approves with `kanban_complete`, or the implementer closes it |
+| `required` | Mandatory gate: the implementer must hand off with `kanban_request_review` | Saved on the card and must carry `sdlc-review` | The saved reviewer approves; `kanban_complete` is refused for the implementer |
+| `disabled` | Forbidden: `kanban_request_review` is refused and hidden from the worker | None | The implementer finishes with `kanban_complete` |
+
+Rules:
+
+- **Defaults and implication.** A card with no policy is `optional`. Passing a `reviewer` without a policy implies `required`, so a saved reviewer keeps gating exactly as before.
+- **Conflicts are refused before anything is written.** `required` needs a valid reviewer. `optional` or `disabled` with a reviewer is a conflict (`review_policy=disabled conflicts with a reviewer`). An unknown value is refused. A refused create leaves no task row, edge, event or workspace.
+- **Existing cards keep their meaning.** A card created before this field reads as `required` when it has a saved reviewer, and as `optional` otherwise. The migration adds the column without touching existing rows.
+- **`disabled` is enforced by the kernel, not the tool list.** The dispatcher tells the worker its policy and `kanban_request_review` is removed from its tool definitions, but `request_review` also refuses a disabled card on every route (agent tool, CLI, dashboard, forced handoff). A refused handoff changes no state, event, claim or assignment. The worker's context and stop-gate nudge describe the normal `kanban_complete` path.
+- **`required` never falls back.** When the saved reviewer can no longer run review (for example, it lost `sdlc-review`), the handoff is refused with no state change, and the message routes the issue to the orchestrator. The card is not completed by the implementer. The implementer's `kanban_request_review` also has no `reviewer` argument, because the saved gate selects the reviewer.
 
 ### Per-task model override
 
@@ -814,6 +888,8 @@ among its parents, in supplied order. An explicit tenant (including the worker's
 active tenant passed by tools) wins. Boards remain the hard isolation boundary.
 
 **Manual** — `kanban.auto_decompose: false`. Triage tasks stay in triage until you act. Click the **⚗ Decompose** button on a card, run `hermes kanban decompose <id>` (or `--all`), or use `/kanban decompose <id>` from a chat. This matches the pre-decomposer behavior of the board, useful when you want full control over what runs when.
+
+**Agent-authored fan-out (the `kanban_decompose` tool)** — an orchestrator profile can fan a `triage` card out itself, with **no auxiliary/LLM call at all**: the agent supplies the whole child graph (each child's `title`, optional `body`, `assignee`, `parents` as 0-based indexes into that same batch, and `workspace_kind`/`workspace_path`) and the tool validates it *before* any write — non-empty titles, a well-formed acyclic graph, assignees that resolve to installed profiles (omitted ones fall back to the configured default assignee) — then persists every child row, dependency edge and event in **one transaction**. An invalid graph writes nothing at all: no child rows, no edges, no events, root untouched. Only a card whose status is exactly `triage` may be decomposed, and only once. On success the root waits on the whole child graph and wakes when all children finish, and the response returns the created child ids plus each card's *actual* resulting status after eligibility is recomputed. This is a different path from the LLM flows above: `hermes kanban decompose` / `POST /api/plugins/kanban/tasks/:id/decompose` run the `decompose_task` auxiliary model (which may fall back to a specify-style promotion), whereas `kanban_decompose` never calls a model — the decomposition decision belongs to the calling agent in its own turn. It is orchestrator-only, so dispatcher-spawned task workers never see it.
 
 **Important boundary:** Manual mode disables only the built-in Triage decomposer. It does not prevent a profile from calling `kanban_create`, and it does not disable creator-session wake-ups. With `kanban.auto_subscribe_on_create: true`, a task's terminal event resumes the originating agent with a synthetic status turn so it can inspect the handoff and decide whether genuinely new follow-up work is needed. Set `auto_subscribe_on_create: false` when task completion should remain passive. For provenance, built-in decomposer children use `created_by=auto-decomposer`; tasks created by a resumed profile carry that profile name instead.
 
@@ -1429,7 +1505,7 @@ Runs are exposed on the dashboard (Run History section in the drawer, one colour
 
 **Live-claim guard on complete.** A `running` task whose worker holds a live claim is only completed by that worker (`kanban_complete` from inside the run) or by an explicit operator override: `hermes kanban complete <id> --force` and the dashboard's "mark done" action. A claim-less `hermes kanban complete <id>` or an orchestrator session's `kanban_complete` is refused with a pointer to `--force` / `hermes kanban reclaim`, so a second session can no longer close a live worker's run underneath it. Completing `ready`, `blocked` or `review` cards without a claim is unchanged.
 
-**Reclaimed runs from status changes.** If you drag a running task off `running` in the dashboard (back to `ready`, or straight to `todo`), or archive a task that was still running, the in-flight run closes with `outcome='reclaimed'` rather than being orphaned. The `task_runs` row is always in a terminal state when `tasks.current_run_id` is `NULL`, and vice versa — that invariant holds across CLI, dashboard, dispatcher, and notifier.
+**Reclaimed runs from status changes.** If you drag a running task off `running` in the dashboard (back to `ready`, or straight to `todo`), the in-flight run closes with `outcome='reclaimed'` rather than being orphaned. The `task_runs` row is always in a terminal state when `tasks.current_run_id` is `NULL`, and vice versa — that invariant holds across CLI, dashboard, dispatcher, and notifier. Archiving a running task is refused outright (see the archive policy below); stopping its worker is the block path's job.
 
 **Synthetic runs for never-claimed completions.** Completing or blocking a task that was never claimed (e.g. a human closes a `ready` task from the dashboard with a summary, or a CLI user runs `hermes kanban complete <ready-task> --summary X`) would otherwise drop the handoff. Instead the kernel inserts a zero-duration run row (`started_at == ended_at`) carrying the summary / metadata / reason so attempt history stays complete. The `completed` / `blocked` event's `run_id` points at that row.
 
@@ -1455,7 +1531,8 @@ Every transition appends a row to `task_events`. Each row carries an optional `r
 | `dependency_wait` | `{reason, kind}` or `{reason: parent_not_done, demoted: true, parent}` | Worker blocked with `kind=dependency` while at least one parent is still open — the task is only waiting on another task, so it routes to `todo` (parent-gated, auto-promoted) instead of `blocked` and no recurrence is counted. No human needed. Also emitted when `link`/`kanban_link` puts a `ready` child under a parent that is not `done`: the child drops back to `todo` and this event records why (the `ready → running` claim re-checks parents, so nothing can run it until the parent completes or the link is removed with `hermes kanban unlink`). |
 | `block_loop_detected` | `{reason, kind, recurrences, limit}` | A task was unblocked and re-blocked for the same reason `BLOCK_RECURRENCE_LIMIT` times (default 2). Instead of landing in `blocked` again — where a cron would keep unblocking it — it routes to `triage` for orchestration attention, breaking the unblock↔re-block loop. |
 | `unblocked` | — | `blocked → ready` (or `todo` if parents are still open), either manually or via `/unblock`. Resets the dispatcher's `consecutive_failures` but deliberately preserves `block_recurrences` so the loop breaker keeps its memory. `run_id` is `NULL`. |
-| `archived` | — | Hidden from the default board. If the task was still running, carries the `run_id` of the run that was reclaimed as a side effect. |
+| `archived` | `{source, actor, reason}?` — only when the agent-facing `kanban_archive` tool supplied its required `reason`; the CLI and the dashboard stay payload-less | Hidden from the default board. Refused while the task is `ready`, `running` or `review`; if a run was still open on a non-running card it is closed here with `run_id`. |
+| `block_worker_termination` | `{worker_pid, stopped, terminated, blocker?}` | A block stopped (or failed to stop) the card's worker: `stopped` is true only when the `worker_pid` + start-time fingerprint could no longer be observed alive. A survivor keeps its identity on the row, which is what later refuses the archive. |
 
 **Edits** (human-driven changes that aren't transitions):
 
@@ -1470,7 +1547,7 @@ Every transition appends a row to `task_events`. Each row carries an optional `r
 
 | Kind | Payload | When |
 |---|---|---|
-| `spawned` | `{pid}` | Dispatcher successfully started a worker process. |
+| `spawned` | `{pid}` | Dispatcher successfully started a worker process and durably published its PID + start fingerprint (only while the row still shows the claim/run the spawn belongs to). |
 | `worker_registered` | `{pid, started_at}` | The dispatcher died after starting the worker but before recording its pid, so the worker recorded it itself before its first model call. Liveness checks then see it and an expired claim is extended instead of spawning a second worker. A worker whose run was reclaimed before it got that far exits without working the card. |
 | `heartbeat` | `{note?}` | Worker called `hermes kanban heartbeat $TASK` to signal liveness during long operations. |
 | `reclaimed` | `{stale_lock}` | Claim TTL expired without a completion; task goes back to `ready`. An automatic reclaim counts as one non-successful attempt toward the `gave_up` breaker (a claim that never spawned a worker would otherwise loop claim → reclaim → claim forever); an operator `reclaim` resets the counter instead. |

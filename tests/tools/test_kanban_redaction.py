@@ -26,6 +26,12 @@ def worker_env(monkeypatch, tmp_path):
     monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
     from pathlib import Path as _Path
     monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+    # kanban_create / kanban_request_review validate assignee and reviewer against the profile
+    # roster (config.yaml marks a directory as a profile), so the peers must exist on disk.
+    for _name in ("peer",):
+        _d = home / "profiles" / _name
+        _d.mkdir(parents=True, exist_ok=True)
+        (_d / "config.yaml").write_text("{}\n", encoding="utf-8")
 
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
@@ -164,7 +170,7 @@ def test_kanban_create_body_scrubbed_api_key(worker_env):
     secret = "sk-" + "a" * 30
     out = json.loads(kt._handle_create({
         "title": f"rotate {secret} now",
-        "assignee": "test-worker",
+        "assignee": "peer",
         "body": f"complete using {secret}",
     }))
     assert out["ok"] is True
@@ -192,7 +198,7 @@ def test_kanban_create_secret_free_body_passthrough(worker_env):
     body = "Investigate the flaky e2e suite and report findings."
     out = json.loads(kt._handle_create({
         "title": "plain task",
-        "assignee": "test-worker",
+        "assignee": "peer",
         "body": body,
     }))
     assert out["ok"] is True
@@ -241,6 +247,7 @@ def test_kanban_request_review_corrupting_metadata_stays_structured(worker_env, 
     response = json.loads(kt._handle_request_review({
         "summary": "ready for review",
         "metadata": {"headers": secret, "safe": "keep"},
+        "reviewer": "peer",
     }))
     assert "error" not in response, response
     conn = connect()

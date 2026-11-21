@@ -292,6 +292,12 @@ async def _start_gateway_start_control_socket(runner):
         from gateway.run_active_work_verb import active_work_verb
         from gateway.relay.link import relay_link_verb
         from gateway.drain_control import RESTART_WAIT_REASON
+        # auto_decompose-off decomposition: the shared CLI/dashboard backend holds no
+        # adapters, so it asks THIS gateway (which does) for a confirmed instruction
+        # wake. Registered here — independent of the kanban dispatcher — so a gateway
+        # with dispatch_in_gateway=false still delivers; the handler runs on the
+        # socket executor thread and marshals onto the loop.
+        from gateway.kanban_watchers import decompose_instruction_control_verb
         descriptor = runner.session_runtime_descriptor
 
         def _identify_runtime():
@@ -360,9 +366,14 @@ async def _start_gateway_start_control_socket(runner):
                 result = {"pending": True, "served_profiles": runner.served_profile_names()}
             return {"multiplex": bool(getattr(runner.config, "multiplex_profiles", False)), **result}
 
+        # The shared CLI/dashboard backend holds no adapters, so it asks THIS gateway (which does)
+        # for a confirmed instruction wake. Registered independent of the kanban dispatcher so a
+        # gateway with dispatch_in_gateway=false still delivers.
+        from gateway.kanban_watchers import decompose_instruction_control_verb
         _control_server = GatewayControlServer(
             verb_handlers={"pause-for-update": _pause_for_update_handler, "identify": _identify_runtime,
                            "rescan-profiles": _rescan_profiles_handler,
+                           "deliver-decompose-instruction": decompose_instruction_control_verb(runner, _main_loop),
                            "migrate-profile-identity": migrate_profile_identity_verb(runner),
                            "unserve-profile": unserve_profile_verb(runner),
                            "serve-profile": serve_profile_verb(runner),

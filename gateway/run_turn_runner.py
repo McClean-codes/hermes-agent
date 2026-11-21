@@ -41,6 +41,7 @@ logger = logging.getLogger("gateway.run")
 # _load_turn_history escalates the lag line from WARNING to ERROR (#114266: 11 days of WARNING).
 _TRANSCRIPT_LAG_ESCALATION_TURNS = 3
 
+
 # Exact refusals retained for older adapters/connectors without destination preflight.
 # Substring matching would also silence transient thread-resolution errors.
 _CARD_DESTINATION_REFUSALS = {
@@ -151,7 +152,14 @@ class _ExecApprovalDeclined(RuntimeError):
     """
 
 
-from gateway.run_turn_progress import GatewayTurnProgressMixin
+from gateway.run_turn_progress import (
+    GatewayTurnProgressMixin,
+    _CATEGORY_ALIASES,
+    _SKILL_TOOL_NAMES,
+    _get_tool_categories,
+    _normalize_filter_key,
+    _resolve_effective_mode,
+)
 from gateway.session_execution import GatewaySessionAgentMixin
 
 

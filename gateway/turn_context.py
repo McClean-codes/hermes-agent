@@ -28,6 +28,12 @@ class TurnContext:
     progress_mode: str = "off"
     progress_grouping: str = "grouped"
     tool_progress_enabled: bool = False
+    tool_progress_filter: Optional[dict] = None
+    # Stable per-message/turn identity (the RAW inbound message id, never the reply
+    # anchor — that may name another message). Lifecycle hooks key reaction,
+    # raw-message, cache and lock state to it so concurrent sessions processed in one
+    # chat can never overwrite each other's state.
+    turn_identity: Optional[str] = None
     progress_queue: Any = None
     log_queue: Any = None
     # mutable single-element containers (shared with the outer body)
@@ -128,3 +134,5 @@ class TurnContext:
     def bind_status_adapter(self, resolve: Callable[[], Any]) -> None:
         """Pin the adapter that answers the turn now, and keep *resolve* to re-ask at every send."""
         self._status_adapter_pinned, self._status_adapter_resolver = resolve(), resolve
+    # Hidden native call IDs filtered by tool_progress_filter; a hidden completion cannot resurrect a card
+    _hidden_native_call_ids: set[str] = field(default_factory=set)

@@ -63,6 +63,11 @@ def turn_waits_for_background_work(ends_wait: Callable[[], bool] = _never) -> It
         _TURN_WAITS_FOR_BACKGROUND_WORK.reset(token)
 
 
+# A one-shot worker that is about to exit waits this long for its post-turn review (the review
+# thread is a daemon: the exit would kill it mid-write). Bounded so a stuck review cannot pin it.
+REVIEW_TEARDOWN_WAIT_SECONDS = 180.0
+
+
 class _BackgroundReviewRun:
     """Per-review cancellation and request-completion handshake."""
 
@@ -301,6 +306,30 @@ def _review_input_token_budget(
     return budget if budget > 0 else None
 
 
+def kanban_worker_turn() -> bool:
+    """A dispatcher-owned Kanban worker turn. Its process is one-shot, so the review thread outlives
+    the turn only until the process exits: the worker waits for it (``wait_for_background_review``)
+    before it tears down, and the idle queue (process-local) must not hold it."""
+    from agent.delegation_context import is_dispatcher_owned_worker_context
+
+    return bool(os.environ.get("HERMES_KANBAN_TASK")) and is_dispatcher_owned_worker_context()
+
+
+def wait_for_background_review(agent: Any, *, timeout: float) -> bool:
+    """Block up to ``timeout`` seconds for this agent's running post-turn review to finish, including
+    its memory/skill writes and usage accounting (both happen before the run is published). Returns
+    True when no review is running or it finished; a timeout is logged and returns False."""
+    run = getattr(agent, "_background_review_run", None)
+    if run is None:
+        return True
+    if run.request_done.wait(timeout=timeout):
+        return True
+    logger.warning(
+        "Background review still running after %.0fs; ending the turn anyway", timeout,
+    )
+    return False
+
+
 def load_background_review_settings() -> tuple[bool, dict[str, Any]]:
     """Single config read -> ``(enabled, task_cfg)``. Fail-open (``enabled=True``) so a broken
     config never silently disables reviews — but WARN so the cost is visible."""
@@ -310,7 +339,9 @@ def load_background_review_settings() -> tuple[bool, dict[str, Any]]:
     # A finite gateway turn (`chat -q` / `-z`) is one-shot like the in-process run, whose exit
     # takes the daemon review thread with it; the long-lived gateway would otherwise fork a
     # ~30K-token review after the viewer has already gone.
-    if safe_worker_enabled() or finite_turn_required() is True:
+    # Kanban workers are finite too, but they wait for their review before exit (managed_worker
+    # and cli_shutdown), so they keep automatic reviews.
+    if safe_worker_enabled() or (finite_turn_required() is True and not kanban_worker_turn()):
         return False, {}
     try:
         from hermes_cli.config import load_config_readonly
@@ -1382,6 +1413,9 @@ def _run_review_in_thread(
             getattr(agent, "provider", "?"),
         )
         _set_thread_approval_callback(None)
+        # The run was admitted before this thread started: publish its completion, or a teardown
+        # wait on it stalls for its whole timeout.
+        finish_background_review_run(agent, review_run)
         return
     st = _ReviewForkState()
     # The gateway's stop may close the parent's handle while the review runs: the fork records its usage through its

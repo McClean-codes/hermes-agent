@@ -884,13 +884,27 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         # Webhooks can't edit messages; a bot peer gets the final reply only (#137027): no progress lanes.
         is_webhook, bot_peer = source.platform == Platform.WEBHOOK, not automatic_notices_allowed(source)
         tool_progress_enabled = progress_mode not in {"off", "log"} and not is_webhook and not bot_peer
+        # Per-tool/category filter: the callback applies exact-tool/category precedence and
+        # re-resolves the effective mode BEFORE every output sink (file log, chat rail,
+        # live-status preview). Only a CHAT-mode entry may keep the progress queue alive
+        # over a global off/log mode: `off` is silent everywhere and `log` is file-only, so
+        # a positive filter must never turn global `log` into chat output.
+        from gateway.display_config import resolve_tool_progress_filter
+        tool_progress_filter = resolve_tool_progress_filter(user_config, platform_key)
+        if not tool_progress_enabled and tool_progress_filter and not is_webhook and not bot_peer:
+            if any(mode in {"all", "new", "verbose"} for mode in tool_progress_filter.values()):
+                tool_progress_enabled = True
         # Live status for text-rendering typing indicators (Slack); independent of tool_progress.
         _live_status_mode = resolve_display_setting(user_config, platform_key, "live_status", "full")
         _live_status_adapter = (
             adapter if getattr(adapter, "supports_status_text", False) and _live_status_mode != "off" else None
         )
-        # "log" mode: tool calls go to ~/.hermes/logs/tool_calls.log instead of the chat. Gateway-only.
-        log_mode_enabled = progress_mode == "log" and not is_webhook
+        # "log" mode: tool calls go to ~/.hermes/logs/tool_calls.log instead of the chat.
+        # Gateway-only. A per-tool `log` entry is file-only wherever it appears, so the log
+        # sink must also be allocated when the global mode is not `log`.
+        log_mode_enabled = (
+            progress_mode == "log" or "log" in tool_progress_filter.values()
+        ) and not is_webhook
         # Interim assistant messages and thinking_progress are independent of tool progress (same
         # queue). Mattermost requires a per-platform opt-in: scratch text leaks into public threads.
         interim_assistant_messages_mode = _display_surface_mode(
@@ -923,8 +937,8 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             disabled_toolsets=disabled_toolsets, resolve_display_setting=resolve_display_setting,
             progress_mode=progress_mode, progress_grouping=progress_grouping,
             _display_surface_mode=_display_surface_mode,
-            tool_progress_enabled=tool_progress_enabled, _live_status_mode=_live_status_mode,
-            _live_status_adapter=_live_status_adapter, log_mode_enabled=log_mode_enabled,
+            tool_progress_enabled=tool_progress_enabled, tool_progress_filter=tool_progress_filter,
+            _live_status_mode=_live_status_mode, _live_status_adapter=_live_status_adapter, log_mode_enabled=log_mode_enabled,
             log_queue=queue.Queue() if log_mode_enabled else None,
             interim_assistant_messages_enabled=interim_assistant_messages_enabled,
             _thinking_enabled=_thinking_enabled, _native_slack_task_cards=_native_slack_task_cards,
@@ -935,7 +949,7 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
     # _RunAgentDisplay fields copied verbatim onto the TurnContext.
     _DISPLAY_TO_TURN_CTX = (
         "_live_status_adapter", "_live_status_mode", "_thinking_enabled", "progress_mode",
-        "progress_grouping", "tool_progress_enabled", "log_queue", "resolve_display_setting",
+        "progress_grouping", "tool_progress_enabled", "tool_progress_filter", "log_queue", "resolve_display_setting",
         "user_config", "enabled_toolsets", "disabled_toolsets", "log_mode_enabled",
         "interim_assistant_messages_enabled", "needs_progress_queue", "_native_slack_task_cards",
     )
@@ -973,6 +987,10 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             _voice_ack_guild=_voice_ack_guild, _voice_ack_loop=asyncio.get_running_loop(),
             **{name: getattr(disp, name) for name in self._DISPLAY_TO_TURN_CTX}, **turn_params,
         )
+        # Bind lifecycle hooks (reactions, raw-message caches, per-turn locks) to THIS
+        # message: derived from the raw inbound id alone so it always matches the id the
+        # adapter's own MessageEvent carries (start/complete hooks key off that event).
+        turn_ctx.turn_identity = str(turn_ctx.inbound_message_id) if turn_ctx.inbound_message_id else None
         turn_runner = TurnRunner(self, turn_ctx)
         turn_ctx.mute_notification_reply = diagnostic_turn_muted(
             turn_ctx.persist_user_display_metadata, source.platform, turn_ctx.user_config)
@@ -2108,7 +2126,7 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         # Progress sender drains BOTH tool-progress lines and thinking bubbles (needs_progress_queue).
         spawn = asyncio.create_task
         progress_task = spawn(turn_runner.send_progress_messages()) if disp.needs_progress_queue else None
-        log_task = spawn(self._run_agent_write_tool_log(disp.log_queue)) if disp.log_mode_enabled else None
+        log_task = spawn(self._run_agent_write_tool_log(disp.log_queue)) if disp.log_queue is not None else None
         # The stream consumer is created inside run_sync; this task polls for it.
         stream_task = spawn(self._run_agent_stream_consumer_task(turn_ctx.stream_consumer_holder))
         tracking_task = spawn(self._run_agent_track_agent(turn_ctx))
